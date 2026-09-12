@@ -1,0 +1,34 @@
+# Build products
+/build*/
+/out/
+/.vs/
+CMakeFiles/
+CMakeCache.txt
+*.obj
+*.o
+*.lib
+*.a
+*.dll
+*.exe
+*.pdb
+*.log
+
+# Local tests and benchmarks
+test/
+tests/
+testing/
+bench/
+benchmark/
+benchmarks/
+
+# Local assistant configuration and records
+.agents/
+.agent/
+.codex/
+.claude/
+.cursor/
+.windsurf/
+AGENTS.md
+CLAUDE.md
+SKILL.md
+copilot-instructions.md

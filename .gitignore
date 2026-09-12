@@ -32,3 +32,14 @@ AGENTS.md
 CLAUDE.md
 SKILL.md
 copilot-instructions.md
+
+# Local analysis reports
+/docs/state-cleanup.md
+
+# Ship dependency headers and licenses only
+/extern/eigen/*
+!/extern/eigen/Eigen/
+!/extern/eigen/COPYING*
+/extern/spdlog/*
+!/extern/spdlog/include/
+!/extern/spdlog/LICENSE

@@ -81,7 +81,7 @@ int DT::dt_init(Mesh& mesh, Args& args)
 	ghost = -1;
 	infolevel = args.infolevel;
 	spdlogoutfile(args.outlogfile);
-	if (infolevel > 0) meshLogger->info("Version 2026.09.09");
+	if (infolevel > 0) meshLogger->info("Version 2026.09.12");
 	improve_step = false;
 	cos_collinear_ang_tol = cos(179.9999 / 180. * PI);
 	seg[0] = seg[1] = -1;

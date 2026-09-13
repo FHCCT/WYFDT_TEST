@@ -113,7 +113,7 @@ namespace dt {
 		int num_threads = 1; // Single thread-count upper bound for every stage.
         size_t parallelMinPointsPerThread = 8192;
         bool threadsInitialized = false;
-		int virtualID = -2;
+		static constexpr int virtualID = -2; // Reserved exterior/hole tag; never a region counter.
 		int tempfliptime = 0;
 		int maxfliptime;
 		int optflipdeep = 3;
@@ -144,7 +144,7 @@ namespace dt {
 		//for boundary size transition
 		std::vector<int> surTri_mapping;
 		/***************** user interaction parameters *****************/
-		int infolevel;
+		int infolevel = 1;
 		/**************************  process **************************/
 		int dt_init(Mesh& mesh, Args& args);
 		int tetrahedralize(Mesh& mesh, Args& args);
@@ -221,7 +221,6 @@ namespace dt {
 		//MeshRefine
 		void updateSize(int iNod, Args& args);
 		void buildspace(Mesh& mesh, Args& args);
-		int creatNewV_Grav(int i, Args& args);
 		int ColorTets();
 		int shellextra();
 		int ColorTetNeig(int iElm, int color);
@@ -242,7 +241,6 @@ namespace dt {
 		///****************** Smoothing **************/
 		int SmoothPass(int nloop, double improve_goal);
 		// smooth
-
 		int smooth_sus(int iNod);
 		double quality_sus(double* a, double* b, double* c, double* d);
 
@@ -274,7 +272,8 @@ namespace dt {
         int TopologicalPass(double improve_goal, double insert_angle_degrees, int nloop);
         int TopologicalPass_serial(const std::vector<TopologyCandidate>& candidates, double improve_goal, double insert_angle_degrees);
         int TopologicalPass_parallel(const std::vector<TopologyCandidate>& candidates, double improve_goal, double insert_angle_degrees, int workers);
-        int tryTopologyInsertion(const TopologyCandidate& candidate, double angleDegrees);
+        // Failed flips: short boundary collapse first, then angle-gated insertion.
+        int tryTopologyRepair(const TopologyCandidate& candidate, double angleDegrees);
         int removebadtet(int& iElm, int thread_n = -1);
         int removebadtet_addPnt(int iElm);
 		int findtet(int p[], std::vector<int> sph);
@@ -465,7 +464,11 @@ namespace dt {
 		bool project_boundary_point_to_fine_mesh(double* in, double* out, double max_projection_distance);
 		bool project_segment_point_to_fine_mesh(double* in, double* out, double max_projection_distance);
     private:
+        int calculateDihedral(double& minD, double& minAvgD, double& maxD, double& maxAvgD);
         void resetMeshState();
+        void removeInteriorSteiner();
+        int recoverFacebyLocalFlips(int targetF);
+        int addInteriorFacePoints(int targetF, std::vector<int>& newN, const double dis[2], const double base[3]);
         int createRefineCandidate(int tet, Args& args, bool& rejected);
         bool fileLogging = false;
         FineMeshProjection fineMeshProjection;

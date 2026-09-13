@@ -385,9 +385,10 @@ bool currentCandidate(DT& mesh, const RefineLane& lane) {
 }
 
 void insertDelaunayPoints(DT& mesh, const std::vector<int>& order) {
+    MeshStageLog stageLog(mesh, "Delaunay insertion", 2);
     DTParallelScope parallelScope;
     if (order.size() <= 4) return;
-    if (mesh.infolevel > 0) mesh.meshLogger->info("Incremental insert points.");
+    if (mesh.infolevel > 0) mesh.meshLogger->debug("Incremental insert points.");
     const int workers = activeDTThreads(mesh, order.size());
     const int remainingCount = static_cast<int>(order.size()) - 4;
     BWPlan serialPlan;
@@ -517,6 +518,7 @@ void insertDelaunayPoints(DT& mesh, const std::vector<int>& order) {
 }
 
 void refineBWParallel(DT& mesh, Args& args) {
+    MeshStageLog stageLog(mesh, "Parallel refinement", 2);
     DTParallelScope parallelScope;
     uint64_t inserted = 0, serialPlans = 0;
     std::vector<uint8_t> rejected(mesh.Elems.size(), 0);
@@ -740,7 +742,7 @@ void refineBWParallel(DT& mesh, Args& args) {
         }
         const uint64_t success = inserted - before;
         if (mesh.infolevel > 0)
-            mesh.meshLogger->info("Loop:{: <2} add:{: <5} Elem:{: <8} Node:{: <8}",
+            mesh.meshLogger->debug("Loop:{: <2} add:{: <5} Elem:{: <8} Node:{: <8}",
                          loop++, success, mesh.Elems.size(), mesh.Nodes.size());
         if (!success && serialFinish) break;
         // Low progress makes the following sweep permanently serial.

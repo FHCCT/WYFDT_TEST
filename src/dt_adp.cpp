@@ -1,12 +1,12 @@
 #include "./dt.h"
 
 int DT::adaptation_by_pError(Mesh& mesh, Args& args, std::vector<std::array<double, 4>>& addVertex, double GrowRatio) {
-	auto t_1 = getTime_now();
 	int p1, p2;
 
 	/************************ Prepare ******************************/
 	//Rebuild TOPO
 	if (!dt_init(mesh, args)) return 1;
+    MeshStageLog stageLog(*this, "adaptation_by_pError");
 	buildTetInfo(mesh, args);
 
 	//Get min volume
@@ -124,28 +124,25 @@ int DT::adaptation_by_pError(Mesh& mesh, Args& args, std::vector<std::array<doub
 			continue;
 		ne++;
 	}
-	meshLogger->info("Init tet: {}  Refine tet: {}  Ratio: {:.3f}", inTetNum, ne, 1.0 * ne / inTetNum);
+	meshLogger->debug("Init tet: {}  Refine tet: {}  Ratio: {:.3f}", inTetNum, ne, 1.0 * ne / inTetNum);
 	/************************ Mesh Improvement ******************************/
 	args.optlevel = 7;
 	MeshImprove(args);
 
-	auto t_2 = getTime_now();
 	RemoveTet(args);
 	outMesh(mesh, args);
-	auto t_3 = getTime_now();
-	meshLogger->info("Mesh Adaptation Cost : {} s", getTime(t_1, t_3));
 
-	meshLogger->info("Init tet: {}  Adaptation tet: {}  Ratio: {:.3f}", inTetNum, mesh.T.size() - initBoxtet, 1.0 * (mesh.T.size() - initBoxtet) / inTetNum);
+	meshLogger->debug("Init tet: {}  Adaptation tet: {}  Ratio: {:.3f}", inTetNum, mesh.T.size() - initBoxtet, 1.0 * (mesh.T.size() - initBoxtet) / inTetNum);
 	return 1;
 }
 
 int DT::adaptation_by_Tetid (Mesh& mesh, Args& args, std::vector<int> refine_tri_id, std::vector<int> refine_tet_id, double GrowRatio) {
-	auto t_1 = getTime_now();
 	int p1, p2;
 
 	/************************ Prepare ******************************/
 	//Rebuild TOPO
 	if (!dt_init(mesh, args)) return 1;
+    MeshStageLog stageLog(*this, "adaptation_by_Tetid ");
 	buildTetInfo(mesh, args);
 
 	int inTetNum = mesh.T.size();
@@ -300,9 +297,7 @@ int DT::adaptation_by_Tetid (Mesh& mesh, Args& args, std::vector<int> refine_tri
 
 	RemoveTet(args);
 	outMesh(mesh, args);
-	auto t_2 = getTime_now();
 
-	meshLogger->info("Mesh Adaptation Cost : {} s", getTime(t_1, t_2));
 
 	meshLogger->info("Init tet: {}  Adaptation tet: {}  Ratio: {:.3f}", inTetNum, mesh.T.size(), 1.0 * mesh.T.size() / inTetNum);
 	return 1;
@@ -314,10 +309,10 @@ int DT::adaptation_by_YunBoSzieControl(
 	std::unordered_map<int, int>& facetNum,
 	std::unordered_map<int, double>& elementSize,
 	std::unordered_map<int, int>& elementNum) {
-	auto t_1 = getTime_now();
 
 	//Rebuild TOPO
 	if (!dt_init(mesh, args)) return 1;
+    MeshStageLog stageLog(*this, "adaptation_by_YunBoSzieControl");
 	buildTetInfo(mesh, args);
 
 	//Split Long Edge
@@ -335,19 +330,17 @@ int DT::adaptation_by_YunBoSzieControl(
 
 	RemoveTet(args);
 	outMesh(mesh, args);
-	auto t_2 = getTime_now();
 
-	meshLogger->info("Mesh Adaptation Cost : {} s", getTime(t_1, t_2));
 	return 1;
 }
 
 //try it's best coarse
 int DT::adaptation_Coarse(Mesh& mesh, Args& args) {
-	auto t_1 = getTime_now();
 	int inTetNum = mesh.T.size();
 
 	//Rebuild TOPO
 	if (!dt_init(mesh, args)) return 1;
+    MeshStageLog stageLog(*this, "adaptation_Coarse");
 	buildTetInfo(mesh, args);
 
 	//Split Long Edge
@@ -372,15 +365,13 @@ int DT::adaptation_Coarse(Mesh& mesh, Args& args) {
 	RemoveTet(args);
 	outMesh(mesh, args);
 
-	auto t_2 = getTime_now();
-	meshLogger->info("Mesh Adaptation Cost : {} s", getTime(t_1, t_2));
-	meshLogger->info("Init tet: {}  Adaptation tet: {}  Reduce to: {:.3f}%", inTetNum, mesh.T.size(), 100.0 * mesh.T.size() / inTetNum);
+	meshLogger->debug("Init tet: {}  Adaptation tet: {}  Reduce to: {:.3f}%", inTetNum, mesh.T.size(), 100.0 * mesh.T.size() / inTetNum);
 	return 1;
 }
 
 int DT::adaptation_by_pSize(Mesh& mesh, Args& args) {
-	auto t_1 = getTime_now();
 	if (!dt_init(mesh, args)) return 1;
+    MeshStageLog stageLog(*this, "adaptation_by_pSize");
 	//Rebuild TOPO
 	buildTetInfo(mesh, args);
 	modifyBnd = true;	//set Bnd Modification
@@ -390,18 +381,16 @@ int DT::adaptation_by_pSize(Mesh& mesh, Args& args) {
 	args.optlevel = 6;
 	MeshImprove(args);
 
-	auto t_2 = getTime_now();
 	RemoveTet(args);
 	outMesh(mesh, args);
 
-	meshLogger->info("Mesh Improvement Cost : {} s", getTime(t_1, t_2));
 	return 1;
 }
 
 int DT::adaptation_by_ani(Mesh& mesh, Args& args, std::vector<std::array<double, 6>>& anisol, std::vector<int> lockFactes, std::vector<int> lockVertex) {
-	auto t_1 = getTime_now();
 
 	if (!dt_init(mesh, args)) return 1;
+    MeshStageLog stageLog(*this, "adaptation_by_ani");
 	AniSol = anisol;
 	//Smooth_size_ani(mesh, anisol, lockFactes, lockVertex);
 	//Rebuild TOPO
@@ -417,9 +406,7 @@ int DT::adaptation_by_ani(Mesh& mesh, Args& args, std::vector<std::array<double,
 	RemoveTet(args);
 	outMesh(mesh, args);
 
-	auto t_2 = getTime_now();
-	meshLogger->info("Mesh Improvement Cost : {} s", getTime(t_1, t_2));
-	meshLogger->info("Final Tet: {}", mesh.T.size());
+	meshLogger->debug("Final Tet: {}", mesh.T.size());
 	return 1;
 }
 
@@ -440,23 +427,21 @@ int DT::lockingPass(std::vector<int> lockFactes, std::vector<int> lockVertex) {
 }
 
 int DT::optimization(Mesh& mesh, Args& args) {
-	auto t_1 = getTime_now();
 	if (!dt_init(mesh, args)) return 1;
+    MeshStageLog stageLog(*this, "optimization");
 	//Rebuild TOPO
 	buildTetInfo(mesh, args);
 	MeshImprove(args);
 
-	auto t_2 = getTime_now();
 	RemoveTet(args);
 	outMesh(mesh, args);
 
-	meshLogger->info("Mesh Improvement Cost : {} s", getTime(t_1, t_2));
 	return 1;
 }
 
 // for adaptive mesh
 void DT::buildTetInfo(Mesh& mesh, Args& args) {
-	auto t_1 = getTime_now();
+    MeshStageLog stageLog(*this, "Rebuild topology", 1);
 	// add Nodes
 	buildPntInfo(mesh);
 
@@ -542,7 +527,5 @@ void DT::buildTetInfo(Mesh& mesh, Args& args) {
 			}
 		}
 	}
-	auto t_2 = getTime_now();
-	meshLogger->info("Rebuild Mesh Topology Cost : {} s", getTime(t_1, t_2));
 	return;
 }

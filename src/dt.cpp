@@ -2,17 +2,21 @@
 
 using namespace std;
 
+constexpr int DT::virtualID; // C++14 definition for reference-taking callers.
+
 DT::DT() {};
 DT::~DT() {};
 
 int DT::tetrahedralize(Mesh& mesh, Args& args)
 {
-	auto t_1 = getTime_now();
 	if (!dt_init(mesh, args))
-		return 1;
+		return 0;
+    MeshStageLog totalLog(*this, "Tetrahedralize");
 
-	if (!BndPntInst(mesh, args))
-		return 1;
+	if (!BndPntInst(mesh, args)) {
+        meshLogger->error("Boundary point insertion failed");
+        return 0;
+    }
 
 	BoudaryRecover(mesh, args);
 
@@ -20,32 +24,10 @@ int DT::tetrahedralize(Mesh& mesh, Args& args)
 
 	MeshRefine(args);
 
-	auto t_2 = getTime_now();
 
-	if (infolevel > 0)
-	{
-		printf("Mesh Generation cost  : %.3f s\n", getTime(t_1, t_2));
-		printf("Mesh Generation create: %d tet\n", (int)Elems.size());
-		printf("Mesh Generation Speed : %.3f W/s\n", Elems.size() / 10000.0 / getTime(t_1, t_2));
-	}
-	auto t_3 = getTime_now();
 	MeshImprove(args);
 	RemoveTet(args);
 	outMesh(mesh, args);
-
-	auto t_4 = getTime_now();
-
-	if (infolevel > 0)
-	{
-		printf("Mesh improve cost     : %.3f s\n", getTime(t_3, t_4));
-		printf("Mesh improve Speed    : %.3f W/s\n", mesh.T.size() / 10000.0 / getTime(t_3, t_4));
-		printf("Total cost            : %.3f s\n", getTime(t_1, t_4));
-		printf("Final tet num         : %zu tet\n", mesh.T.size());
-		printf("DT speed              : %.3f W/s\n", mesh.T.size() / 10000.0 / getTime(t_1, t_4));
-		printf("Memory cost           : %.3f MB\n", getPeakMegabytesUsed());
-		printf("Tetrahedralize success!\n");
-	}
-
 	return 1;
 }
 
@@ -71,7 +53,7 @@ void DT::resetMeshState() {
     susIdleStates.clear(); serialBW.slots.clear();
     ignoreIntersect = false; modifyBnd = false; addBoxFlag = false;
     tempfliptime = 0; initBWshell = 0; addst = 0; addstbnd = 0; AvgEdgLen = 0;
-    minVolume_bw = 0; virtualID = -2; // Derived from the mesh/algorithm run.
+    minVolume_bw = 0; // Derived from the mesh/algorithm run.
 }
 
 int DT::dt_init(Mesh& mesh, Args& args)
@@ -79,9 +61,12 @@ int DT::dt_init(Mesh& mesh, Args& args)
 	dt::GEOM_FUNC::exactinit();
     resetMeshState();
 	ghost = -1;
-	infolevel = args.infolevel;
+	infolevel = std::max(0, std::min(2, args.infolevel));
 	spdlogoutfile(args.outlogfile);
-	if (infolevel > 0) meshLogger->info("Version 2026.09.12");
+    meshLogger->set_level(infolevel == 0 ? spdlog::level::err :
+        infolevel == 1 ? spdlog::level::info : spdlog::level::debug);
+	if (infolevel > 0) meshLogger->info("Version 2026.09.13");
+    MeshStageLog initLog(*this, "Initialize");
 	improve_step = false;
 	cos_collinear_ang_tol = cos(179.9999 / 180. * PI);
 	seg[0] = seg[1] = -1;
@@ -139,18 +124,18 @@ int DT::dt_init(Mesh& mesh, Args& args)
 
 int DT::BndPntInst(Mesh& mesh, Args& args)
 {
+    MeshStageLog stageLog(*this, "Boundary points", 1);
 	int i, j;
 	double v1[3], v2[3], n[3];
-	auto t_begin = getTime_now();
 	// Read input Pnts
 	buildPntInfo(mesh);
 	if (infolevel > 0)
-		meshLogger->info("Delaunizing boundary points.");
+		meshLogger->debug("Delaunizing boundary points.");
 	/**set ghost at nSurNodes**/
 	//init ghost nodes;store at nSurNodes
 	ghost = addNode();
 	/********************* Hilbert sort input nodes ******************/
-	if (infolevel > 0) meshLogger->info("Hilbert sort");
+	if (infolevel > 0) meshLogger->debug("Hilbert sort");
 	std::vector<int> order;
 	order.resize(nSurNodes);
 	for (i = 0; i < nSurNodes; i++)
@@ -158,7 +143,7 @@ int DT::BndPntInst(Mesh& mesh, Args& args)
 	Hilbert(mesh.V, order);
 	/************************ init first tet *************************/
 	{
-		if (infolevel > 0) meshLogger->info("Create first tet");
+		if (infolevel > 0) meshLogger->debug("Create first tet");
 		double epsilon = 1e-30;
 		// Calculate the diagonal size of its bounding box.
 		double boxsize = sqrt(norm2(maxW[0] - minW[0], maxW[0] - minW[0], maxW[2] - minW[0]));
@@ -196,7 +181,7 @@ int DT::BndPntInst(Mesh& mesh, Args& args)
 		}
 
 		if (i == nSurNodes){//plane
-			if (infolevel > 0) meshLogger->info("It is a 2D model.");
+			if (infolevel > 0) meshLogger->debug("It is a 2D model.");
 			return 0;
 		}
 
@@ -235,8 +220,6 @@ int DT::BndPntInst(Mesh& mesh, Args& args)
 	insertDelaunayPoints(*this, order);
 	
 	AddBox(2.0);
-	auto t_end = getTime_now();
-	if (infolevel > 0) meshLogger->info("Delaunizing bnd points cost time: {:.6f}", getTime(t_begin, t_end));
 	return 1;
 }
 
@@ -284,17 +267,16 @@ void DT::AddBox(double scaled) {
 		}
 		else {
 			BW_insert_vertex(iNod, firsttet, 0);
-			if (infolevel > 0) meshLogger->error("Inserting box point failed.");
+			meshLogger->error("Inserting box point failed.");
 		}
 	}
 	return;
 }
 
 int DT::BoudaryRecover(Mesh& mesh, Args& args) {
-	auto t_begin = getTime_now();
-	if (infolevel > 0) meshLogger->info("Recovering boundaries.");
+    MeshStageLog stageLog(*this, "Boundary recovery", 1);
+	if (infolevel > 0) meshLogger->debug("Recovering boundaries.");
 
-	auto t1 = getTime_now();
 	// Read input Faces
 	buildBndInfo(mesh, args);
 
@@ -314,31 +296,27 @@ int DT::BoudaryRecover(Mesh& mesh, Args& args) {
 		recoverEdgesPass(args);
 	}
 
-	auto t2 = getTime_now();
 	/************************** Recover Faces **************************/
 	recoverFacesPass(args);
 
-	auto t3 = getTime_now();
-	if (!ignoreIntersect && SteinerOrd.size() != 0) {
+	if (!ignoreIntersect && args.constrain == 1) {
 		removeStPass(args);
 	}
+    else if (!ignoreIntersect && addst > 0) {
+        removeInteriorSteiner();
+    }
 
-	auto t4 = getTime_now();
 
-	auto t_end = getTime_now();
 	if (infolevel > 0) {
-		meshLogger->info("Recovering Edge: {:.6f}", getTime(t1, t2));
-		meshLogger->info("Recovering Face: {:.6f}", getTime(t2, t3));
-		meshLogger->info("Remove Boundary st: {:.6f}", getTime(t3, t4));
-		meshLogger->info("Add steiner point: {}", addst);
-		meshLogger->info("Add Boundary point: {}", addstbnd);
-		meshLogger->info("Recovering boundaries cost time: {:.3f}", getTime(t_begin, t_end));
+		meshLogger->debug("Add steiner point: {}", addst);
+		meshLogger->debug("Add Boundary point: {}", addstbnd);
 	}
 
 	return 0;
 }
 
 int DT::AutorecoverEdges(Args& args) {
+    MeshStageLog stageLog(*this, "Recover edges by flips", 2);
 	std::queue<int> lost;
 	std::unordered_map<int, int> N_lostE_pre;
 
@@ -368,7 +346,7 @@ int DT::AutorecoverEdges(Args& args) {
 	}
 
 	if (infolevel > 0)
-		meshLogger->info("Lost Edges: {} / {}", (int)lost.size(), (int)SurEdgs.size());
+		meshLogger->debug("Lost Edges: {} / {}", (int)lost.size(), (int)SurEdgs.size());
 
 	/**************************** Start Recover Edge *******************************/
 	int tempfliplevel = 1;
@@ -424,48 +402,21 @@ int DT::AutorecoverEdges(Args& args) {
 			}
 		}
 
-		for (int iloop = 0; iloop < 3; iloop++) {
-			int nrmv = 0;
-			for (int i = nSurNodes; i < Nodes.size(); i++) {
-				if (isDelNod(i) || isbndpnt(i) || i == ghost) {
-					continue;
-				}
-				if (!removePnt(i))
-					smooth_volume(i, true);
-			}
-			if (nrmv == 0) break;
-		}
-
-
 		updateFliptype(N_lostE_pre, lost);
 
-		if (infolevel > 1)
-			meshLogger->info("level:{} lost edges:{}", tempfliplevel, (int)lost.size());
+		if (infolevel >= 2)
+			meshLogger->debug("level:{} lost edges:{}", tempfliplevel, (int)lost.size());
 		tempfliplevel++;
 		if (tempfliplevel > 1000) {
-			if (meshLogger->level() != spdlog::level::off) printf("Boundary recovery failed!\n");
 			meshLogger->error("Boundary recovery failed!");
 			throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 		}
 	}
 
-	for (int iloop = 0; iloop < 3; iloop++) {
-		int nrmv = 0;
-		for (int i = nSurNodes; i < Nodes.size(); i++) {
-			if (isDelNod(i) || isbndpnt(i) || i == ghost) {
-				continue;
-			}
-			if (!removePnt(i))
-				smooth_volume(i, true); 
-			else nrmv++;
-		}
-		if (nrmv == 0) break;
-	}
-
 	seg[0] = seg[1] = -1;
 
 	if (lost.empty() && infolevel > 0)
-		meshLogger->info("Finish Recover Edges.");
+		meshLogger->debug("Finish Recover Edges.");
 
 	return 0;
 }
@@ -513,6 +464,7 @@ void DT::updateFliptype(std::unordered_map<int, int>& N_lostE_pre, std::queue<in
 }
 
 int DT::recoverEdgesPass(Args& args) {
+    MeshStageLog stageLog(*this, "Recover edges", 2);
 	std::queue<int> lost;
 	int success = 0;
 	//find all lost edges
@@ -534,15 +486,15 @@ int DT::recoverEdgesPass(Args& args) {
 	}
 
 	if (infolevel > 0)
-		meshLogger->info("Lost Edges: {} / {}", (int)lost.size(), (int)SurEdgs.size());
+		meshLogger->debug("Lost Edges: {} / {}", (int)lost.size(), (int)SurEdgs.size());
 
 	//-------------------------------- only easy flip -----------------------------
 	fliplevel = 1;
 	while (lost.size() != 0) {
 		success = recoverEdges(lost, 0, 0);
 
-		if (infolevel > 1)
-			meshLogger->info("level:{} lost edges:{}", fliplevel, (int)lost.size());
+		if (infolevel >= 2)
+			meshLogger->debug("level:{} lost edges:{}", fliplevel, (int)lost.size());
 		if (success == 0) {
 			break;
 		}
@@ -550,11 +502,10 @@ int DT::recoverEdgesPass(Args& args) {
 	}
 
 	fliplevel = std::max(1000, fliplevel);
-	//maxfliptime = 10000;
 	while (lost.size() != 0) {
 		success = recoverEdges(lost, 1, 0);
-		if (infolevel > 1)
-			meshLogger->info("level:{} lost edges:{}", fliplevel, (int)lost.size());
+		if (infolevel >= 2)
+			meshLogger->debug("level:{} lost edges:{}", fliplevel, (int)lost.size());
 		if (success == 0) {
 			break;
 		}
@@ -575,52 +526,26 @@ int DT::recoverEdgesPass(Args& args) {
 		int oldlost = lost.size();
 		if (success == 0) {
 			if (trybdrc++ > 100) {
-				if (meshLogger->level() != spdlog::level::off) printf("Boundary recovery failed!\n");
 				meshLogger->error("Boundary recovery failed!");
 				throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 			}
-			success = recoverEdges(lost, 1, 1);
+			success = recoverEdges(lost, 1, trybdrc > 1 ? 2 : 1);
 		}
-		for (int iloop = 0; iloop < 3; iloop++) {
-			int nrmv = 0;
-			for (int i = nSurNodes; i < Nodes.size(); i++) {
-				if (isDelNod(i) || isbndpnt(i) || i == ghost) {
-					continue;
-				}
-				if (!removePnt(i))
-					smooth_volume(i, true); 
-				else nrmv++;
-			}
-			if (nrmv == 0) break;
-		}
+
 		success = recoverEdges(lost, 1, 0);
-		if (infolevel > 1)
-			meshLogger->info("Recover by add steiner, lost edges:{}", (int)lost.size());
+		if (infolevel >= 2)
+			meshLogger->debug("Recover by add steiner, lost edges:{}", (int)lost.size());
 	}
 
-	//try to delete or smooth steiner point in volume
-	if (args.ignoreIntersect != 1) {
-		for (int iloop = 0; iloop < 3; iloop++) {
-			int nrmv = 0;
-			for (int i = nSurNodes; i < Nodes.size(); i++) {
-				if (isDelNod(i) || isbndpnt(i) || i == ghost) {
-					continue;
-				}
-				if (!removePnt(i))
-					smooth_volume(i, true); 
-				else nrmv++;
-			}
-			if (nrmv == 0) break;
-		}
-	}
 
 	if (lost.empty() && infolevel > 0)
-		meshLogger->info("Finish Recover Edges.");
+		meshLogger->debug("Finish Recover Edges.");
 
 	return 0;
 }
 
 int DT::recoverFacesPass(Args& args) {
+    MeshStageLog stageLog(*this, "Recover faces", 2);
 	int i, j, success, a, b, c, d;
 	std::queue<int> lost;
 				
@@ -641,7 +566,7 @@ int DT::recoverFacesPass(Args& args) {
 			lost.push(i);//find a lost edge
 		}
 	}
-	if (infolevel > 0) meshLogger->info("Lost Faces: {} / {}", (int)lost.size(), (int)SurTris.size());
+	if (infolevel > 0) meshLogger->debug("Lost Faces: {} / {}", (int)lost.size(), (int)SurTris.size());
 
 	//-------------------------------  flip ---------------------------
 	fliplevel_face = 0;
@@ -650,8 +575,8 @@ int DT::recoverFacesPass(Args& args) {
 	while (lost.size() != 0) {
 		success = recoverFaces(lost, 0);
 
-		if (infolevel > 1)
-			meshLogger->info("level:{} lost faces:{}", fliplevel_face, (int)lost.size());
+		if (infolevel >= 2)
+			meshLogger->debug("level:{} lost faces:{}", fliplevel_face, (int)lost.size());
 		if (fliplevel_face++ > 100)
 			break;
 		if (success == 0) {
@@ -667,17 +592,11 @@ int DT::recoverFacesPass(Args& args) {
 		}
 	}
 
-	//-----------------------  flip + add inner steiner ---------------------
-	while (lost.size() != 0) {
-		success = recoverFaces(lost, 1);
-		success = recoverFaces(lost, 0);
-
-		if (infolevel > 1)
-			meshLogger->info("level:{} lost faces:{}", fliplevel_face, (int)lost.size());
-		if (success == 0) {
-			break;
-		}
-	}
+    // Keep boundary connectivity while the interior-only attempt is useful.
+    if (!args.ignoreIntersect && !lost.empty()) {
+        recoverFaces(lost, 1);
+        recoverFaces(lost, 0);
+    }
 
 	//-----------------------  flip +  + split ---------------------
 	int tryloop = 0;
@@ -685,62 +604,52 @@ int DT::recoverFacesPass(Args& args) {
 		success = recoverFaces(lost, 2);
 		success = recoverFaces(lost, 0);
 
-		if (infolevel > 1)
-			meshLogger->info("level:{} lost faces:{}", fliplevel_face, (int)lost.size());
+		if (infolevel >= 2)
+			meshLogger->debug("level:{} lost faces:{}", fliplevel_face, (int)lost.size());
 		if (tryloop++ > 1000) {
-			//success = recoverFaces(lost, 2);
-			//success = recoverFaces(lost, 0);
 			throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 		}
 	}
 
-	//try to delete or smooth steiner point in volume
-	if (args.ignoreIntersect != 1) {
-		for (int iloop = 0; iloop < 3; iloop++) {
-			int nrmv = 0;
-			for (int i = nSurNodes; i < Nodes.size(); i++) {
-				if (isDelNod(i) || isbndpnt(i) || i == ghost) {
-					continue;
-				}
-				if (!removePnt(i))
-					smooth_volume(i, true); 
-				else nrmv++;
-			}
-			if (nrmv == 0) break;
-		}
-	}
 
 	if (lost.empty() && infolevel > 0)
-		meshLogger->info("Finish Recover Faces.");
+		meshLogger->debug("Finish Recover Faces.");
 
-//#ifdef _DEBUG
-//	for (int i = 0; i < SurTris.size(); i++) {
-//		if (SurTris[i].info > 1 || isDelSurTri(i))
-//			continue;
-//		if (!isMeshFace(SurTris[i].form[0], SurTris[i].form[1], SurTris[i].form[2])) {
-//			assert(0);
-//		}
-//	}
-//	checkMeshError();
-//#endif
 	return 0;
 }
 
+// Boundary points are retained here; only disposable interior points are tried.
+void DT::removeInteriorSteiner() {
+    MeshStageLog stageLog(*this, "Remove interior Steiner points", 2);
+	for (int i = nSurNodes; i < Nodes.size(); i++) {
+		if (isDelNod(i) || isbndpnt(i) || i == ghost) {
+			continue;
+		}
+		if (!removePnt(i, 100)){
+			smooth_volume(i, true);
+		}
+	}
+}
+
 int DT::removeStPass(Args& args) {
-	if (!args.constrain && periodic_P.size() == 0)
+    MeshStageLog stageLog(*this, "Remove boundary Steiner points", 2);
+	if (!args.constrain)
 		return 1;
 
 	int nRmvS = 0;
+    std::vector<int> remainingOrder;
+    remainingOrder.reserve(SteinerOrd.size());
 	int it = TriSteiner.size() - 1;
 	int ie = EdgSteiner.size() - 1;
 	for (int j = SteinerOrd.size() - 1; j >= 0; j--) {
 		if (SteinerOrd[j] == 2) {
 			if (!removeTriStiner(it)) {//can't remove
-				if (infolevel > 1) meshLogger->warn("Can't remove Tri steiner point:{}", TriSteiner[it].first);
+                remainingOrder.push_back(2);
+				if (infolevel >= 2) meshLogger->warn("Can't remove Tri steiner point:{}", TriSteiner[it].first);
 			}
 			else {//success remove steiner point
 				nRmvS++;
-				if (infolevel > 2) meshLogger->info("Remove Tri steiner point:{}", TriSteiner[it].first);
+				if (infolevel >= 2) meshLogger->debug("Remove Tri steiner point:{}", TriSteiner[it].first);
 				vector<std::pair<int, int>>::iterator iter = TriSteiner.begin() + it;
 				TriSteiner.erase(iter);//erase this steiner info
 			}
@@ -752,13 +661,14 @@ int DT::removeStPass(Args& args) {
 			if (EdgSteiner[ie].first != -1)
 				ret = removeEdgStiner(ie, 0);
 			//checkMeshError();
-			if (ret == 0) {//can't remove
-				if (infolevel > 1) meshLogger->warn("Can't remove Edge steiner point:{} in {} {}", EdgSteiner[ie].first,
+			if (ret != 1) {//can't remove
+                remainingOrder.push_back(1);
+				if (infolevel >= 2) meshLogger->warn("Can't remove Edge steiner point:{} in {} {}", EdgSteiner[ie].first,
 					SurEdgs[EdgSteiner[ie].second].iStart, SurEdgs[EdgSteiner[ie].second].iEnd);
 			}
 			else if (ret == 1) {//success remove steiner point
 				nRmvS++;
-				if (infolevel > 2) meshLogger->info("Remove steiner point:{} in {} {}", EdgSteiner[ie].first,
+				if (infolevel >= 2) meshLogger->debug("Remove steiner point:{} in {} {}", EdgSteiner[ie].first,
 					SurEdgs[EdgSteiner[ie].second].iStart, SurEdgs[EdgSteiner[ie].second].iEnd);
 				vector<std::pair<int, int>>::iterator iter = EdgSteiner.begin() + ie;
 				EdgSteiner.erase(iter);//erase this steiner info
@@ -766,23 +676,15 @@ int DT::removeStPass(Args& args) {
 			ie--;
 		}
 	}
-	SteinerOrd.clear();
+	std::reverse(remainingOrder.begin(), remainingOrder.end());
+    SteinerOrd.swap(remainingOrder);
 
-	//try to delete or smooth steiner point in volume
-	auto t3 = getTime_now();
-	for (int i = nSurNodes; i < Nodes.size(); i++) {
-		if (isDelNod(i) || isbndpnt(i) || i == ghost) {
-			continue;
-		}
-		if (!removePnt(i, 100)){
-			smooth_volume(i, true);
-		}
-	}
+    removeInteriorSteiner();
 
 	if (infolevel > 0) {
-		if (EdgSteiner.size() + TriSteiner.size() == 0) meshLogger->info("Keep constrain!");
-		meshLogger->info("Remove Bnd steiner: {}", nRmvS);
-		meshLogger->info("Leave Bnd steiner: {}", (int)EdgSteiner.size() + (int)TriSteiner.size());
+		if (EdgSteiner.size() + TriSteiner.size() == 0) meshLogger->debug("Keep constrain!");
+		meshLogger->debug("Remove Bnd steiner: {}", nRmvS);
+		meshLogger->debug("Leave Bnd steiner: {}", (int)EdgSteiner.size() + (int)TriSteiner.size());
 	}
 	return 0;
 }
@@ -791,15 +693,15 @@ int DT::removeStPass(Args& args) {
 * dig hole
 */
 int DT::ColorVirtualTet(Args& args) {
+    MeshStageLog stageLog(*this, "Classify regions", 1);
 	if (infolevel > 0)
-		meshLogger->info("Color outer tet & hole!");
+		meshLogger->debug("Color outer tet & hole!");
 
-	auto t1 = getTime_now();
 
 	//color all tet
 	int subdomain = ColorTets();
 	if (infolevel > 0)
-		meshLogger->info("Have {} SubDomain.", subdomain);
+		meshLogger->debug("Have {} SubDomain.", subdomain);
 
 	if (args.extrashell) {
 		shellextra();
@@ -818,12 +720,12 @@ int DT::ColorVirtualTet(Args& args) {
         for (int i = ghost; i < static_cast<int>(Nodes.size()); ++i)
             if (!isDelNod(i) && isbndpnt(i)) ++nEdgSteiner;
         for (int i = 0; i < static_cast<int>(Elems.size()); ++i) {
-            if (Elems[i].geo == 0 || isDelEle(i)) continue;
+            if (isvirtualtet(i) || isDelEle(i)) continue;
             for (int n : Elems[i].form)
                 if (!isbndpnt(n) && !counted[n]) { counted[n] = 1; ++innerCount; }
         }
-        meshLogger->info("{} steiner in volume", innerCount);
-        meshLogger->info("{} steiner in Boundary", nEdgSteiner);
+        meshLogger->debug("{} steiner in volume", innerCount);
+        meshLogger->debug("{} steiner in Boundary", nEdgSteiner);
     }
 
     // Lazy index includes all slots, matching the original geo-based scans.
@@ -854,11 +756,10 @@ int DT::ColorVirtualTet(Args& args) {
 		for (int i = 0; i < args.hole.size() / 3; i++) {
             int iSrch = firstSearch;
 			if (infolevel > 0)
-				meshLogger->info("Hole: {} {} {}", args.hole[i * 3], args.hole[i * 3 + 1], args.hole[i * 3 + 2]);
+				meshLogger->debug("Hole: {} {} {}", args.hole[i * 3], args.hole[i * 3 + 1], args.hole[i * 3 + 2]);
 			int findpoint = addNode(args.hole[i * 3], args.hole[i * 3 + 1], args.hole[i * 3 + 2], 0);
 			locate_pnt(findpoint, iSrch);
 			DelNod(findpoint);
-			printf("%d %ld\n", iSrch, Elems[iSrch].geo);
 			int iColor = Elems[iSrch].geo;
             changeRegion(iColor, virtualID);
 		}
@@ -874,7 +775,7 @@ int DT::ColorVirtualTet(Args& args) {
 
 	setAllP2T();
 
-    const bool needRegionBoundary = infolevel > 1 || !args.hole_bnd_vec.empty() || !args.bnd_bodyid.empty();
+    const bool needRegionBoundary = infolevel >= 2 || !args.hole_bnd_vec.empty() || !args.bnd_bodyid.empty();
 	std::set<int> setTriGeo;
 
 	//clean outer steiner point,only do in constrain
@@ -927,7 +828,7 @@ int DT::ColorVirtualTet(Args& args) {
 				}
 			}
 		}
-		//meshLogger->info("TetGeo connect to TriGeo:");
+		//meshLogger->debug("TetGeo connect to TriGeo:");
 		std::map<int, std::set<int>> geo2tet;
 		for (const auto& tid : t2s) {
 			//std::printf("%d : ", tid.first);
@@ -1027,7 +928,6 @@ int DT::ColorVirtualTet(Args& args) {
 			}
 		}
 
-		printf("Body: %d   Face: %d\n", (int)t2s.size(), (int)setTriGeo.size());
 	}
 
 
@@ -1038,15 +938,13 @@ int DT::ColorVirtualTet(Args& args) {
 		SurTris[i].parent = findTriParent(i);
 	}
 
-	auto t2 = getTime_now();
-	if(infolevel>0)
-		meshLogger->info("Color Tet cost:{:.6f}", getTime(t1, t2));
 	return 0;
 }
 
 int DT::RemoveTet(Args& args) {
+    MeshStageLog stageLog(*this, "Remove exterior cells", 1);
 	if (infolevel > 0)
-		meshLogger->info("Remove outer tet & Dig hole!");
+		meshLogger->debug("Remove outer tet & Dig hole!");
 
 	if (ignoreIntersect && (args.optlevel!=1)) {
 		//for Autogrid, Maintain the suspension point
@@ -1071,7 +969,7 @@ int DT::RemoveTet(Args& args) {
 	setAllP2T();
 
 	for (int i = nSurNodes; i < Nodes.size(); i++) {
-		if (isDelNod(i))
+		if (isDelNod(i) || isbndpnt(i))
 			continue;
 		int iElm = getP2T(i);
 		if (isDelEle(iElm))
@@ -1103,31 +1001,31 @@ int DT::RemoveTet(Args& args) {
 
 //add inner point,using default size now
 int DT::MeshRefine(Args& args) {
+    MeshStageLog stageLog(*this, "Refinement", 1);
 	if (!args.refine) {
 		return 0;
 	}
 
-	if (infolevel > 0) meshLogger->info("MeshRefine Start");
+	if (infolevel > 0) meshLogger->debug("MeshRefine Start");
 	if (args.sizingFunc) {
-		if (infolevel > 0) meshLogger->info("Size function control!");
+		if (infolevel > 0) meshLogger->debug("Size function control!");
 	}
 	else if (args.growsize != -1) {//use Boundary transition control
-		if (infolevel > 0) meshLogger->info("Edge grow ratio control: {}", args.growsize);
+		if (infolevel > 0) meshLogger->debug("Edge grow ratio control: {}", args.growsize);
 	}
 	else {
-		if (infolevel > 0) meshLogger->info("Uniform Size control: {}", args.size);
+		if (infolevel > 0) meshLogger->debug("Uniform Size control: {}", args.size);
 	}
 	if (minEdge != -1) {
-		if (infolevel > 0) meshLogger->info("Target Min Edge Length: {}", minEdge);
+		if (infolevel > 0) meshLogger->debug("Target Min Edge Length: {}", minEdge);
 	}
 	if (maxEdge != -1) {
-		if (infolevel > 0) meshLogger->info("Target Max Edge Length: {}", maxEdge);
+		if (infolevel > 0) meshLogger->debug("Target Max Edge Length: {}", maxEdge);
 	}
-	auto t_begin = getTime_now();
 	/*********************** incremental insert inner point *******************/
-	if (infolevel > 0) meshLogger->info("Before mesh refine have tet: {}", (int)Elems.size());
+	if (infolevel > 0) meshLogger->debug("Before mesh refine have tet: {}", (int)Elems.size());
 
-	if (num_threads > 1) {
+	if (/*num_threads > 1*/ 0) {
 		refineBWParallel(*this, args);
 	} else {
 		int loop = 0;
@@ -1136,7 +1034,7 @@ int DT::MeshRefine(Args& args) {
 			int success = 0;
 			int n = Elems.size();
 			for (int i = 0; i < n; i++) {
-				if (isDelEle(i) || isvirtualtet(i))
+				if (isDelEle(i) || isvirtualtet(i) || ishulltet(i))
 					continue;
 				bool wasRejected = rejected[i] != 0;
                 int iNod = createRefineCandidate(i, args, wasRejected);
@@ -1152,7 +1050,7 @@ int DT::MeshRefine(Args& args) {
                     rejected.resize(Elems.size(), 0);
                     for (int t : serialBW.plan.newElements) rejected[t] = 0;
 					updateSize(iNod, args);
-					if (infolevel > 3) {
+					if (infolevel >= 2) {
 						if (Nodes.size() % 1000000 == 0) {
 							printMemoryUsage();
 						}
@@ -1165,7 +1063,7 @@ int DT::MeshRefine(Args& args) {
 			}
 			//
 			if (infolevel > 0)
-				meshLogger->info("Loop:{: <2} add:{: <5} Elem:{: <8} Node:{: <8}", loop++, success, (int)Elems.size(), (int)Nodes.size());
+				meshLogger->debug("Loop:{: <2} add:{: <5} Elem:{: <8} Node:{: <8}", loop++, success, (int)Elems.size(), (int)Nodes.size());
 			if (success == 0)
 				break;//can't create new tet economically
 		}
@@ -1179,9 +1077,7 @@ int DT::MeshRefine(Args& args) {
 			setP2T(Elems[i].form[j], i);
 		}
 	}
-	if (infolevel > 0) meshLogger->info("After mesh refine have tet: {}", (int)Elems.size());
-	auto t_end = getTime_now();
-	if (infolevel > 0) meshLogger->info("MeshRefine cost time  : {}", getTime(t_begin, t_end));
+	if (infolevel > 0) meshLogger->debug("After mesh refine have tet: {}", (int)Elems.size());
 	return 1;
 }
 
@@ -1189,20 +1085,21 @@ int DT::MeshRefine(Args& args) {
 /**************************  algorithm ************************/
 ////////////////////////////////////////////////////////////////
 void DT::buildPntInfo(Mesh& mesh) {
+    MeshStageLog stageLog(*this, "Build point data", 2);
 	nSurNodes = mesh.V.size();
 	nSurTris = mesh.F.size();
 	int ntet = mesh.T.size();
-	if (infolevel > 0) meshLogger->info("Input nods: {}", nSurNodes);
-	if (infolevel > 0) meshLogger->info("Input Tris: {}", nSurTris);
+	if (infolevel > 0) meshLogger->debug("Input nods: {}", nSurNodes);
+	if (infolevel > 0) meshLogger->debug("Input Tris: {}", nSurTris);
 	if (ntet != 0 && infolevel > 0)
-		meshLogger->info("Input Tets: {}", mesh.T.size());
+		meshLogger->debug("Input Tets: {}", mesh.T.size());
 	if (mesh.S.size() != 0 && infolevel > 0)
-		meshLogger->info("Input Segs: {}", mesh.S.size());
+		meshLogger->debug("Input Segs: {}", mesh.S.size());
 	//alloc memory
 	if (ntet == 0) {
 		uint64_t freeM = getFreeMemory();
 		if (infolevel > 0)
-			meshLogger->info("Free Memory: {:.3f} GB", 1.0 * freeM / 1024 / 1024 / 1024);
+			meshLogger->debug("Free Memory: {:.3f} GB", 1.0 * freeM / 1024 / 1024 / 1024);
 
 		uint64_t MaxN = freeM / sizeof(Elem) / 10;
 		uint64_t MaxE = freeM / sizeof(Node) * 0.8;
@@ -1234,7 +1131,7 @@ void DT::buildPntInfo(Mesh& mesh) {
 	dist_max = std::sqrt(std::pow((maxW[0] - minW[0]), 2) +
 		std::pow((maxW[1] - minW[1]), 2) +
 		std::pow((maxW[2] - minW[2]), 2));
-	if (infolevel > 0) meshLogger->info("Diagonal: {}", dist_max);
+	if (infolevel > 0) meshLogger->debug("Diagonal: {}", dist_max);
 	return;
 }
 
@@ -1507,7 +1404,6 @@ int DT::findSphere_tri(const  int p, std::unordered_set<int>& Sphere_tri) {
 	std::queue<int> que;
 	iElm = getP2T(p);
 	if (isNod_in_Tet(p, iElm) == -1) {
-		if (meshLogger->level() != spdlog::level::off) printf("Wrong point to tet! P:%d T:%d\n", p, iElm);
 		meshLogger->error("Wrong point to tet! P:{} T:{}", p, iElm);
 		throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 	}
@@ -1522,7 +1418,6 @@ int DT::findSphere_tri(const  int p, std::unordered_set<int>& Sphere_tri) {
 		int ord = isNod_in_Tet(p, iElm);
 
 		if (ord == -1) {//p don't in iElm
-			if (meshLogger->level() != spdlog::level::off) printf("Wrong point to tet! P:%d T:%d\n", p, iElm);
 			meshLogger->error("Wrong point to tet! P:{} T:{}", p, iElm);
 			throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 		}
@@ -1675,7 +1570,6 @@ bool DT::isMeshEdge(const int p1, const int p2, int* tet) {
 	int iElm = getP2T(p1);
 	if (isNod_in_Tet(p1, iElm) == -1) {
 		return 0;
-		if (meshLogger->level() != spdlog::level::off) printf("Wrong point to tet! P:%d T:%d\n", p1, iElm);
 		meshLogger->error("Wrong point to tet! P:{} T:{}", p1, iElm);
 		throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 	}
@@ -1696,7 +1590,6 @@ bool DT::isMeshFace(const int p1, const int p2, const int p3, int* tet) {
 		return false;
 	int iElm = getP2T(p1);
 	if (isNod_in_Tet(p1, iElm) == -1) {
-		if (meshLogger->level() != spdlog::level::off) printf("Wrong point to tet! P:%d T:%d\n", p1, iElm);
 		meshLogger->error("Wrong point to tet! P:{} T:{}", p1, iElm);
 		throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 	}
@@ -1780,7 +1673,7 @@ int DT::recoverEdge(const int targetE, int fullsearch, int info) {
 
 	if (ret == 1) {
 		if(!isDelSurEdg(targetE))
-			lostE->info = 1;//set this edge is recovered
+			SurEdgs[targetE].info = 1;//set this edge is recovered
 		return 1;
 	}
 	else if (ret < 0) 
@@ -1792,7 +1685,7 @@ int DT::recoverEdge(const int targetE, int fullsearch, int info) {
 
 	if (ret == 1) {
 		if (!isDelSurEdg(targetE))
-			lostE->info = 1;//set this edge is recovered
+			SurEdgs[targetE].info = 1;//set this edge is recovered
 		return 1;
 	}
 	else if (ret < 0) 
@@ -1805,7 +1698,7 @@ int DT::recoverEdge(const int targetE, int fullsearch, int info) {
 		ret = recoverEdgebyFlip(targetE, 0, filpdepth << 1 | 1);
 
 		if (ret == 1) {
-			lostE->info = 1;//set this edge is recovered
+			SurEdgs[targetE].info = 1;//set this edge is recovered
 			return 1;
 		}
 		else if (ret < 0) 
@@ -1814,19 +1707,13 @@ int DT::recoverEdge(const int targetE, int fullsearch, int info) {
 			return ret;
 	}
 
-	if (info > 0) {
-		ret = addinnerSteiner_Edge(targetE, newN, 0);
-
-		if (ret == 0 && info > 1)
-			ret = splitBndEdge(targetE, 1);//intersec point plus
-
-		for (auto iNod : newN) {
-			if (isDelNod(iNod))
-				continue;
-			if (!removePnt(iNod,20))
-				smooth_volume(iNod, true);
-		}
-	}
+    // info: 0 flip only; 1 interior only; 2 interior then boundary; 3 boundary only.
+    if (info == 3) return splitBndEdge(targetE, 1);
+    if (info > 0) {
+        ret = addinnerSteiner_Edge(targetE, newN, 0);
+        if (ret == 0 && info > 1) ret = splitBndEdge(targetE, 1);
+        // Retain useful interior points until both edges and faces are recovered.
+    }
 
 	return ret;
 }
@@ -1892,7 +1779,6 @@ int DT::findIntersectwithEdgs(const int targetE, std::vector<std::array<int, 3>>
 								}
 							}
 							return 0;
-							if (meshLogger->level() != spdlog::level::off) printf("Colline happen, %d located in %d,%d\n", IntersectPnt, p1, p2);
 							meshLogger->error("Colline happen,{} located in {} {}", IntersectPnt, p1, p2);
 							throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 						}
@@ -1995,7 +1881,6 @@ int DT::findIntersectwithEdgs(const int targetE, std::vector<std::array<int, 3>>
 									}
 								}
 								return 0;
-								if (meshLogger->level() != spdlog::level::off) printf("Colline happen, %d located in %d,%d\n", IntersectPnt, p1, p2);
 								meshLogger->error("Colline happen,{} located in {} {}", IntersectPnt, p1, p2);
 								throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 							}
@@ -2057,8 +1942,6 @@ int DT::findIntersectwithEdgs(const int targetE, std::vector<std::array<int, 3>>
 				}
 				if (!ignoreIntersect) {
 					return 0;
-					if (meshLogger->level() != spdlog::level::off)
-					printf("Colline happen, %d located in %d,%d\n", IntersectPnt, p1, p2);
 					meshLogger->error("Colline happen,{} located in {} {}", IntersectPnt, p1, p2);
 					throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 				}
@@ -2165,8 +2048,6 @@ int DT::recoverEdgebyFlip(const int targetE, int dirflag, int info)
 			if (auto* boundaryEntry = BndTri.find(pa, pb, pc)) {
 				const int boundaryIndex = *boundaryEntry;//chcek if it is bnd Tri
 				if (!ignoreIntersect) {
-					if(meshLogger->level()!= spdlog::level::off)
-						printf("Intersection Face: %d: %d,%d,%d | Edge: %d,%d\n", boundaryIndex, pa, pb, pc, p1, p2);
 					meshLogger->error("Intersection Face: {}:{} {} {} | Edge:{} {}", boundaryIndex, pa, pb, pc, p1, p2);
 					//outTempMesh("./temp.vtk");
 					ignoreE(targetE);
@@ -2174,7 +2055,7 @@ int DT::recoverEdgebyFlip(const int targetE, int dirflag, int info)
 					throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 				}
 				else {
-					if (infolevel > 1) meshLogger->warn("Intersection Face: {}:{} {} {} | Edge:{} {}", boundaryIndex, pa, pb, pc, p1, p2);
+					if (infolevel >= 2) meshLogger->warn("Intersection Face: {}:{} {} {} | Edge:{} {}", boundaryIndex, pa, pb, pc, p1, p2);
 					return -1;
 				}
 			}
@@ -2191,8 +2072,6 @@ int DT::recoverEdgebyFlip(const int targetE, int dirflag, int info)
 			pb = Elems[srctet].form[ib];
 			if (isBndEdg(pa, pb)) { //chcek if it is bnd Tri
 				if (!ignoreIntersect) {
-					if (meshLogger->level() != spdlog::level::off)
-						printf("Intersection Edge: %d,%d | %d,%d\n", pa, pb, p1, p2);
 					meshLogger->error("Intersection Edge: {} {} | {} {}", pa, pb, p1, p2);
 					//outTempMesh("./temp.vtk");
 					int ret;
@@ -2217,13 +2096,13 @@ int DT::recoverEdgebyFlip(const int targetE, int dirflag, int info)
 					}
 				}
 				else {
-					if (infolevel > 1) meshLogger->warn("Intersection Edge: {} {} | {} {}", pa, pb, p1, p2);
+					if (infolevel >= 2) meshLogger->warn("Intersection Edge: {} {} | {} {}", pa, pb, p1, p2);
 					return -1;
 				}
 			}
 
 			std::vector<int> rE = { srctet };//store init and new tet
-			if (removeEdge(rE, ia, ib, info >> 1)) {
+			if (removeEdge(rE, ia, ib, info >> 1) == 1) {
 				continue;
 			}
 		}
@@ -2236,15 +2115,10 @@ int DT::recoverEdgebyFlip(const int targetE, int dirflag, int info)
 			std::vector<std::array<int, 3>> Vid;
 			int ret = findIntersectwithEdgs(targetE, Vid);
 			int sus = 0;
-			std::vector<int> mp;
-
-			auto seen = [&](int x) {
-				return std::find(mp.begin(), mp.end(), x) != mp.end();
-				};
+            // A failed neighboring flip does not rule out other intersections.
+            const int searchDepth = std::min(info >> 1, 32);
 
 			for (const auto& it : Vid) {
-				if (seen(it[0]) || seen(it[1]) || seen(it[2]))
-					continue;
 
 				if (it[2] != -1) {
 					//try to remove face
@@ -2256,13 +2130,9 @@ int DT::recoverEdgebyFlip(const int targetE, int dirflag, int info)
 							}
 						}
 						std::vector<int> rf = { srctet };
-						if (removeface(rf, dir,/* info >> 1*/ 1) == 1)
+						if (removeface(rf, dir, searchDepth) == 1)
 							sus++;
-						else {
-							mp.push_back(it[0]);
-							mp.push_back(it[1]);
-							mp.push_back(it[2]);
-						}
+
 					}
 				}
 				else {
@@ -2273,14 +2143,11 @@ int DT::recoverEdgebyFlip(const int targetE, int dirflag, int info)
 							else if (Elems[srctet].form[t] == it[1]) { ib = t; }
 						}
 						std::vector<int> re = { srctet };
-						ret = removeEdge(re, ia, ib, /*info >> 1*/ 1);
+						ret = removeEdge(re, ia, ib, searchDepth);
 
 						if (ret == 1)
 							sus++;
-						else {
-							mp.push_back(it[0]);
-							mp.push_back(it[1]);
-						}
+
 					}
 				}
 			}
@@ -2292,127 +2159,158 @@ int DT::recoverEdgebyFlip(const int targetE, int dirflag, int info)
 	return 0;
 }
 
+
+namespace {
+// One recovery attempt owns all traversal marks and snapshots. No mesh marks
+// are borrowed, and a flip never leaves cached tetrahedron indices in use.
+struct FaceRecoveryPatch {
+    std::vector<std::array<int, 2>> edges;
+    std::vector<std::array<int, 4>> topology;
+    std::vector<int> pending, sphere;
+    std::unordered_set<int> visited;
+    std::unordered_map<uint64_t, int> intersections;
+
+    void collect(DT& mesh, int face) {
+        edges.clear(); topology.clear(); pending.clear(); visited.clear(); intersections.clear();
+        const std::array<int, 3> target = {mesh.SurTris[face].form[0],
+            mesh.SurTris[face].form[1], mesh.SurTris[face].form[2]};
+        double tri[3][3];
+        for (int i=0;i<3;++i) for (int k=0;k<3;++k) tri[i][k]=mesh.Nodes[target[i]].pt[k];
+        auto enqueueTet = [&](int tet) {
+            if (tet>=0 && !mesh.isDelEle(tet) && !mesh.ishulltet(tet) && visited.insert(tet).second)
+                pending.push_back(tet);
+        };
+        // Include vertex contacts and coplanar contacts, not only transverse
+        // intersections. These connect the cut cells in degenerate positions.
+        for (int p:target) {
+            sphere.clear(); mesh.findSphere(p,sphere);
+            for (int tet:sphere) enqueueTet(tet);
+        }
+        for (size_t next=0;next<pending.size();++next) {
+            const int tet=pending[next];
+            std::array<int,4> form;
+            for (int k=0;k<4;++k) form[k]=mesh.Elems[tet].form[k];
+            auto canonical=form; std::sort(canonical.begin(),canonical.end());
+            topology.push_back(canonical);
+            for (int a=0;a<4;++a) for (int b=a+1;b<4;++b) {
+                const int u=std::min(form[a],form[b]),v=std::max(form[a],form[b]);
+                const uint64_t key=(uint64_t(uint32_t(u))<<32)|uint32_t(v);
+                auto hit=intersections.emplace(key,0);
+                if (hit.second) {
+                    double line[2][3]; int code=-1;
+                    for (int k=0;k<3;++k) {line[0][k]=mesh.Nodes[u].pt[k];line[1][k]=mesh.Nodes[v].pt[k];}
+                    dt::GEOM_FUNC::lin_tri_intersect3d(line,tri,&hit.first->second,&code,nullptr);
+                    const int type=hit.first->second;
+                    if ((type==dt::GEOM_FUNC::LTI_INTERSECT_FAC || type==dt::GEOM_FUNC::LTI_INTERSECT_EDG)
+                        && std::find(target.begin(),target.end(),u)==target.end()
+                        && std::find(target.begin(),target.end(),v)==target.end()) edges.push_back({u,v});
+                }
+                if (hit.first->second!=dt::GEOM_FUNC::LTI_INTERSECT_NUL) {
+                    // Traverse the two faces containing this intersecting edge.
+                    for (int k=0;k<4;++k) if (k!=a && k!=b) enqueueTet(mesh.getNeig(tet,k));
+                }
+            }
+        }
+        std::sort(topology.begin(),topology.end());
+    }
+};
+}
+
+int DT::recoverFacebyLocalFlips(const int targetF) {
+    const std::array<int,3> target={SurTris[targetF].form[0],SurTris[targetF].form[1],SurTris[targetF].form[2]};
+    FaceRecoveryPatch patch;
+    std::set<std::vector<std::array<int,4>>> tried;
+    std::vector<int> shell;
+    for (;;) {
+        if (isMeshFace(target[0],target[1],target[2])) return 1;
+        patch.collect(*this,targetF);
+        if (patch.edges.empty() || !tried.insert(patch.topology).second) return 0;
+        for (const auto& edge:patch.edges) {
+            int tet=-1;
+            if (isBndEdg(edge[0],edge[1]) || !isMeshEdge(edge[0],edge[1],&tet)) continue;
+            shell.assign(1,tet);
+            removeEdge(shell,isNod_in_Tet(edge[0],tet),isNod_in_Tet(edge[1],tet),fliplevel_face);
+            if (isMeshFace(target[0],target[1],target[2])) return 1;
+        }
+        // Even a failed edge removal can retain intermediate flips during
+        // recovery. Compare actual topology, rather than just success counts.
+    }
+}
+
 //info == Insertion point method
 int DT::recoverFace(const int targetF, int info) {
-	if (isDelSurTri(targetF) || isRecBndTri(targetF))
-		return 1;
-
-	SurTri* lostF = &SurTris[targetF];
-	fac[0] = lostF->form[0];
-	fac[1] = lostF->form[1];
-	fac[2] = lostF->form[2];
-
-	int ret;
-	//check if the edge of this tet has been recovered
-	for (int i = 0; i < 3; i++) {
-		int targetEdge = BndEdg.get(fac[i], fac[(i + 1) % 3]);
-		if (targetEdge == -1) 
-			return 1;
-		if (isMeshEdge(SurEdgs[targetEdge].iStart, SurEdgs[targetEdge].iEnd)) {
-			continue;
-		}
-		else {
-			SurEdgs[targetEdge].info = -1;
-			while (1) {
-				ret = recoverEdge(targetEdge, 1, 2);
-				if (ret == 1) {
-					return recoverFace(targetF, info);
-				}
-				if (ret != 0) {//split
-					return SurTris.size() - 4;
-				}
-			}
-		}
-	}
-
-	//recover face by flip only
-
-	ret = recoverFacebyFlip_Split(targetF, info < 2 ? 0 : info);
-
-	if (ret == 1) {
-		lostF->info = 1;//set this edge is recovered
-		return 1;
-	}
-	else if (ret > 1) {
-		return ret;
-	}
-	else if (ret == -1) {
-		return ignoreF(targetF);
-	}
-	return 0;
+    if (isDelSurTri(targetF) || isRecBndTri(targetF)) return 1;
+    const std::array<int,3> target = {SurTris[targetF].form[0], SurTris[targetF].form[1], SurTris[targetF].form[2]};
+    for (int j=0;j<3;++j) fac[j]=target[j];
+    for (int j=0;j<3;++j) {
+        const int* edge = BndEdg.find(target[j],target[(j+1)%3]);
+        if (!edge) return 0;
+        const int e=*edge;
+        if (isMeshEdge(SurEdgs[e].iStart,SurEdgs[e].iEnd)) continue;
+        SurEdgs[e].info=-1;
+        const int firstNewFace=static_cast<int>(SurTris.size());
+        const int ret=recoverEdge(e,1,info);
+        for(int k=0;k<3;++k) fac[k]=target[k];
+        seg[0]=seg[1]=-1;
+        if (static_cast<int>(SurTris.size())>firstNewFace) return firstNewFace;
+        if (ret!=1 || !isMeshEdge(SurEdgs[e].iStart,SurEdgs[e].iEnd)) return 0;
+    }
+    // Try every anchor edge with flips before considering a surface split.
+    int ret=recoverFacebyFlip_Split(targetF,0);
+    if (ret==0 && (info>0 || fliplevel_face>=1000)) ret=recoverFacebyLocalFlips(targetF);
+    if (ret==0 && (info==1 || info==2)) {
+        std::vector<int> newNodes;
+        ret=recoverFacebyaddinSt(targetF,newNodes,info);
+        if(ret==0 && !newNodes.empty()) {
+            ret=recoverFacebyFlip_Split(targetF,0);
+            if(ret==0) ret=recoverFacebyLocalFlips(targetF);
+        }
+    }
+    if(ret==0 && info>=2) ret=recoverFacebyFlip_Split(targetF,2);
+    if(ret==1) { if(!isDelSurTri(targetF)) SurTris[targetF].info=1; return 1; }
+    if(ret>1) return ret;
+    if(ret==-1) return ignoreF(targetF);
+    return 0;
 }
 
 int DT::recoverFacebyaddinSt(const int targetF, std::vector<int>& newN, int info) {
-	int dir = -1, srctet = -1, pa = -1, pb = -1, pc = -1, pd = -1, pe = -1, a = -1, b = -1, c = -1, d = -1;
-	int intTyp = -1, intCod = -1, startPidx = -1;
-	bool findIntersectMeshEdg = false;
-	double linep[2][3], facept[3][3], intPnt[3];//, middle[3], mindis;
-	int p1 = SurTris[targetF].form[0];
-	int p2 = SurTris[targetF].form[1];
-	int p3 = SurTris[targetF].form[2];
-
-	for (int k = 0; k < 3; k++) {
-		facept[0][k] = Nodes[p1].pt[k];
-		facept[1][k] = Nodes[p2].pt[k];
-		facept[2][k] = Nodes[p3].pt[k];
-	}
-
-	pa = p1; pb = p2; pe = p3;
-	//find a tet contain p1,p2;
-	dir = finddirection(pa, pb, srctet);
-	a = isNod_in_Tet(pa, srctet);
-	b = dir;//dir return pb's order in srctet
-	DDNC(c, d, a, b);
-	while (1) {
-		pc = Elems[srctet].form[c];
-		pd = Elems[srctet].form[d];
-		if (pc == pe || pd == pe)
-			return 1;//face has been recoverd
-		if (startPidx == -1) {
-			startPidx = pc;
-		}
-		else if (startPidx != -1 && startPidx == pc) {
-			break;
-		}
-
-		if (pc != ghost && pd != ghost) {
-			//check if pc,pd intersect with pa,pb,pc
-			for (int k = 0; k < 3; k++) {
-				linep[0][k] = Nodes[pc].pt[k];
-				linep[1][k] = Nodes[pd].pt[k];
-			}
-			dt::GEOM_FUNC::lin_tri_intersect3d(linep, facept, &intTyp, &intCod, intPnt);
-			if (intTyp == 3) {//intersect with face
-				findIntersectMeshEdg = true;
-				break;
-			}
-		}
-		d = getNeigOrd(srctet, c);
-		srctet = getNeig(srctet, c);
-		for (int j = 0; j < 4; j++) {
-			if (j != d && Elems[srctet].form[j] != pa && Elems[srctet].form[j] != pb) {
-				c = j;//update p0
-				break;
-			}
-		}
-	}
-
-	if (!findIntersectMeshEdg) {
-		return 0;
-	}
-
-	double area = calArea(facept[0], facept[1], facept[2]);
-
-	double dis[2] = { 0 };
-
-	dis[0] = dt::GEOM_FUNC::orient3d(facept[0], facept[1], facept[2], Nodes[pc].pt) / -2.0 / area;
-	dis[1] = dt::GEOM_FUNC::orient3d(facept[0], facept[1], facept[2], Nodes[pd].pt) / -2.0 / area;
-	if (dis[0] <= 0 && dis[1] >= 0) {
-		std::swap(dis[0], dis[1]);
-	}
-
-	int ret = addinnerSteiner_Face(targetF, newN, dis);
-	return ret;
+    const int* target=SurTris[targetF].form;
+    if (isMeshFace(target[0],target[1],target[2])) return 1;
+    double tri[3][3],center[3]={};
+    for (int i=0;i<3;++i) for (int k=0;k<3;++k) {
+        tri[i][k]=Nodes[target[i]].pt[k]; center[k]+=tri[i][k]/3.0;
+    }
+    const double area=calArea(tri[0],tri[1],tri[2]);
+    if (!(area>0)) return 0;
+    FaceRecoveryPatch patch;
+    patch.collect(*this,targetF);
+    double best=0,dis[2]={},base[3]={};
+    for (const auto& edge:patch.edges) {
+        if (isBndEdg(edge[0],edge[1])) continue;
+        double line[2][3],intersection[3]; int type=0,code=-1;
+        for (int i=0;i<2;++i) for (int k=0;k<3;++k) line[i][k]=Nodes[edge[i]].pt[k];
+        dt::GEOM_FUNC::lin_tri_intersect3d(line,tri,&type,&code,intersection);
+        if (type!=dt::GEOM_FUNC::LTI_INTERSECT_FAC) continue;
+        double heights[2];
+        for (int i=0;i<2;++i) heights[i]=-dt::GEOM_FUNC::orient3d(tri[0],tri[1],tri[2],line[i])/(2.0*area);
+        if (heights[0]<0) std::swap(heights[0],heights[1]);
+        if (!(heights[0]>0 && heights[1]<0)) continue;
+        // Favor a residual crossing with room on both sides. Blend its foot
+        // towards the centroid to keep the new points away from facet edges.
+        const double clearance=std::min(heights[0],-heights[1]);
+        if (clearance>best) {
+            best=clearance; dis[0]=heights[0]; dis[1]=heights[1];
+            for (int k=0;k<3;++k) base[k]=center[k]+0.5*(intersection[k]-center[k]);
+        }
+    }
+    if (!(best>0)) return 0;
+    const size_t before=newN.size();
+    int ret=addInteriorFacePoints(targetF,newN,dis,base);
+    // Keep the established centroid fallback when the residual-based position
+    // cannot be inserted at all; do not add another pair after successful BW.
+    if (ret==0 && newN.size()==before && distance2(base,center)>0)
+        ret=addInteriorFacePoints(targetF,newN,dis,center);
+    return ret;
 }
 
 //info mean when to split this face,default:7
@@ -2438,7 +2336,7 @@ int DT::recoverFacebyFlip_Split(const int targetF, int info)
 			else if (i == 1) { pa = p2; pb = p3; pe = p1; }
 			else if (i == 2) { pa = p3; pb = p1; pe = p2; }
 			//find a tet contain p1,p2;
-			isMeshEdge(pa, pb, &srctet);
+			if (!isMeshEdge(pa, pb, &srctet)) return 0;
 			//dir = finddirection(pa, pb, srctet);
 			a = isNod_in_Tet(pa, srctet);
 			b = isNod_in_Tet(pb, srctet);
@@ -2465,7 +2363,7 @@ int DT::recoverFacebyFlip_Split(const int targetF, int info)
 						&& std::find(shellp.begin(), shellp.end(), p2) != shellp.end()
 						&& std::find(shellp.begin(), shellp.end(), p3) != shellp.end()){
 						flip32(shell, c, d, -1);
-						return 0;
+						return isMeshFace(p1,p2,p3) ? 1 : 0;
 					}
 				}
 				else {
@@ -2479,14 +2377,13 @@ int DT::recoverFacebyFlip_Split(const int targetF, int info)
 						if (isBndEdg(pc, pd)) {//intersect input mesh
 							if (!ignoreIntersect) {
 								//outTempMesh("./temp.vtk");
-								if (meshLogger->level() != spdlog::level::off) printf("Intersection Face: %d: %d,%d,%d | Edge: %d,%d\n", targetF, p1, p2, p3, pc, pd);
 								meshLogger->error("Intersection Face: {} : {} {} {} | Edge:{} {}", targetF, p1, p2, p3, pc, pd);
 								ignoreF(targetF);
 								return 1;
 								throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 							}
 							else {
-								if (infolevel > 1) meshLogger->warn("Intersection Face: {} {} {} | Edge:{} {}", p1, p2, p3, pc, pd);
+								if (infolevel >= 2) meshLogger->warn("Intersection Face: {} {} {} | Edge:{} {}", p1, p2, p3, pc, pd);
 								return -1;
 							}
 						}
@@ -2511,8 +2408,11 @@ int DT::recoverFacebyFlip_Split(const int targetF, int info)
 										}
 										else {
 											//only split, no insert
-											std::vector<int> shell;
-											return splitBndTri(targetF, shell, intPnt, intsectpnt);
+											if (info > 1) {
+												std::vector<int> shell;
+												return splitBndTri(targetF, shell, intPnt, intsectpnt);
+											}
+											return 0;
 										}
 									}
 									return 0;
@@ -2547,7 +2447,6 @@ int DT::recoverFacebyFlip_Split(const int targetF, int info)
 					}//if (intTyp == 3)
 					else if (intTyp != 0) {
 						//outTempMesh("./temp.vtk");
-						if (meshLogger->level() != spdlog::level::off) printf("A strange intersect happen: %d\n", intTyp);
 						meshLogger->error("A strange intersect happen:{}", intTyp);
 						throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 					}
@@ -2988,7 +2887,7 @@ int DT::flipBndEdgPass(int nloop) {
 		}
 		//outTempMesh("./temp_" + std::to_string(loop) + ".vtk");
 		if (infolevel > 0) 
-			meshLogger->info("Flip bndEdg: {} of {}, fail: {}", nsuccess, SurEdgs.size(), fail);
+			meshLogger->debug("Flip bndEdg: {}/{}", nsuccess, nsuccess + fail);
 		if (nsuccess < 5) 
 			break;
 	}
@@ -3190,15 +3089,17 @@ int DT::splitBndEdge(const int lostE, int info) {
 						continue;
 					}
 				}
+				else continue;
 
-				double d1 = distance(pnt, Nodes[p1].pt);
-				double d2 = distance(pnt, Nodes[p2].pt);
+				double d1 = distance(tempnt, Nodes[p1].pt);
+				double d2 = distance(tempnt, Nodes[p2].pt);
 
-				dis1 = d1 / (d2 + d1);
+				const long double candidateRatio = d1 / (d2 + d1);
 
-				if (std::fabs(0.5 - dis1) < best) {
+				if (std::fabs(0.5 - candidateRatio) < best) {
 					srchtet = tempvec;
-					best = std::fabs(0.5 - dis1);
+					best = std::fabs(0.5 - candidateRatio);
+					dis1 = candidateRatio;
 					for (int k = 0; k < 3; k++)
 						pnt[k] = tempnt[k];
 				}
@@ -3222,17 +3123,18 @@ int DT::splitBndEdge(const int lostE, int info) {
 						return splitBndEdge(lostE, 0);
 					}
 
-					double d1 = distance(pnt, Nodes[p1].pt);
-					double d2 = distance(pnt, Nodes[p2].pt);
-					dis1 = d1 / (d2 + d1);
+					double d1 = distance(tempnt, Nodes[p1].pt);
+					double d2 = distance(tempnt, Nodes[p2].pt);
+					const long double candidateRatio = d1 / (d2 + d1);
 
-					if (std::fabs(0.5 - dis1) < best) {
+					if (std::fabs(0.5 - candidateRatio) < best) {
 						srchtet.clear();
 						srchtet.push_back(srctet);
 						int forthp = Elems[srctet].form[0] + Elems[srctet].form[1] + Elems[srctet].form[2] + Elems[srctet].form[3] - it[0] - it[1] - it[2];
 						srchtet.push_back(getNeig(srctet, isNod_in_Tet(forthp, srctet)));
 
-						best = std::fabs(0.5 - dis1);
+						best = std::fabs(0.5 - candidateRatio);
+					dis1 = candidateRatio;
 						for (int k = 0; k < 3; k++)
 							pnt[k] = tempnt[k];
 					}
@@ -3246,7 +3148,7 @@ int DT::splitBndEdge(const int lostE, int info) {
 			return splitBndEdge(lostE, 0);
 		}
 
-		space = (Nodes[p1].space * dis1 + Nodes[p2].space * (1 - dis1));
+		space = Nodes[p1].space * (1 - dis1) + Nodes[p2].space * dis1;
 	}
 
 	//before add steiner point,we need to deltet BndTri connect to Edge
@@ -3397,8 +3299,8 @@ int DT::splitBndEdge(const int lostE, int info) {
 		BndTri.add(SurTris[f[i]].form[0], SurTris[f[i]].form[1], SurTris[f[i]].form[2], f[i]);//add this sub bnd Tris
 	}
 
-	if (infolevel > 1)
-		meshLogger->info("Split Edge:{} [{},{}],add steiner:{}", lostE, p1, p2, newp);
+	if (infolevel >= 2)
+		meshLogger->debug("Split Edge:{} [{},{}],add steiner:{}", lostE, p1, p2, newp);
 	return e1;
 }
 
@@ -3409,11 +3311,11 @@ int DT::splitBndEdge(const int lostE, int info) {
 */
 int DT::splitBndTri(const int targetF, std::vector<int>& shell, double intPnt[], int info) {
 	int newp = 0;
-	SurTri* oldf = &SurTris[targetF];
+	const std::array<int, 3> originalForm = {SurTris[targetF].form[0], SurTris[targetF].form[1], SurTris[targetF].form[2]};
 
-	int p1 = oldf->form[0];//one of old Tri point
-	int p2 = oldf->form[1];//one of old Tri point
-	int p3 = oldf->form[2];//one of old Tri point
+	int p1 = originalForm[0];//one of old Tri point
+	int p2 = originalForm[1];//one of old Tri point
+	int p3 = originalForm[2];//one of old Tri point
 	if (info == -1) {//use gravity point
 		double newpt[3];
 		for (int i = 0; i < 3; i++) {
@@ -3456,8 +3358,8 @@ int DT::splitBndTri(const int targetF, std::vector<int>& shell, double intPnt[],
 	for (int i = 0; i < 3; i++) {
 		f[i] = SurTris.size();
 		SurTris.emplace_back(SurTri());//add new surTri
-		SurTris[f[i]].form[0] = oldf->form[i];
-		SurTris[f[i]].form[1] = oldf->form[(i + 1) % 3];
+		SurTris[f[i]].form[0] = originalForm[i];
+		SurTris[f[i]].form[1] = originalForm[(i + 1) % 3];
 		SurTris[f[i]].form[2] = newp;
 		SurTris[f[i]].parent = targetF;
 		SurTris[f[i]].info = 0;
@@ -3467,7 +3369,7 @@ int DT::splitBndTri(const int targetF, std::vector<int>& shell, double intPnt[],
 		e[i] = SurEdgs.size();
 		SurEdgs.emplace_back(SurEdg());//add new surEdg
 		SurEdgs[e[i]].iStart = newp;
-		SurEdgs[e[i]].iEnd = oldf->form[i];
+		SurEdgs[e[i]].iEnd = originalForm[i];
 		SurEdgs[e[i]].face.resize(2);
 		SurEdgs[e[i]].face[0] = f[i];
 		SurEdgs[e[i]].face[1] = f[(i + 2) % 3];
@@ -3476,8 +3378,8 @@ int DT::splitBndTri(const int targetF, std::vector<int>& shell, double intPnt[],
 		BndEdg.add(SurEdgs[e[i]].iStart, SurEdgs[e[i]].iEnd, e[i]);
 	}
 	for (int i = 0; i < 3; i++) {
-		p1 = oldf->form[i];
-		p2 = oldf->form[(i + 1) % 3];
+		p1 = originalForm[i];
+		p2 = originalForm[(i + 1) % 3];
 		int edgid = BndEdg.get(p1, p2);
 		for (int j = 0; j < SurEdgs[edgid].face.size(); j++) {
 			if (SurEdgs[edgid].face[j] == targetF) {
@@ -3487,9 +3389,9 @@ int DT::splitBndTri(const int targetF, std::vector<int>& shell, double intPnt[],
 		}
 	}
 	//link old Tri to sub Tri
-	oldf->info = f[0];
-	if (infolevel > 1)
-		meshLogger->info("Split Tri:{}:{} {} {},add steiner:{}", targetF, oldf->form[0], oldf->form[1], oldf->form[2], newp);
+	SurTris[targetF].info = f[0];
+	if (infolevel >= 2)
+		meshLogger->debug("Split Tri:{}:{} {} {},add steiner:{}", targetF, originalForm[0], originalForm[1], originalForm[2], newp);
 
 	return f[0];
 }
@@ -3506,8 +3408,8 @@ int DT::addinnerSteiner_Edge(const int lostE, std::vector<int>& newN, int info) 
 
 	int pa = SurEdgs[lostE].iStart;
 	int pb = SurEdgs[lostE].iEnd;
-	double* p1 = Nodes[pa].pt;
-	double* p2 = Nodes[pb].pt;
+	double p1[3] = {Nodes[pa].pt[0],Nodes[pa].pt[1],Nodes[pa].pt[2]};
+    double p2[3] = {Nodes[pb].pt[0],Nodes[pb].pt[1],Nodes[pb].pt[2]};
 	double LenEdg = distance(p1, p2);
 	double space = (Nodes[pa].space + Nodes[pb].space) / 2.0;
 	double linep[2][3], facept[3][3], intPnt[3], pnt[3];
@@ -3590,8 +3492,7 @@ int DT::addinnerSteiner_Edge(const int lostE, std::vector<int>& newN, int info) 
 
 					int BW_tet = getP2T(pa);
 					int loc = locate_pnt(newp, BW_tet);
-					if (loc < 1)
-						continue;
+					if (loc < 1) { DelNod(newp); continue; }
 
 					std::vector<int> BW_vec = { srctet,getNeig(srctet,dir)};
 
@@ -3599,8 +3500,7 @@ int DT::addinnerSteiner_Edge(const int lostE, std::vector<int>& newN, int info) 
 
 					if (ret <= 0)
 						DelNod(newp);
-					else
-						newN.push_back(newp);
+					else { ++addst; newN.push_back(newp); }
 				}			
 				if (recoverEdge(lostE, 0, 0) == 1) {
 					return 1;
@@ -3655,7 +3555,7 @@ int DT::addinnerSteiner_Edge(const int lostE, std::vector<int>& newN, int info) 
 						DelNod(newp);
 						continue;
 					}
-					else newN.push_back(newp);
+					else { ++addst; newN.push_back(newp); }
 
 					// direction
 					double norm[3] = { 0 };
@@ -3920,8 +3820,14 @@ int DT::addinnerSteiner_Edge2(const int lostE, std::vector<int>& newN, int info)
 //dis[0],for <p1,p2,p3> is positive
 //dis[1],for <p1,p2,p3> is negative
 int DT::addinnerSteiner_Face(const int lostF, std::vector<int>& newN, double dis[2]) {
+    double center[3]={};
+    for (int i=0;i<3;++i) for (int k=0;k<3;++k) center[k]+=Nodes[SurTris[lostF].form[i]].pt[k]/3.0;
+    return addInteriorFacePoints(lostF,newN,dis,center);
+}
+
+int DT::addInteriorFacePoints(const int lostF, std::vector<int>& newN, const double dis[2], const double base[3]) {
 	int i, j, newp, srchtet, p1, p2, p3;
-	double  norm[3] = { 0 }, pnt[3] = { 0 };
+	double norm[3] = { 0 };
 	p1 = SurTris[lostF].form[0];
 	p2 = SurTris[lostF].form[1];
 	p3 = SurTris[lostF].form[2];
@@ -3929,15 +3835,15 @@ int DT::addinnerSteiner_Face(const int lostF, std::vector<int>& newN, double dis
 	//cal normal
 	calnormal(p1, p2, p3, norm);
 	double normLen = lenvec(norm);
+    if (!(normLen > 0)) return 0;
 	for (i = 0; i < 3; i++)
 		norm[i] /= normLen;
 
 	double space = (Nodes[p1].space + Nodes[p2].space + Nodes[p3].space) / 3.0;//space
-	for (i = 0; i < 3; i++)
-		pnt[i] = (Nodes[p1].pt[i] + Nodes[p2].pt[i] + Nodes[p3].pt[i]) / 3.0;
+
 
 	for (i = 0; i < 2; i++) {
-		double len = dis[i];
+		double len = std::abs(dis[i]); // Both signed distances are lengths on opposite sides.
 
 		//update normal
 		if (i == 1) {
@@ -3954,7 +3860,7 @@ int DT::addinnerSteiner_Face(const int lostF, std::vector<int>& newN, double dis
 				break;
 			}
 			for (j = 0; j < 3; j++) {
-				Nodes[newp].pt[j] = pnt[j] + len * norm[j] * ratio;
+				Nodes[newp].pt[j] = base[j] + len * norm[j] * ratio;
 			}
 			ratio *= 0.5;
 
@@ -3966,11 +3872,7 @@ int DT::addinnerSteiner_Face(const int lostF, std::vector<int>& newN, double dis
 					break;
 			}
 
-			if (ishulltet(srchtet)) {
-				DelNod(newp);
-				break;
-			}
-			else if (loc < 1 || loc == 100 || ishulltet(srchtet)) //iNod is same point,and it's idx = -sameP
+			if (loc < 1 || loc == 100 || ishulltet(srchtet))
 				continue;
 			else if (loc > 15) {//point in face
 				int ord = (loc >> 4) - 1;
@@ -3993,7 +3895,9 @@ int DT::addinnerSteiner_Face(const int lostF, std::vector<int>& newN, double dis
 
 			int ret = BW_insert_vertex(newp, tempS, 3);
 			if (ret <= 0) {
-				DelNod(newp);
+                // BW failure is transactional; reuse this uninserted node for
+                // a shorter step, and release it when this side is exhausted.
+				continue;
 			}
 			else {
 				addst++;
@@ -4044,8 +3948,8 @@ int DT::removeEdgStiner(const int idx, int level) {
 	}
 	else {
 		if (mainfold == 1) {
-			if (infolevel > 2)
-				meshLogger->info("Can't remove single edge steiner now!");
+			if (infolevel >= 2)
+				meshLogger->debug("Can't remove single edge steiner now!");
 			return 2;
 		}
 		/************************** Build subTri Hash ************************/
@@ -4102,7 +4006,7 @@ int DT::removeEdgStiner(const int idx, int level) {
 		}
 		if (color != mainfold) {
 			if (infolevel > 0)
-				meshLogger->info("Remove Edge steiner point {} error,classify sph fail!", idx);
+				meshLogger->debug("Remove Edge steiner point {} error,classify sph fail!", idx);
 			return 0;
 		}
 		/*********************** determine norm and new pt ***********************/
@@ -4346,18 +4250,13 @@ int DT::removeEdgStiner(const int idx, int level) {
 		}
 	}
 	/************************ update SurTris and SurEdgs **************************/
-	//SurEdgs
-	setDelSurEdg(subedg0);				//sub edge 0
-	setDelSurEdg(subedg0 + 1);			//sub edge 1
-	setDelSurEdg(subedg0 + 2);			//sub edge 2
-	setDelSurEdg(subedg0 + 3);			//sub edge 3
-	SurEdgs[lostedg].info = 1;		    //recovered
-	BndEdg.add(p1, p2, lostedg);
-
-	BndEdg.erase(SurEdgs[subedg0 + 3].iStart, SurEdgs[subedg0 + 3].iEnd);//update BndEdg Hash
-	BndEdg.erase(SurEdgs[subedg0 + 2].iStart, SurEdgs[subedg0 + 2].iEnd);//update BndEdg Hash
-	BndEdg.erase(SurEdgs[subedg0 + 1].iStart, SurEdgs[subedg0 + 1].iEnd);//update BndEdg Hash
-	BndEdg.erase(SurEdgs[subedg0].iStart, SurEdgs[subedg0].iEnd);        //update BndEdg Hash
+    // Two half-edges plus one spoke per incident face, including non-manifold edges.
+    for (int child=subedg0; child<subedg0+mainfold+2; ++child) {
+        setDelSurEdg(child);
+        BndEdg.erase(SurEdgs[child].iStart,SurEdgs[child].iEnd);
+    }
+    SurEdgs[lostedg].info=1;
+    BndEdg.add(p1,p2,lostedg);
 
 	for (i = 0; i < SurEdgs[subedg0].face.size(); i++) {
 		SurTri* s = &SurTris[SurEdgs[subedg0].face[i]];   //sub Tri
@@ -4466,7 +4365,7 @@ int DT::removeTriStiner(const int idx) {
 			color++;
 		}
 		if (color != 2) {
-			if (infolevel > 0) meshLogger->info("Remove Face steiner point {} error,classify sph fail!", idx);
+			if (infolevel > 0) meshLogger->debug("Remove Face steiner point {} error,classify sph fail!", idx);
 			return 0;
 		}
 		/*********************** determine norm and new pt ***********************/
@@ -4877,7 +4776,6 @@ int DT::removeEdge(std::vector<int>& oldtet, int ia, int ib, int info, int threa
 	if (oldtet.size() < 3) {
 		//checkMeshError();
 		//printf("%d %d\n", pa, pb);
-		if (meshLogger->level() != spdlog::level::off) printf("Negative Volume Unit\n");
 		meshLogger->error("Opt remove edge {} {} connect to two tet.", pa, pb);
 		throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 	}
@@ -5221,7 +5119,6 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 					}
 					if (havpepd == -1) {//old flipvec is useless
 						if (!isMeshEdge(pd, pe, &havpepd)) {
-							if (meshLogger->level() != spdlog::level::off) printf("Pd and Pe is missing in backtrack flipnm!\n");
 							meshLogger->error("Pd and Pe is missing in backtrack flipnm!");
 							throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 						}
@@ -5235,7 +5132,6 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 					std::vector<int> shell_point;
 					findShell(havpepd, d, e, backtrack, shell_point);
 					if (backtrack.size() != 3) {
-						if (meshLogger->level() != spdlog::level::off) printf("Backtrack flipnm error!\n");
 						meshLogger->error("Backtrack flipnm error!");
 						throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 					}
@@ -5779,6 +5675,7 @@ bool DT::flipintersectcheck(int fliptype, int a, int b, int c, int d, int e) {
 
 /* Transport dt's Nodes and Elems to mesh*/
 int DT::outMesh(Mesh& mesh, Args& args) {
+    MeshStageLog stageLog(*this, "Export mesh", 1);
 	int k = 0;
 
 	//waiting for add clean delete Nodes
@@ -5869,9 +5766,10 @@ int DT::outMesh(Mesh& mesh, Args& args) {
 }
 
 void DT::buildBndInfo(Mesh& mesh, Args& args, bool buildSize) {
+    MeshStageLog stageLog(*this, "Build boundary topology", 2);
 	int i, j, k, m;
 	if (infolevel > 0)
-		meshLogger->info("Build faces&edges' TOPO.");
+		meshLogger->debug("Build faces&edges' TOPO.");
 	//cal Area and destory it
 	SurMeshClean(mesh, args);
 	nSurTris = mesh.F.size(); //update num of surTris, because of surMeshClean
@@ -5949,7 +5847,7 @@ void DT::buildBndInfo(Mesh& mesh, Args& args, bool buildSize) {
 
 	AvgEdgLen /= EdgNum;
 	if (infolevel > 0)
-		meshLogger->info("AveEdgLen: {}", AvgEdgLen);
+		meshLogger->debug("AveEdgLen: {}", AvgEdgLen);
 
 	setAllP2T();//set all point to tet
 
@@ -5980,7 +5878,7 @@ void DT::buildBndInfo(Mesh& mesh, Args& args, bool buildSize) {
 			if (isDelSurEdg(ie) || SurEdgs[ie].face.size() != 1)
 				continue;
 				if(outputnum++ < 3)
-					meshLogger->info("Single edge: {} {}", SurEdgs[ie].iStart, SurEdgs[ie].iEnd);
+					meshLogger->debug("Single edge: {} {}", SurEdgs[ie].iStart, SurEdgs[ie].iEnd);
 				AttachSeg2Pnt(ie);
 		}
 
@@ -6006,7 +5904,7 @@ int DT::AttachPnt2Seg(int iNod,int targetE) {
 			continue;
 		if (P_in_Line(Nodes[iNod].pt, Nodes[p1].pt, Nodes[p2].pt))
 		{
-			if (infolevel > 0) meshLogger->info("Attach {} in {},{}", iNod, p1, p2);
+			if (infolevel > 0) meshLogger->debug("Attach {} in {},{}", iNod, p1, p2);
 
 			int  e1, e2, manifold;
 			std::vector<int> f;
@@ -6156,7 +6054,7 @@ int DT::AttachPnt2Seg(int iNod,int targetE) {
 	}
 
 	//if (infolevel > 0)
-	//	meshLogger->info("{} Attach fail,need try to do Attach to Facet, connect to WYF~",iNod);
+	//	meshLogger->debug("{} Attach fail,need try to do Attach to Facet, connect to WYF~",iNod);
 	return nSe;
 }
 
@@ -6172,7 +6070,7 @@ void  DT::AttachSeg2Pnt(int ie) {
 			continue;
 		if (P_in_Line(Nodes[iNod].pt, Nodes[p1].pt, Nodes[p2].pt))
 		{
-			if (infolevel > 0) meshLogger->info("Attach {} in {},{}", iNod, p1, p2);
+			if (infolevel > 0) meshLogger->debug("Attach {} in {},{}", iNod, p1, p2);
 
 			if (auto* boundaryEntry = BndTri.find(iNod, p1, p2)) {
 				const int boundaryIndex = *boundaryEntry;
@@ -6317,7 +6215,7 @@ void  DT::AttachSeg2Pnt(int ie) {
 	}
 
 	//if (infolevel > 0)
-	//	meshLogger->info("{} Attach fail,need try to do Attach to Facet, connect to WYF~",iNod);
+	//	meshLogger->debug("{} Attach fail,need try to do Attach to Facet, connect to WYF~",iNod);
 	return;
 }
 
@@ -6372,7 +6270,7 @@ void DT::DelSingleEdge(int ie) {
 
 			if (cross) {
 				if (infolevel > 0)
-					meshLogger->info("Ignore single Edge {},{}", p1, p2);
+					meshLogger->debug("Ignore single Edge {},{}", p1, p2);
 				ignoreE(ie);
 				return;
 			}
@@ -6473,12 +6371,12 @@ int DT::ColorTets() {
     };
 	//find hulltet
 	if (ghost != -1) {
-		virtualID = layer;
 		for (int i = 0; i < Elems.size(); i++) {
 			if (isDelEle(i))
 				continue;
 			if (ishulltet(i)) {
-				colorComponent(i, layer++);
+				colorComponent(i, virtualID);
+                ++layer; // Keep physical region numbering starting at 1.
 				break;
 			}
 		}
@@ -6574,7 +6472,7 @@ int DT::shellextra() {
 	int ia, ib, ic, id, pb, pc, pd, nid = 0;
 	std::set<int> Shell;
 	for (int i = 0; i < Elems.size(); i++) {
-		if (Elems[i].geo == 0) {
+		if (isvirtualtet(i)) {
 			for (int j = 0; j < 4; j++) {
 				DNC(j, ia, ib, ic, id);
 				pb = Elems[i].form[ib];
@@ -6673,9 +6571,7 @@ void DT::buildspace(Mesh& mesh, Args& args) {
 			if (isDelNod(i))
 				continue;
 			//querySizeNum++;
-			//auto t_1 = getTime_now();
 			double s = (args.sizingFunc)(Nodes[i].pt[0], Nodes[i].pt[1], Nodes[i].pt[2]);
-			//auto t_2 = getTime_now();
 			//querySizeTime += getTime(t_1, t_2);
 			if (s <= 0) {
 				meshLogger->warn("Input Size <= 0");
@@ -6696,13 +6592,6 @@ void DT::buildspace(Mesh& mesh, Args& args) {
 */
 // Compatibility helper: direct callers retain the original element-bit contract.
 // MeshRefine uses an explicit call-local rejection map instead.
-int DT::creatNewV_Grav(int i, Args& args) {
-    bool rejected = get_bit(Elems[i].info, 28) != 0;
-    int node = createRefineCandidate(i, args, rejected);
-    if (rejected) set_bit(Elems[i].info, 28);
-    return node;
-}
-
 int DT::createRefineCandidate(int i, Args& args, bool& rejected) {
 	int  j, k;
 	double pnt[3] = { 0 }, dp = 0, dt[4] = { 0 }, SizeAlpha = args.size;

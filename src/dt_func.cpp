@@ -90,15 +90,6 @@ namespace {
 	}
 
 
-	static void append_triangle(dt::FineMeshProjection& projection, const dt::Mesh& mesh, const std::array<int, 3>& face) {
-		Eigen::Matrix3d tri;
-		for (int i = 0; i < 3; ++i) {
-			const auto& v = mesh.V[face[i]];
-			tri.row(i) = Eigen::Vector3d(v[0], v[1], v[2]);
-		}
-		projection.triangles.push_back(tri);
-	}
-
 	static std::array<int, 2> sorted_edge_key(int a, int b) {
 		return a < b ? std::array<int, 2>{{ a, b }} : std::array<int, 2>{{ b, a }};
 	}
@@ -136,24 +127,6 @@ namespace {
 		projection.edges.push_back(edge);
 	}
 
-	static bool collect_fine_mesh_boundary_faces(
-		const dt::Mesh& mesh,
-		std::vector<std::array<int, 3>>& faces,
-		std::vector<int>& face_geo
-	) {
-		faces.clear();
-		face_geo.clear();
-
-		for (const auto& face_with_id : mesh.F) {
-			std::array<int, 3> face = {{ face_with_id[0], face_with_id[1], face_with_id[2] }};
-			if (valid_triangle(mesh, face)) {
-				faces.push_back(face);
-				face_geo.push_back(face_with_id[3]);
-			}
-		}
-
-		return !faces.empty();
-	}
 	static bool is_fine_mesh_crease_edge(
 		const dt::Mesh& mesh,
 		const std::array<int, 2>& edge,
@@ -216,9 +189,14 @@ namespace {
 
 		std::vector<std::array<int, 3>> faces;
 		std::vector<int> face_geo;
-		if (!collect_fine_mesh_boundary_faces(mesh, faces, face_geo)) {
-			return;
+		for (const auto& face_with_id : mesh.F) {
+			std::array<int, 3> face = {{face_with_id[0], face_with_id[1], face_with_id[2]}};
+			if (valid_triangle(mesh, face)) {
+				faces.push_back(face);
+				face_geo.push_back(face_with_id[3]);
+			}
 		}
+		if (faces.empty()) return;
 
 		struct EdgeFaceRecord {
 			std::array<int, 3> face;
@@ -287,16 +265,6 @@ namespace {
 		return true;
 	}
 
-	static void extract_boundary_triangles(dt::FineMeshProjection& projection, const dt::Mesh& mesh) {
-		projection.triangles.clear();
-
-		for (const auto& face_with_id : mesh.F) {
-			std::array<int, 3> face = {{ face_with_id[0], face_with_id[1], face_with_id[2] }};
-			if (valid_triangle(mesh, face)) {
-				append_triangle(projection, mesh, face);
-			}
-		}
-	}
 	static Eigen::Vector3d project_boundary_point_to_fine_mesh_bruteforce(
 		const dt::FineMeshProjection& projection,
 		const Eigen::Vector3d& p,
@@ -342,7 +310,16 @@ bool DT::build_fine_mesh_projection_tree(const std::string& fine_mesh_file) {
 		return false;
 	}
 
-	extract_boundary_triangles(projection, fine_mesh);
+	for (const auto& face_with_id : fine_mesh.F) {
+		const std::array<int, 3> face = {{face_with_id[0], face_with_id[1], face_with_id[2]}};
+		if (!valid_triangle(fine_mesh, face)) continue;
+		Eigen::Matrix3d triangle;
+		for (int i = 0; i < 3; ++i) {
+			const auto& vertex = fine_mesh.V[face[i]];
+			triangle.row(i) = Eigen::Vector3d(vertex[0], vertex[1], vertex[2]);
+		}
+		projection.triangles.push_back(triangle);
+	}
 	extract_fine_mesh_feature_edges(projection, fine_mesh);
 	build_fine_mesh_feature_edge_tree(projection);
 	if (projection.triangles.empty()) {
@@ -1335,8 +1312,14 @@ double DT::caltri33_ani(double v1[3], double v2[3], double v3[3], double* AniMet
 }
 
 void DT::printfDihedral(double& minD, double& minAvgD, double& maxD, double& maxAvgD) {
+    if (infolevel <= 0) return;
+    const int minID = calculateDihedral(minD, minAvgD, maxD, maxAvgD);
+    meshLogger->info("Dihedral: min: {:.8f} minAvg: {:.3f} max: {:.3f} maxAvg: {:.3f} minID: {}",
+        minD, minAvgD, maxD, maxAvgD, minID);
+}
+
+int DT::calculateDihedral(double& minD, double& minAvgD, double& maxD, double& maxAvgD) {
     DTParallelScope parallelScope;
-    if (infolevel == 0) return;
     struct alignas(64) Statistics {
         double minAngle = DBL_MAX, maxAngle = DBL_MIN, sumMin = 0, sumMax = 0;
         int count = 0, minID = -1;
@@ -1372,11 +1355,11 @@ void DT::printfDihedral(double& minD, double& minAvgD, double& maxD, double& max
     minD = total.count ? total.minAngle : 0; maxD = total.count ? total.maxAngle : 0;
     minAvgD = total.count ? total.sumMin / total.count : 0;
     maxAvgD = total.count ? total.sumMax / total.count : 0;
-    meshLogger->info("Dihedral: min: {:.8f} minAvg: {:.3f} max: {:.3f} maxAvg: {:.3f} minID: {}",
-        minD, minAvgD, maxD, maxAvgD, total.minID);
+    return total.minID;
 }
 //--------------------- Hilbert sort ---------------------
 void DT::Hilbert(const std::vector<std::array<double, 3>>& V, std::vector<int>& order) {
+    MeshStageLog stageLog(*this, "Hilbert ordering", 2);
 	int  ngroup = 0, Vsize = V.size();
 	std::vector<std::array<double, 4>> Varray;
 	Varray.resize(Vsize);
@@ -2411,7 +2394,6 @@ double DT::getTime(std::chrono::high_resolution_clock::time_point t1,
 }
 
 void DT::prinfPnt(int iNod) {
-	printf("%d %lf %lf %lf\n", iNod, Nodes[iNod].pt[0], Nodes[iNod].pt[1], Nodes[iNod].pt[2]);
 	return;
 }
 
@@ -2721,8 +2703,8 @@ void DT::checkMeshError() {
 		}
 	}
 
-	if (infolevel > 2) {
-		meshLogger->info("Min Volume:{} {} : {},{},{},{}", minidx, minVolum,
+	if (infolevel >= 2) {
+		meshLogger->debug("Min Volume:{} {} : {},{},{},{}", minidx, minVolum,
 			Elems[minidx].form[0], Elems[minidx].form[1], Elems[minidx].form[2], Elems[minidx].form[3]);
 		//std::vector<int> worst = { minidx };
 		//printSph(worst);
@@ -2775,10 +2757,11 @@ void DT::spdlogoutfile(bool outlogfile) {
     fileLogging = true;
 
 	meshLogger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-	meshLogger->set_level(spdlog::level::info);
+	meshLogger->set_level(infolevel == 0 ? spdlog::level::err :
+        infolevel == 1 ? spdlog::level::info : spdlog::level::debug);
 	meshLogger->flush_on(spdlog::level::info);
 
-	meshLogger->info("Log file created: {}", filename.str());
+	meshLogger->debug("Log file created: {}", filename.str());
 }
 
 void DT::checkEdgeDegree() {
@@ -2806,9 +2789,9 @@ void DT::checkEdgeDegree() {
 	}
 	for (int i = 3; i < 10; i++) {
 		sum += count[i];
-		meshLogger->info("{}:{}", i, count[i]);
+		meshLogger->debug("{}:{}", i, count[i]);
 	}
-	meshLogger->info("sum:{}", sum);
+	meshLogger->debug("sum:{}", sum);
 	return;
 }
 
@@ -2831,7 +2814,7 @@ int DT::checkEdgeLen() {
 			}
 		}
 	}
-	meshLogger->info("TE_min  : {:.3f}  TE_max: {:.3f}  AvgE: {:.3f}   MaxE: {:.3f}   MinE: {:.3f}", minEdge, maxEdge, sumE / numE, maxE, minE);
+	meshLogger->debug("TE_min  : {:.3f}  TE_max: {:.3f}  AvgE: {:.3f}   MaxE: {:.3f}   MinE: {:.3f}", minEdge, maxEdge, sumE / numE, maxE, minE);
 	maxE = 0;
 	for (int i = 0; i < SurEdgs.size(); i++) {
 		if (isDelSurEdg(i))
@@ -2849,9 +2832,9 @@ int DT::checkEdgeLen() {
 }
 void DT::printSph(const std::vector<int> Sph) {
 	int i, j;
-	meshLogger->info("Sph size: {}", Sph.size());
+	meshLogger->debug("Sph size: {}", Sph.size());
 	for (i = 0; i < Sph.size(); i++) {
-		meshLogger->info("{}: {} {} {} {}", Sph[i], Elems[Sph[i]].form[0],
+		meshLogger->debug("{}: {} {} {} {}", Sph[i], Elems[Sph[i]].form[0],
 			Elems[Sph[i]].form[1], Elems[Sph[i]].form[2], Elems[Sph[i]].form[3]);
 	}
 	return;
@@ -2909,11 +2892,11 @@ void DT::printMemoryUsage() {
 			SIZE_T freeMemory = memStatus.ullAvailPhys;
 
 			double usedMemoryGB = usedMemory / (1024.0 * 1024 * 1024);
-			meshLogger->info("Used Memory : {:.3f} GB   Free Memory: {:.3f} GB", usedMemoryGB, freeMemory / (1024.0 * 1024 * 1024));
+			meshLogger->debug("Used Memory : {:.3f} GB   Free Memory: {:.3f} GB", usedMemoryGB, freeMemory / (1024.0 * 1024 * 1024));
 
 			if (usedMemoryGB > 0) {
 				double elemsPerGB = Elems.size() / usedMemoryGB / 10000.0;
-				meshLogger->info("Elems Num   : {}   Elems per 1 GB: {:.3f} W", Elems.size(), elemsPerGB);
+				meshLogger->debug("Elems Num   : {}   Elems per 1 GB: {:.3f} W", Elems.size(), elemsPerGB);
 			}
 		}
 	}
@@ -2942,13 +2925,13 @@ void DT::printMemoryUsage() {
 	double totalMemoryGB = totalMemory / 1024.0 / 1024.0;
 	double freeMemoryGB = availableMemory / 1024.0 / 1024.0;
 
-	meshLogger->info("Program Used Memory: {:.3f} GB", usedMemoryGB);
-	meshLogger->info("Total System Memory: {:.3f} GB", totalMemoryGB);
-	meshLogger->info("Free System Memory: {:.3f} GB", freeMemoryGB);
+	meshLogger->debug("Program Used Memory: {:.3f} GB", usedMemoryGB);
+	meshLogger->debug("Total System Memory: {:.3f} GB", totalMemoryGB);
+	meshLogger->debug("Free System Memory: {:.3f} GB", freeMemoryGB);
 
 	if (usedMemoryGB > 0) {
 		double elemsPerGB = Elems.size() / usedMemoryGB / 10000.0;
-		meshLogger->info("Number of Elems: {}  Elems per 1 GB: {:.3f} W", Elems.size(), elemsPerGB);
+		meshLogger->debug("Number of Elems: {}  Elems per 1 GB: {:.3f} W", Elems.size(), elemsPerGB);
 	}
 #endif
 	return;
@@ -2972,4 +2955,23 @@ double DT::getPeakMegabytesUsed()
 #else
 	return 0;
 #endif
+}
+namespace dt {
+MeshStageLog::MeshStageLog(DT& owner, const char* stage, int verbosity)
+    : mesh(owner), name(stage), level(verbosity > 1 ? spdlog::level::debug : spdlog::level::info),
+      active(owner.infolevel >= verbosity && owner.meshLogger->should_log(level)) {
+    if (!active) return;
+    mesh.meshLogger->log(level, "{} begin", name);
+    started = std::chrono::steady_clock::now();
+}
+
+MeshStageLog::~MeshStageLog() noexcept {
+    if (!active) return;
+    try {
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        mesh.meshLogger->log(level, "{}: time={:.6f}s", name, seconds);
+    } catch (...) {
+        // Diagnostics must not replace an algorithm exception during unwinding.
+    }
+}
 }

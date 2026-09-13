@@ -33,7 +33,7 @@ void initializeDTThreads(DT& mesh, const Args& args, size_t pointCount) {
 #endif
     mesh.threadsInitialized = true;
     if (args.infolevel > 0) {
-        mesh.meshLogger->info("DT Thread : {}", mesh.num_threads);
+        mesh.meshLogger->debug("DT Thread : {}", mesh.num_threads);
     }
 }
 }

@@ -1,5 +1,30 @@
 #include "dt.h"
 #include <exception>
+#include "spdlog/sinks/null_sink.h"
+
+namespace {
+constexpr double topologyShortEdgeRatio = 1.0 / 200.0;
+
+// A tiny edge may join two feature vertices created by a narrow surface strip.
+// Bound any geometric relaxation by both its own length and the local shell
+// scale. Locked vertices, normal changes and positive volumes remain checked.
+double shortBoundaryCollapseTolerance(DT& mesh, int pa, int pb, const std::vector<int>& shell) {
+    if (!mesh.improve_step || !mesh.modifyBnd || !mesh.isbndpnt(pa) || !mesh.isbndpnt(pb)) return 0;
+    double longestSquared = 0;
+    for (int t : shell) {
+        if (mesh.ishulltet(t) || mesh.isvirtualtet(t)) continue;
+        for (int e = 0; e < 6; ++e)
+            longestSquared = std::max(longestSquared, mesh.distance2(
+                mesh.Nodes[mesh.Elems[t].form[Egid[e][0]]].pt,
+                mesh.Nodes[mesh.Elems[t].form[Egid[e][1]]].pt));
+    }
+    const double edgeSquared = mesh.distance2(mesh.Nodes[pa].pt, mesh.Nodes[pb].pt);
+    if (!(longestSquared > 0) || !std::isfinite(longestSquared) ||
+        !(edgeSquared < longestSquared * topologyShortEdgeRatio * topologyShortEdgeRatio)) return 0;
+    return std::min(std::sqrt(edgeSquared), 1e-3 * std::sqrt(longestSquared));
+}
+}
+
 //-------------------------mesh improvement-------------------------
 /* optlevel info
 *  0:Don't improvement
@@ -18,11 +43,15 @@
 *  15:UVAT
 */
 int DT::MeshImprove(Args& args) {
+    infolevel = std::max(0, std::min(2, args.infolevel));
+    meshLogger->set_level(infolevel == 0 ? spdlog::level::err :
+        infolevel == 1 ? spdlog::level::info : spdlog::level::debug);
 	if (args.optlevel == 0)
 		return 0;
 	if (infolevel > 0)
-		meshLogger->info("Mesh improve start");
+		meshLogger->debug("Mesh improve start");
 
+    MeshStageLog stageLog(*this, "Optimization", 1);
 	if (!improve_init(args))
 		return 0;
 
@@ -51,7 +80,7 @@ int DT::MeshImprove(Args& args) {
 		return VolumeImprovePass(args);
 	}
 	else {
-		meshLogger->info("This optimization method is awaiting development... ...");
+		meshLogger->warn("This optimization method is awaiting development... ...");
 	}
 
 	return 0;
@@ -81,11 +110,11 @@ int DT::improve_init(Args& args) {
 
 	//printf opt info
 	if (infolevel > 0) {
-		if (args.optlevel == 8) meshLogger->info("Opt_level         : Coarsening");
-		else meshLogger->info("Opt_level          : {}", args.optlevel);
-		meshLogger->info("Opt_Loop_num       : {}", args.optloop);
-		meshLogger->info("Opt_Threshold : {}", args.optTh);
-		meshLogger->info("Opt_Angle_strict: {}", args.optanglestrict);
+		if (args.optlevel == 8) meshLogger->debug("Opt_level         : Coarsening");
+		else meshLogger->debug("Opt_level          : {}", args.optlevel);
+		meshLogger->debug("Opt_Loop_num       : {}", args.optloop);
+		meshLogger->debug("Opt_Threshold : {}", args.optTh);
+		meshLogger->debug("Opt_Angle_strict: {}", args.optanglestrict);
 	}
 
 	return 1;
@@ -112,6 +141,7 @@ int DT::TraditionalOptPass(Args& args) {
 			flipEdgPass(1);
 			improve_step = true;
 		}
+        else if (infolevel > 0) meshLogger->info("Flip bndEdg: {}/{}", 0, 0);
 
 		prepareQuality();
 		TopologicalPass(improve_goal, args.optlevel > 2 ? args.optanglestrict : 0.0, 1);
@@ -472,9 +502,9 @@ int DT::QuicklyOptCoarsePass(Args& args) {
 		improve_step = false;
 
 		int contract1 = contractEdgPass(1e10);
-		if (infolevel > 0) meshLogger->info("Contract  BndEdg: {}", contract1);
+		if (infolevel > 0) meshLogger->debug("Contract  BndEdg: {}", contract1);
 		int contract2 = contshortEdgPass(1e10);
-		if (infolevel > 0) meshLogger->info("Contract MeshEdg: {}", contract2);
+		if (infolevel > 0) meshLogger->debug("Contract MeshEdg: {}", contract2);
 
 		flipEdgPass(1);
 
@@ -494,12 +524,15 @@ int DT::QuicklyOptCoarsePass(Args& args) {
 
 int DT::VolumeImprovePass(Args& args) {
 	//Volume uniformity
-	meshLogger->info("Volume uniformity");
+	meshLogger->debug("Volume uniformity");
 	int nLoop = std::max(args.optloop, 100), ntet, fail = 0, nbad;
 	double minV, maxV, Avg, Energy, Variance, oldminAvgD, max_minAvgD = 0;
 	double minq = 0, minD = 0, minAvgD = 0, maxD = 0, maxAvgD = 0, improve_goal;
-	FILE* outFile = fopen((args.filename + "_" + std::to_string(args.optlevel - 10) + "_Energy.csv").c_str(), "w");
-	fprintf(outFile, " ,Min Volume,Max Volume,TetNum,Avg Volum,Vol Variance,Energy,minD,minAvgD,maxD,maxAvgD\n");
+    // The stopping criterion needs angles even when diagnostic scans are disabled.
+    const auto updateDihedral = [&]() {
+        if (infolevel > 0) printfDihedral(minD, minAvgD, maxD, maxAvgD);
+        else calculateDihedral(minD, minAvgD, maxD, maxAvgD);
+    };
 
 	int smooth_type = args.optlevel < 15 ? args.optlevel - 10 : 0;
 	int Energy_tpye = 2;
@@ -507,12 +540,11 @@ int DT::VolumeImprovePass(Args& args) {
 	if (smooth_type == 1) Energy_tpye = 1;
 	improve_Metric = 3;
 	prepareQuality();
-	meshLogger->info("Initial:");
-	calGlobalEnergy(minV, maxV, ntet, Avg, Variance, Energy, Energy_tpye);
-	printfDihedral(minD, minAvgD, maxD, maxAvgD);
+	meshLogger->debug("Initial:");
+	if (infolevel >= 2) calGlobalEnergy(minV, maxV, ntet, Avg, Variance, Energy, Energy_tpye);
+	updateDihedral();
 	oldminAvgD = minAvgD;
 	max_minAvgD = std::max(max_minAvgD, std::floor(minAvgD * (smooth_type == 0 ? 10.0 : 100.0)) / (smooth_type == 0 ? 10.0 : 100.0));
-	fprintf(outFile, "Initial,%.15lf,%.15lf,%d,%.15lf,%.15lf,%.15lf,%.15lf,%.15lf,%.15lf,%.15lf\n", minV, maxV, ntet, Avg, Variance, Energy, minD, minAvgD, maxD, maxAvgD);
 	for (int loop = 0; loop < nLoop; loop++) {
 		meshLogger->info("Loop {}:", loop);
 		//sizeControlPass(minEdge, maxEdge);
@@ -526,9 +558,8 @@ int DT::VolumeImprovePass(Args& args) {
 		improve_Metric = 3;
 		prepareQuality();
 		SmoothPassForVolume(5, smooth_type);
-		printfDihedral(minD, minAvgD, maxD, maxAvgD);
-		calGlobalEnergy(minV, maxV, ntet, Avg, Variance, Energy, Energy_tpye);
-		fprintf(outFile, "Loop %d,%.15lf,%.15lf,%d,%.15lf,%.15lf,%.15lf,%.15lf,%.15lf,%.15lf,%.15lf\n", loop + 1, minV, maxV, ntet, Avg, Variance, Energy, minD, minAvgD, maxD, maxAvgD);
+		updateDihedral();
+		if (infolevel >= 2) calGlobalEnergy(minV, maxV, ntet, Avg, Variance, Energy, Energy_tpye);
 		//outTempMesh("./temp_" + std::to_string(loop) + ".vtk");
 		if (std::floor(minAvgD * (smooth_type == 0 ? 10.0 : 100.0)) / (smooth_type == 0 ? 10.0 : 100.0) <= max_minAvgD) {
 			fail++;
@@ -554,9 +585,8 @@ int DT::VolumeImprovePass(Args& args) {
 			improve_Metric = 3;
 			prepareQuality();
 			SmoothPassForVolume(5, 1);
-			printfDihedral(minD, minAvgD, maxD, maxAvgD);
-			calGlobalEnergy(minV, maxV, ntet, Avg, Variance, Energy, 1);
-			fprintf(outFile, "Loop %d,%.15lf,%.15lf,%d,%.15lf,%.15lf,%.15lf,%.15lf,%.15lf,%.15lf,%.15lf\n", loop + 1, minV, maxV, ntet, Avg, Variance, Energy, minD, minAvgD, maxD, maxAvgD);
+			updateDihedral();
+			if (infolevel >= 2) calGlobalEnergy(minV, maxV, ntet, Avg, Variance, Energy, 1);
 			if (std::floor(minAvgD * 100.0) / 100.0 <= max_minAvgD) {
 				fail++;
 			}
@@ -568,24 +598,11 @@ int DT::VolumeImprovePass(Args& args) {
 				break;
 		}
 	}
-	//fclose(outFile);
-	//FILE* outVolumeFile = fopen((args.filename + "_" + std::to_string(args.optlevel - 10) + "_volume.csv").c_str(), "w");
-	//for (int i = 0; i < Elems.size(); i++) {
-	//	if (isDelEle(i))
-	//		continue;
-	//	fprintf(outVolumeFile, "%lf\n", calVolume(i));
-	//}
-	//fclose(outVolumeFile);
-	//checkEdgeDegree();
-	//improve_Metric = 2;
-	//prepareQuality();
-	//double improve_goal = std::sin(ANGLE2RADIO(30));//sin(30)
-	//printQuality(improve_goal, nbad, minq, false);
-	//meshLogger->info("{} {} {} {}", minAvgD, minD, maxAvgD, maxD);
 	return 0;
 }
 
 int DT::prepareQuality() {
+    MeshStageLog stageLog(*this, "Evaluate quality", 2);
     DTParallelScope parallelScope;
     const int workers = activeDTThreads(*this, 0, Elems.size());
 #pragma omp parallel for num_threads(workers) schedule(static) if(workers > 1)
@@ -608,7 +625,7 @@ int DT::prepareQuality() {
 			q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt, AniMetric, improve_Metric);
 			if (q < 0) {
 				double ori = calVolume(i);
-				meshLogger->info("Warning:Inverted tet: {} {}", i, ori);
+				meshLogger->warn("Warning:Inverted tet: {} {}", i, ori);
 				q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt, AniMetric, improve_Metric);
 			}
 		}
@@ -633,8 +650,7 @@ int DT::prepareQuality() {
 }
 
 void DT::printQuality(double  improve_goal, int& nbad, double& minq, bool outWorst) {
-	if (infolevel == 0)
-		return;
+	// Quality drives stopping conditions at every verbosity level.
 	int nElem = Elems.size(), nSum = 0;
 	double SumQ = 0;
 	minq = DBL_MAX;
@@ -657,22 +673,9 @@ void DT::printQuality(double  improve_goal, int& nbad, double& minq, bool outWor
 	}
 
 	if (infolevel > 0) {
-		meshLogger->info("Quality : bad:{} minQ:{:3e} avg:{:.3e}", nbad, minq, SumQ / nSum);
+		meshLogger->info("Quality : bad:{} minQ:{:3e} avg:{:.3e}", nbad, minq, nSum ? SumQ / nSum : 0.0);
 	}
 
-	//if (outWorst) {
-	//	std::vector<int> worst;
-	//	for (int i = 0; i < nElem; i++) {
-	//		if (isDelEle(i) || isvirtualtet(i) || ishulltet(i))
-	//			continue;
-
-
-	//		if (Elems[i].q < 1e-5)
-	//			worst.push_back(i);
-
-	//	}
-	//	printSph_VTK(worst, "./worst_" + std::to_string(minq) + ".vtk");
-	//}
 	return;
 }
 
@@ -692,7 +695,7 @@ void DT::updateQuality(int i) {
 		q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt, AniMetric, improve_Metric);
 		//if (q < 0) {
 		//	double ori = calVolume(i);
-		//	meshLogger->info("Warning:Inverted tet: {} {}", i, ori);
+		//	meshLogger->warn("Warning:Inverted tet: {} {}", i, ori);
 		//	q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt, AniMetric, improve_Metric);
 		//}
 	}
@@ -728,6 +731,7 @@ void DT::updateminVolume(void) {
 //if checkQ open ,keep every smooth is improvement
 int DT::SmoothPass(int nloop, double improve_goal)
 {
+    MeshStageLog stageLog(*this, "Smooth", 2);
     DTParallelScope parallelScope;
     if (susReuseIdle) susIdleStates.resize(Nodes.size());
     std::vector<std::vector<int>> colors;
@@ -735,18 +739,23 @@ int DT::SmoothPass(int nloop, double improve_goal)
     size_t maxGroup = 0;
     for (const auto& group : colors) maxGroup = std::max(maxGroup, group.size());
     const int workers = activeDTThreads(*this, 0, maxGroup);
+    long long success = 0, attempts = 0;
     // One team per pass; each color ends with a barrier before the next color.
-#pragma omp parallel num_threads(workers) if(workers > 1)
+#pragma omp parallel num_threads(workers) if(workers > 1) reduction(+:success, attempts)
     {
         for (int loop = 0; loop < nloop; ++loop) {
             for (size_t color = 0; color < colors.size(); ++color) {
                 const auto& group = colors[color];
 #pragma omp for schedule(dynamic, 16)
                 for (int i = 0; i < static_cast<int>(group.size()); ++i)
-                    smooth_sus(group[i]);
+                {
+                    ++attempts;
+                    success += smooth_sus(group[i]) == 1;
+                }
             }
         }
     }
+    if (infolevel > 0) meshLogger->info("Smooth: {}/{}", success, attempts);
     return 1;
 }
 
@@ -885,14 +894,47 @@ bool DT::hasBadDihedral(double angleDegrees) {
     return false;
 }
 
-int DT::tryTopologyInsertion(const TopologyCandidate& candidate, double angleDegrees) {
-    if (!topologyCandidateCurrent(candidate) || !needsTopologyInsertion(candidate.tet, angleDegrees)) return 0;
+int DT::tryTopologyRepair(const TopologyCandidate& candidate, double angleDegrees) {
+    if (parallelTopologyBatch || omp_in_parallel())
+        throw std::logic_error("Topology repair must run outside a parallel region");
+    if (!topologyCandidateCurrent(candidate)) return 0;
+
+    // Collapse is independent of the angle threshold, including when insertion
+    // is disabled. Lengths here are physical lengths, not sizing-field lengths.
+    if (improve_step && modifyBnd) {
+        std::array<double, 6> squaredLengths;
+        double longestSquared = 0;
+        for (int e = 0; e < 6; ++e) {
+            squaredLengths[e] = distance2(Nodes[candidate.form[Egid[e][0]]].pt,
+                Nodes[candidate.form[Egid[e][1]]].pt);
+            longestSquared = std::max(longestSquared, squaredLengths[e]);
+        }
+        if (longestSquared > 0 && std::isfinite(longestSquared)) {
+            const double limit = longestSquared * topologyShortEdgeRatio * topologyShortEdgeRatio;
+            for (int e = 0; e < 6; ++e) {
+                if (!(squaredLengths[e] < limit)) continue;
+                const int p1 = candidate.form[Egid[e][0]], p2 = candidate.form[Egid[e][1]];
+                const int* entry = BndEdg.find(p1, p2);
+                if (!entry || isDelSurEdg(*entry) || SurEdgs[*entry].info > 1 || lockE.count(*entry)) continue;
+                // Preserve distinct feature curves, as in contractEdgPass.
+                if (SurEdgs[*entry].constrain == 0 && collapsePointLevel(p1) >= 2 && collapsePointLevel(p2) >= 2)
+                    continue;
+                // The master entry selects face -> segment -> corner, tries
+                // both directions at equal levels, and handles periodic pairs.
+                if (collapseEdg(*entry) == 1) return 1;
+                if (!topologyCandidateCurrent(candidate)) return 0;
+            }
+        }
+    }
+    if (!needsTopologyInsertion(candidate.tet, angleDegrees)) return 0;
     return removebadtet_addPnt(candidate.tet);
 }
 
 int DT::TopologicalPass(double improve_goal, double insert_angle_degrees, int nloop) {
+    MeshStageLog stageLog(*this, "Topology", 2);
     if (!std::isfinite(insert_angle_degrees) || insert_angle_degrees < 0 || insert_angle_degrees > 180)
         throw std::invalid_argument("Topology insertion angle must be in [0, 180] degrees");
+    size_t totalSuccess = 0, totalCandidates = 0;
     for (int loop = 0; loop < nloop; ++loop) {
         std::vector<TopologyCandidate> candidates;
         for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
@@ -908,13 +950,17 @@ int DT::TopologicalPass(double improve_goal, double insert_angle_degrees, int nl
             success = TopologicalPass_parallel(candidates, improve_goal, insert_angle_degrees, workers);
         else
             success = TopologicalPass_serial(candidates, improve_goal, insert_angle_degrees);
+        totalSuccess += success;
+        totalCandidates += candidates.size();
         if (success < 10) break;
     }
+    if (infolevel > 0) meshLogger->info("Topology: {}/{}", totalSuccess, totalCandidates);
     return 1;
 }
 
 int DT::TopologicalPass_serial(const std::vector<TopologyCandidate>& candidates,
     double improve_goal, double insert_angle_degrees) {
+    MeshStageLog stageLog(*this, "Serial topology", 2);
     int success = 0;
     for (const auto& candidate : candidates) {
         if (!topologyCandidateCurrent(candidate) || Elems[candidate.tet].q < 0 || Elems[candidate.tet].q > improve_goal) continue;
@@ -922,7 +968,7 @@ int DT::TopologicalPass_serial(const std::vector<TopologyCandidate>& candidates,
         const int result = removebadtet(t, -1);
         if (result == 1) ++success;
         else if (result == 0 && t >= 0 && !isDelEle(t))
-            success += tryTopologyInsertion(topologyCandidate(t), insert_angle_degrees) == 1;
+            success += tryTopologyRepair(topologyCandidate(t), insert_angle_degrees) == 1;
     }
     return success;
 }
@@ -968,6 +1014,7 @@ public:
 
 int DT::TopologicalPass_parallel(const std::vector<TopologyCandidate>& candidates,
     double improve_goal, double insert_angle_degrees, int workers) {
+    MeshStageLog stageLog(*this, "Parallel topology", 2);
     DTParallelScope parallelScope;
     workers = std::min(workers, activeDTThreads(*this, 0, candidates.size()));
     if (workers <= 1) return TopologicalPass_serial(candidates, improve_goal, insert_angle_degrees);
@@ -980,31 +1027,52 @@ int DT::TopologicalPass_parallel(const std::vector<TopologyCandidate>& candidate
     TopologyIndexSet seedTets(tetCapacity), readTets(tetCapacity), writeTets(tetCapacity), shellVertices(nodeCapacity);
     TopologyIndexSet visited(tetCapacity);
     std::vector<int> star, points;
+    std::vector<unsigned char> starOrdinals;
+    std::vector<int> batch, result;
+    std::vector<std::exception_ptr> errors;
+    std::vector<TopologyCandidate> failed;
+    batch.reserve(workers); result.reserve(workers); errors.reserve(workers); failed.reserve(workers);
+    // All callers have already checked the tetrahedron index. Keep its four
+    // vertex reads together in this hot, read-only traversal.
+    auto pointOrdinal = [&](int node, int tet) {
+        const auto& cell = Elems[tet];
+        if (cell.info < 0) return -1;
+        for (int j = 0; j < 4; ++j) if (cell.form[j] == node) return j;
+        return -1;
+    };
     // Same traversal as findSphere, using reusable LOCAL visit marks. This
     // lambda runs only during serial planning, never alongside mesh mutation.
     auto findPlanningStar = [&](int node) {
-        star.clear(); visited.clear();
+        star.clear(); starOrdinals.clear(); visited.clear();
         if (node < 0 || node >= static_cast<int>(Nodes.size())) return;
         int seed = getP2T(node);
-        if (seed < 0 || seed >= static_cast<int>(Elems.size()) || isDelEle(seed) || isNod_in_Tet(node, seed) < 0) {
+        int seedOrdinal = seed >= 0 && seed < static_cast<int>(Elems.size())
+            ? pointOrdinal(node, seed) : -1;
+        if (seedOrdinal < 0) {
             seed = -1;
             for (int t = 0; t < static_cast<int>(Elems.size()); ++t)
                 if (!isDelEle(t) && isNod_in_Tet(node, t) >= 0) { seed = t; break; }
         }
         if (seed < 0) return;
-        visited.insert(seed); star.push_back(seed);
+        if (seedOrdinal < 0) seedOrdinal = pointOrdinal(node, seed);
+        visited.insert(seed); star.push_back(seed); starOrdinals.push_back(static_cast<unsigned char>(seedOrdinal));
         for (size_t k = 0; k < star.size(); ++k) {
-            const int t = star[k], ord = isNod_in_Tet(node, t);
+            const int t = star[k], ord = starOrdinals[k];
             for (int f = 0; f < 4; ++f) {
                 if (f == ord) continue;
                 const int next = getNeig(t, f);
-                if (next < 0 || next >= static_cast<int>(Elems.size()) || isDelEle(next) || isNod_in_Tet(node, next) < 0) continue;
-                if (visited.insert(next)) star.push_back(next);
+                // Planning never mutates the mesh: an already visited cell
+                // remains live and contains this node until traversal finishes.
+                if (next < 0 || next >= static_cast<int>(Elems.size()) || visited.count(next)) continue;
+                const int nextOrdinal = pointOrdinal(node, next);
+                if (nextOrdinal < 0) continue;
+                visited.insert(next); star.push_back(next);
+                starOrdinals.push_back(static_cast<unsigned char>(nextOrdinal));
             }
         }
     };
     while (!pending.empty()) {
-        std::vector<int> batch;
+        batch.clear();
         batchReadTets.clear(); batchWriteTets.clear(); batchWriteNodes.clear();
         size_t requiredSlots = 0;
         const size_t lookahead = std::min(pending.size(), static_cast<size_t>(workers) * 8);
@@ -1070,8 +1138,8 @@ int DT::TopologicalPass_parallel(const std::vector<TopologyCandidate>& candidate
             while (Evacancy_thread[w].size() < requiredSlots) {
                 int t = addElem(); DelEle(t, w);
             }
-        std::vector<int> result(batch.size(), 0);
-        std::vector<std::exception_ptr> errors(batch.size());
+        result.assign(batch.size(), 0);
+        errors.assign(batch.size(), std::exception_ptr{});
         parallelTopologyBatch = true;
 #pragma omp parallel for num_threads(workers) schedule(static, 1)
         for (int j = 0; j < static_cast<int>(batch.size()); ++j) {
@@ -1081,15 +1149,15 @@ int DT::TopologicalPass_parallel(const std::vector<TopologyCandidate>& candidate
         parallelTopologyBatch = false;
         for (const auto& error : errors) if (error) std::rethrow_exception(error);
         // Finish this batch's failed attempts before starting another batch.
-        // Snapshot all identities first: one insertion can invalidate another.
-        std::vector<TopologyCandidate> failed;
+        // Snapshot identities first: a collapse or insertion can invalidate another.
+        failed.clear();
         for (size_t j = 0; j < batch.size(); ++j) {
             if (result[j] == 1) ++success;
             else if (result[j] == 0 && batch[j] >= 0 && !isDelEle(batch[j]))
                 failed.push_back(topologyCandidate(batch[j]));
         }
         for (const auto& candidate : failed)
-            success += tryTopologyInsertion(candidate, insert_angle_degrees) == 1;
+            success += tryTopologyRepair(candidate, insert_angle_degrees) == 1;
     }
     return success;
 }
@@ -1435,14 +1503,15 @@ int DT::matchtet(int p[], int t) {
 }
 
 int DT::SmoothPassForVolume(int nloop, int smooth_type) {
+    MeshStageLog stageLog(*this, "Volume smooth", 2);
 	std::vector<int> nodes;
 	evalNodesToSmooth(nodes, 1);
+    long long success = 0, attempts = 0;
 
 	for (int loop = 0; loop < nloop; loop++) {
 		//if constrain,there will change
 		int iSuccess = 0;
 		int iTried = 0;
-		auto t1 = getTime_now();
 		//Volume uniformity
 
 		//Don't use openmp
@@ -1474,10 +1543,10 @@ int DT::SmoothPassForVolume(int nloop, int smooth_type) {
 			}
 		}
 
-		auto t2 = getTime_now();
-		double Timecost = getTime(t1, t2);
-		if (infolevel > 1) meshLogger->info("Try:{} Success:{} Time:{:.3e} Speed:{:.3e}", iTried, iSuccess, Timecost, iTried / Timecost);
+        success += iSuccess;
+        attempts += iTried;
 	}
+    if (infolevel > 0) meshLogger->info("Smooth: {}/{}", success, attempts);
 	return 0;
 }
 /*
@@ -1958,7 +2027,7 @@ void DT::calGlobalEnergy(double& minV, double& maxV, int& nTet,
 		}
 	}
 
-	meshLogger->info("minV:{:.6e} maxV:{:.6e} Num:{} Avg:{:.6e} Variance:{:.6e} Energy:{:.6e}",
+	meshLogger->debug("minV:{:.6e} maxV:{:.6e} Num:{} Avg:{:.6e} Variance:{:.6e} Energy:{:.6e}",
 		minV, maxV, nTet, Avg, Variance, Energy);
 	return;
 }
@@ -1979,6 +2048,7 @@ double DT::getVolEnergy(std::vector<double> volume, std::vector<double> area) {
 
 //#pragma optimize("",off)
 int DT::sizeControlPass(double lower, double upper) {
+    MeshStageLog stageLog(*this, "Size control", 2);
 	int  splitNum = 0, contract = 0;
 	improve_step = false;
 
@@ -1986,10 +2056,10 @@ int DT::sizeControlPass(double lower, double upper) {
 	if (modifyBnd) {
 		for (int i = 0; i < 1; i++) {
 			splitNum = splitBndEdgPass(upper);
-			if (infolevel > 0) meshLogger->info("Split    BndEdge : {}", splitNum);
+			if (infolevel > 0) meshLogger->debug("Split    BndEdge : {}", splitNum);
 
 			contract = contractEdgPass(lower);
-			if (infolevel > 0) meshLogger->info("Contract BndEdge : {}", contract);
+			if (infolevel > 0) meshLogger->debug("Contract BndEdge : {}", contract);
 			
 			flipEdgPass(3);
 
@@ -1998,10 +2068,10 @@ int DT::sizeControlPass(double lower, double upper) {
 
 	//split long Edge
 	splitNum = splitLongEdgPass(upper);
-	if (infolevel > 0) meshLogger->info("Split    : {}", splitNum);
+	if (infolevel > 0) meshLogger->debug("Split    : {}", splitNum);
 
 	contract = contshortEdgPass(lower);
-	if (infolevel > 0) meshLogger->info("Contract : {}", contract);
+	if (infolevel > 0) meshLogger->debug("Contract : {}", contract);
 
 	improve_step = true;
 
@@ -2010,6 +2080,7 @@ int DT::sizeControlPass(double lower, double upper) {
 //#pragma optimize("",on)
 
 int DT::splitBndEdgPass(double upper) {
+    MeshStageLog stageLog(*this, "Split boundary edges", 2);
 	int n = SurEdgs.size(), splitNum = 0;
 	for (int i = 0; i < n; i++) {
 		if (isDelSurEdg(i))
@@ -2212,6 +2283,7 @@ int DT::splitLongEdgPass_noParallel(double upper) {
 
 //#pragma optimize("",off)
 int DT::splitLongEdgPass(double upper) {
+    MeshStageLog stageLog(*this, "Split long edges", 2);
     // Insertion grows shared containers and can expand its cavity beyond a
     // partition. Use the serial insertion path, as in TopologicalPass.
     return splitLongEdgPass_noParallel(upper);
@@ -2247,6 +2319,7 @@ double DT::contractionEdgeLength(int p1, int p2) {
 }
 
 int DT::contractEdgPass(double lower) {
+    MeshStageLog stageLog(*this, "Collapse boundary edges", 2);
 	const int edgeCount = static_cast<int>(SurEdgs.size());
 	int contract = 0;
 
@@ -2276,6 +2349,7 @@ int DT::contractEdgPass(double lower) {
 }
 
 int DT::contshortEdgPass(double lower) {
+    MeshStageLog stageLog(*this, "Collapse short edges", 2);
 	const int elemCount = static_cast<int>(Elems.size());
 	int contract = 0;
 
@@ -2311,10 +2385,14 @@ int DT::contshortEdgPass(double lower) {
 }
 
 int DT::flipEdgPass(int nloop) {
-	if (!modifyBnd)
+    MeshStageLog stageLog(*this, "Boundary flips", 2);
+	if (!modifyBnd) {
+        if (infolevel > 0) meshLogger->info("Flip bndEdg: {}/{}", 0, 0);
 		return 0;
+    }
 
 	int nsuccess = 0;
+    size_t attempts = 0;
 	for (int loop = 0; loop < nloop; loop++) {
 		int tpsuc = 0, fail = 0;
 		for (int i = 0; i < SurEdgs.size(); i++) {
@@ -2356,8 +2434,9 @@ int DT::flipEdgPass(int nloop) {
 			}
 		}
 		nsuccess += tpsuc;
+        attempts += tpsuc + fail;
 		if (infolevel > 0)
-			meshLogger->info("Flip bndEdg: {} of {}, fail: {}", tpsuc, SurEdgs.size(), fail);
+			meshLogger->debug("Boundary flip round: {} of {}, fail: {}", tpsuc, SurEdgs.size(), fail);
 		if (tpsuc == 0)
 			break;
 	}
@@ -2373,6 +2452,7 @@ int DT::flipEdgPass(int nloop) {
 
 	int nvirtual = ColorTetNeig(hullidx, virtualID);
 
+    if (infolevel > 0) meshLogger->info("Flip bndEdg: {}/{}", nsuccess, attempts);
 	return nsuccess;
 }
 
@@ -2383,7 +2463,7 @@ int DT::canDestroyShortEdge(int iElm, int ia, int ib, double Threshold) {
 
 	const int pa = Elems[iElm].form[ia];
 	const int pb = Elems[iElm].form[ib];
-	if (pa == ghost || pa == pb || isDelNod(pa) || (pb != ghost && isDelNod(pb)))
+	if (pa == ghost || pa == pb || isDelNod(pa) || lockV.count(pa) || (pb != ghost && isDelNod(pb)))
 		return 0;
 
 	const int levelA = collapsePointLevel(pa);
@@ -2391,7 +2471,7 @@ int DT::canDestroyShortEdge(int iElm, int ia, int ib, double Threshold) {
 	if (levelA > levelB)
 		return 0;
 	if (isbndpnt(pa) && isbndpnt(pb)) {
-		if (!isBndEdg(pa, pb) || (isCornerpnt(pa) && isCornerpnt(pb)))
+		if (!isBndEdg(pa, pb))
 			return 0;
 	}
 	else if (isbndpnt(pa) && !isbndpnt(pb)) {
@@ -2403,6 +2483,9 @@ int DT::canDestroyShortEdge(int iElm, int ia, int ib, double Threshold) {
 	findShell(iElm, ia, ib, shell, shellPoints);
 	if (shell.empty())
 		return 0;
+    const double shortEdgeTolerance = shortBoundaryCollapseTolerance(*this, pa, pb, shell);
+    if (isCornerpnt(pa) && isCornerpnt(pb) && !(shortEdgeTolerance > 0)) return 0;
+
 
 	for (int tempE : shell) {
 		int ta = -1, tb = -1;
@@ -2443,7 +2526,7 @@ int DT::canDestroyShortEdge(int iElm, int ia, int ib, double Threshold) {
 		std::unordered_set<int> surfaceTriangles;
 		findSphere_tri(pa, surfaceTriangles);
 		const double edgeLength = distance(Nodes[pa].pt, target);
-		const double deviationTolerance = 0.01 * edgeLength;
+		const double deviationTolerance = std::max(0.01 * edgeLength, shortEdgeTolerance);
 		const double minimumNormalCos = std::cos(5.0 * PI / 180.0);
 		int previousSegmentPoint = -1;
 
@@ -2603,7 +2686,7 @@ int DT::destroyShortEdge(int iElm, int ia, int ib, double Threshold) {
 
 	const int pa = Elems[iElm].form[ia];
 	const int pb = Elems[iElm].form[ib];
-	if (pa == ghost || pa == pb || isDelNod(pa) || (pb != ghost && isDelNod(pb)))
+	if (pa == ghost || pa == pb || isDelNod(pa) || lockV.count(pa) || (pb != ghost && isDelNod(pb)))
 		return 0;
 
 	const int levelA = collapsePointLevel(pa);
@@ -2611,7 +2694,7 @@ int DT::destroyShortEdge(int iElm, int ia, int ib, double Threshold) {
 	if (levelA > levelB)
 		return 0;
 	if (isbndpnt(pa) && isbndpnt(pb)) {
-		if (!isBndEdg(pa, pb) || (isCornerpnt(pa) && isCornerpnt(pb)))
+		if (!isBndEdg(pa, pb))
 			return 0;
 	}
 	else if (isbndpnt(pa) && !isbndpnt(pb)) {
@@ -2623,6 +2706,9 @@ int DT::destroyShortEdge(int iElm, int ia, int ib, double Threshold) {
 	findShell(iElm, ia, ib, shell, shellPoints);
 	if (shell.empty())
 		return 0;
+    const double shortEdgeTolerance = shortBoundaryCollapseTolerance(*this, pa, pb, shell);
+    if (isCornerpnt(pa) && isCornerpnt(pb) && !(shortEdgeTolerance > 0)) return 0;
+
 
 	// Reject non-manifold reconnections before changing any topology.
 	for (int tempE : shell) {
@@ -2666,7 +2752,7 @@ int DT::destroyShortEdge(int iElm, int ia, int ib, double Threshold) {
 		std::unordered_set<int> surfaceTriangles;
 		findSphere_tri(pa, surfaceTriangles);
 		const double edgeLength = distance(Nodes[pa].pt, target);
-		const double deviationTolerance = 0.01 * edgeLength;
+		const double deviationTolerance = std::max(0.01 * edgeLength, shortEdgeTolerance);
 		const double minimumNormalCos = std::cos(5.0 * PI / 180.0);
 		int previousSegmentPoint = -1;
 
@@ -2805,8 +2891,9 @@ int DT::destroyShortEdge(int iElm, int ia, int ib, double Threshold) {
 
 	DelNod(pa);
 	if (improve_step) {
-		for (int tempE : sphereA)
-			updateQuality(tempE);
+		for (int tempE : sphereA) {
+			if (!isDelEle(tempE)) updateQuality(tempE);
+		}
 		for (int tempE : sphereB) {
 			if (!isDelEle(tempE))
 				updateQuality(tempE);
@@ -2822,14 +2909,13 @@ void DT::Type_Vertex_Edg(double Angle, const Mesh& mesh) {
 		if (isDelNod(i) || i == ghost)
 			continue;
 		if (isNod_in_Tet(i, getP2T(i)) == -1) {
-			if (meshLogger->level() != spdlog::level::off) printf("Points %d in a suspended surface, unconnected tetrahedrons\n", i);
 			meshLogger->error("Points {} in a suspended surface, unconnected tetrahedrons!", i);
 			//throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 		}
 	}
 
 	if (infolevel > 0) 
-		meshLogger->info("Conforming adaptive angle: {}", Angle);
+		meshLogger->debug("Conforming adaptive angle: {}", Angle);
 	// Currently, we consider Angle as the ridge line.
 	double angleCheck = Angle;
 	for (int index = 0; index < SurEdgs.size(); index++) {
@@ -3057,7 +3143,7 @@ int DT::splitEdg(int index,int deep) {
 			BndTri.add(SurTris[Fidx].form[0], SurTris[Fidx].form[1], SurTris[Fidx].form[2], Fidx);
 		}
 		BndEdg.add(p1, p2, index);
-		//meshLogger->info("Split Bnd Edge {} failed!", index);
+		//meshLogger->debug("Split Bnd Edge {} failed!", index);
 		return 0;
 	}
 	minVolume_bw = oldminVolume_bw;
@@ -3258,12 +3344,10 @@ int DT::splitEdg(int index,int deep) {
 								double oldminVolume_bw = minVolume_bw;
 								double shellVol = DBL_MAX;
 								for (int i = 0; i < shell.size(); i++) {
-									printf("%d %d %d %d\n", Elems[shell[i]].form[0], Elems[shell[i]].form[1], Elems[shell[i]].form[2], Elems[shell[i]].form[3]);
 									if (ishulltet(shell[i]))
 										continue;
-									printf("%.16lf\n",calVolume(shell[i]));
 								}
-								outTempMesh("./temp.vtk");
+								// Explicit mesh export is left to the caller.
 								meshLogger->warn("The periodicity may be disrupted during splitEdg, {} {}", p1, p2);
 							}
 						}
@@ -3298,7 +3382,7 @@ int DT::collapseEdg(int index) {
 }
 
 int DT::canCollapseBoundaryEdgeDirected(int edgeIndex, int deletePoint, int keepPoint) {
-	if (edgeIndex < 0 || edgeIndex >= static_cast<int>(SurEdgs.size()) || isDelSurEdg(edgeIndex))
+	if (edgeIndex < 0 || edgeIndex >= static_cast<int>(SurEdgs.size()) || isDelSurEdg(edgeIndex) || lockE.count(edgeIndex))
 		return 0;
 
 	if (deletePoint < 0 || keepPoint < 0 || deletePoint == keepPoint)
@@ -3345,7 +3429,7 @@ int DT::canCollapseBoundaryEdgeDirected(int edgeIndex, int deletePoint, int keep
 }
 
 int DT::collapseEdg(int index, int expectedDelete, int expectedKeep) {
-	if (index < 0 || index >= static_cast<int>(SurEdgs.size()) || isDelSurEdg(index))
+	if (index < 0 || index >= static_cast<int>(SurEdgs.size()) || isDelSurEdg(index) || lockE.count(index))
 		return 0;
 
 	int p1 = SurEdgs[index].iStart;
@@ -3810,10 +3894,6 @@ int DT::ifflipEdg(int index) {
 	if (!checkFlipNormal(p1, p2, p3, p4))
 		return 0;
 
-	//double ori = dt::GEOM_FUNC::orient3d(Nodes[p1].pt, Nodes[p2].pt, Nodes[p3].pt, Nodes[p4].pt);
-	//if (std::fabs(ori) > 1e-8)
-	//	return 0;
-
 	double disedge = segmentSegmentDistance(Nodes[p1].pt, Nodes[p2].pt, Nodes[p3].pt, Nodes[p4].pt);
 	if (disedge > 1e-1 * distance(Nodes[p1].pt,Nodes[p2].pt))
 		return 0;
@@ -3875,103 +3955,58 @@ int DT::ifflipEdg(int index) {
 }
 
 int DT::checkFlipNormal(int p1, int p2, int p3, int p4) {
-	double nOld1[3], nOld2[3];
-	double nNew1A[3], nNew2A[3];
-	double nNew1B[3], nNew2B[3];
+    using Vec = Eigen::Vector3d;
+    const int ids[4] = {p1, p2, p3, p4};
+    for (int id : ids)
+        if (id < 0 || id >= static_cast<int>(Nodes.size())) return 0;
+    const Vec origin(Nodes[p1].pt[0], Nodes[p1].pt[1], Nodes[p1].pt[2]);
+    std::array<Vec, 4> points;
+    double scale = 0;
+    for (int i = 0; i < 4; ++i) {
+        points[i] = Vec(Nodes[ids[i]].pt[0], Nodes[ids[i]].pt[1], Nodes[ids[i]].pt[2]) - origin;
+        if (!points[i].allFinite()) return 0;
+        scale = std::max(scale, points[i].cwiseAbs().maxCoeff());
+    }
+    if (!(scale > 0)) return 0;
+    for (auto& point : points) point /= scale;
 
-	auto normalCos = [&](double n1[3], double n2[3]) -> double {
-		double l1 = lenvec(n1);
-		double l2 = lenvec(n2);
+    // Relative area detects unreliable normals independently of mesh size.
+    auto normal = [&](int a, int b, int c, Vec& n, double& length) {
+        const Vec ab = points[b] - points[a], ac = points[c] - points[a];
+        const double edgeSquared = std::max(ab.squaredNorm(),
+            std::max(ac.squaredNorm(), (points[c] - points[b]).squaredNorm()));
+        n = ab.cross(ac);
+        length = n.norm();
+        return length > 1e-12 * edgeSquared;
+    };
 
-		double eps = 1e-14 * dist_max * dist_max;
-		if (l1 <= eps || l2 <= eps) {
-			return -2.0;  // invalid normal
-		}
+    Vec old1, old2, next1, next2;
+    double oldLength1, oldLength2, nextLength1, nextLength2;
+    const bool old1Valid = normal(0, 1, 2, old1, oldLength1);
+    const bool old2Valid = normal(1, 0, 3, old2, oldLength2);
+    // Always validate the replacement, even if the old patch is degenerate.
+    if (!normal(2, 3, 0, next1, nextLength1) || !normal(3, 2, 1, next2, nextLength2)) return 0;
+    next1 /= nextLength1;
+    next2 /= nextLength2;
+    const double newCos = next1.dot(next2);
+    if (!old1Valid || !old2Valid) {
+        // Consistent normals exclude overlapping/oppositely oriented faces.
+        return newCos >= std::cos(ANGLE2RADIO(5.0));
+    }
 
-		double c = dot(n1, n2) / (l1 * l2);
-
-		if (c > 1.0) c = 1.0;
-		if (c < -1.0) c = -1.0;
-
-		return c;
-		};
-
-	// 1. Construct old faces with consistent orientation.
-	calnormal(p1, p2, p3, nOld1);
-	calnormal(p2, p1, p4, nOld2);
-
-	double oldCos = normalCos(nOld1, nOld2);
-	if (oldCos < std::cos(ANGLE2RADIO(30.0))) {
-		return 0;
-	}
-
-	// 2. Old patch normal = sum of old normals.
-	double nOld[3] = {
-		nOld1[0] + nOld2[0],
-		nOld1[1] + nOld2[1],
-		nOld1[2] + nOld2[2]
-	};
-
-	if (lenvec(nOld) <= 1e-14 * dist_max * dist_max) {
-		return 0;
-	}
-
-	// 3. Candidate A.
-	calnormal(p3, p4, p1, nNew1A);
-	if (lenvec(nNew1A) < 1e-16) return 0;
-	calnormal(p4, p3, p2, nNew2A);
-	if (lenvec(nNew2A) < 1e-16) return 0;
-	// 4. Candidate B: same geometry, opposite orientation.
-	calnormal(p4, p3, p1, nNew1B);
-	if (lenvec(nNew1B) < 1e-16) return 0;
-	calnormal(p3, p4, p2, nNew2B);
-	if (lenvec(nNew2B) < 1e-16) return 0;
-
-	double scoreA =
-		normalCos(nNew1A, nOld) +
-		normalCos(nNew2A, nOld);
-
-	double scoreB =
-		normalCos(nNew1B, nOld) +
-		normalCos(nNew2B, nOld);
-
-	double* nNew1 = nullptr;
-	double* nNew2 = nullptr;
-
-	if (scoreA >= scoreB) {
-		nNew1 = nNew1A;
-		nNew2 = nNew2A;
-	}
-	else {
-		nNew1 = nNew1B;
-		nNew2 = nNew2B;
-	}
-
-	// 5. Each new face normal must be close to at least one old face normal.
-	//    Angle threshold: 30 degrees.
-	const double minSingleFaceCos = std::cos(ANGLE2RADIO(30)); // cos(30бу)
-
-	double cos11 = normalCos(nNew1, nOld1);
-	double cos12 = normalCos(nNew1, nOld2);
-	double cos21 = normalCos(nNew2, nOld1);
-	double cos22 = normalCos(nNew2, nOld2);
-
-	if (std::max(cos11, cos12) < minSingleFaceCos) {
-		return 0;
-	}
-
-	if (std::max(cos21, cos22) < minSingleFaceCos) {
-		return 0;
-	}
-
-	// 6. New pair of faces should not become much more folded than old pair.
-	double newCos = normalCos(nNew1, nNew2);
-
-	if (newCos < std::cos(ANGLE2RADIO(30.0))) {
-		return 0;
-	}
-
-	return 1;
+    const double minFaceCos = std::cos(ANGLE2RADIO(30.0));
+    const Vec oldPatch = old1 + old2;
+    old1 /= oldLength1;
+    old2 /= oldLength2;
+    if (old1.dot(old2) < minFaceCos || newCos < minFaceCos) return 0;
+    // The reversed candidate has exactly the opposite normals; no need to
+    // recompute both triangles to choose the common orientation.
+    if ((next1 + next2).dot(oldPatch) < 0) {
+        next1 = -next1;
+        next2 = -next2;
+    }
+    return std::max(next1.dot(old1), next1.dot(old2)) >= minFaceCos
+        && std::max(next2.dot(old1), next2.dot(old2)) >= minFaceCos;
 }
 //waiting TODO:virtual tet seting
 int DT::flipEdg(int index , int deep) {
@@ -4198,7 +4233,7 @@ int DT::flipEdg(int index , int deep) {
 	//printSph_VTK(shell, "./shell_" + std::to_string(index) + ".vtk");
 	//if (index == 242504) {
 	//	printSph_VTK(shell,"./shell.vtk");
-	//	//outTempMesh("./temp.vtk");
+	//	//// Explicit mesh export is left to the caller.
 	//	checkMeshError();
 	//	std::string load = "./"+std::to_string(index) + "_out.vtk";
 	//	writeVTK(load, mesh, true);
@@ -4215,10 +4250,17 @@ int DT::flipEdg(int index , int deep) {
 
 	dt::DT d;
     d.parallelMinPointsPerThread = parallelMinPointsPerThread;
-    d.meshLogger->set_level(spdlog::level::off);
+    // This is a speculative local mesh. A rejected trial is a recoverable
+    // optimization detail, not an error of the caller's mesh generation.
+    d.meshLogger = std::make_shared<spdlog::logger>("topology_trial",
+        std::make_shared<spdlog::sinks::null_sink_mt>());
     try {
-        d.tetrahedralize(mesh, tempargs);
+        if (!d.tetrahedralize(mesh, tempargs)) {
+            meshLogger->debug("Local topology trial rejected");
+            return 0;
+        }
     } catch (...) {
+        meshLogger->debug("Local topology trial rejected");
         return 0;
     }
 

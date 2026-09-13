@@ -24,7 +24,7 @@ int main(int argc, char* argv[]) {
 	app.add_option("--minEdge", args.minEdge, "Min Edge Length.(-1 is off) (double, optional, default:-1)");
 	app.add_option("--maxEdge", args.maxEdge, "Max Edge Length.(-1 is off) (double, optional, default:-1)");
 	app.add_option("--growsize", args.growsize, "Edge grow size.(-1 is off) (double, optional, default:>1)");
-	app.add_option("--infolevel", args.infolevel, "Information out level. (int, optional, int:1)");
+	app.add_option("--infolevel", args.infolevel, "Log detail: 0=errors only, 1=main stages/timing/quality, 2=all stage details (default:1)");
 	app.add_option("--watertightcheck", args.watertightcheck, "Check Mesh Hole. (int, optional, int:0)");
 	app.add_option("--dighole", args.hole, "Dig hole's coordinates. (double,double,double)");
 	app.add_option("--diglayer", args.layer, "Dig layer idx,1  (int)");
@@ -55,25 +55,25 @@ int main(int argc, char* argv[]) {
 
 	dt::Mesh mesh;
 	dt::DT d;
-	for (int i = 2 ; i < 500; i++)
-		args.layer.push_back(i);
+    d.infolevel = std::max(0, std::min(2, args.infolevel));
+    d.meshLogger->set_level(d.infolevel == 0 ? spdlog::level::err :
+        d.infolevel == 1 ? spdlog::level::info : spdlog::level::debug);
+	//for (int i = 2 ; i < 500; i++)
+	//	args.layer.push_back(i);
 
-	if (dt::readMesh(in_filename, mesh)) {
+    int readResult;
+    { dt::MeshStageLog readLog(d, "Read input"); readResult = dt::readMesh(in_filename, mesh); }
+	if (readResult) {
 		if (in_per_filename.size() > 0) {
 			readPeriodicP(in_per_filename, args.periodic_P);
 		}
 
 		if (adptype == 0) {
 			if (d.tetrahedralize(mesh, args)){
-				//for (auto it : args.periodic_P)
-				//	printf("%d,", it);
-				dt::writeVTK(out_filename, mesh, outwithsur);
-				//mesh.T.resize(0);
-				//out_filename = "./newin.vtk";
-				//dt::writeVTK(out_filename, mesh, outwithsur);
+				{ dt::MeshStageLog writeLog(d, "Write output"); dt::writeVTK(out_filename, mesh, outwithsur); }
 			}
 			else
-				spdlog::info("tetrahedralize failed!");
+				{ d.meshLogger->error("tetrahedralize failed!"); return 1; }
 		}
 		else {
 			int ret;
@@ -133,9 +133,9 @@ int main(int argc, char* argv[]) {
 			}
 
 			if (ret == 1)
-				dt::writeVTK(out_filename, mesh, outwithsur);
+				{ dt::MeshStageLog writeLog(d, "Write output"); dt::writeVTK(out_filename, mesh, outwithsur); }
 			else
-				spdlog::info("Mesh Adaptation failed!");
+				spdlog::error("Mesh Adaptation failed!");
 		}
 	}
 	else

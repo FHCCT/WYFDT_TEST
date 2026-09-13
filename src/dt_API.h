@@ -27,7 +27,7 @@ namespace dt {
 	};
 
 	struct Args {
-		int infolevel = 1;			//输出信息等级，设置为0输出最少，作为库，建议设置为0
+		int infolevel = 1; // 0: errors only; 1: main stages; 2: detailed stages/quality/timing.
 		int constrain = 1;			//0，conforming;1,constrain
 		int refine = 1;				//是否开启网格细化，默认打开
 		int optlevel = 3;			//优化等级，0~4，0不优化，默认最高4，质量最慢，实测3更好插点

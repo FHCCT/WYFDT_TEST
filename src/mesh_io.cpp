@@ -25,7 +25,7 @@ int dt::readVTK(std::string& filename, Mesh& mesh)
 	std::ifstream vtk_file(filename);
 
 	if (!vtk_file.is_open()) {
-		std::cout << "No such file: " << filename << std::endl;
+		spdlog::error("No such file: {}", filename);
 		return 0;
 	}
 
@@ -56,7 +56,7 @@ int dt::readVTK(std::string& filename, Mesh& mesh)
 			if (words[1] == "POLYDATA") vtk_type_str = "POLYGONS ";
 			else if (words[1] == "UNSTRUCTURED_GRID") vtk_type_str = "CELLS ";
 			else {
-				std::cout << "The format of VTK file is illegal, No clear DATASET name. - " << filename << std::endl;
+				spdlog::error("The format of VTK file is illegal, No clear DATASET name. - {}", filename);
 				return 0;
 			}
 		}
@@ -82,7 +82,7 @@ int dt::readVTK(std::string& filename, Mesh& mesh)
 				std::string dataType;
 
 				if (!(vtk_file >> keyword >> dataType) || keyword != "OFFSETS") {
-					std::cout << "Invalid VTK 5.1 OFFSETS section." << std::endl;
+					spdlog::error("Invalid VTK 5.1 OFFSETS section.");
 					return 0;
 				}
 
@@ -93,7 +93,7 @@ int dt::readVTK(std::string& filename, Mesh& mesh)
 				}
 
 				if (!(vtk_file >> keyword >> dataType) || keyword != "CONNECTIVITY") {
-					std::cout << "Invalid VTK 5.1 CONNECTIVITY section." << std::endl;
+					spdlog::error("Invalid VTK 5.1 CONNECTIVITY section.");
 					return 0;
 				}
 
@@ -274,7 +274,7 @@ int dt::readVTK(std::string& filename, Mesh& mesh)
 int dt::readOBJ(std::string& filename, Mesh& mesh) {
 	std::ifstream obj_file(filename);
 	if (!obj_file.is_open()) {
-		std::cout << "Could not open file: " << filename << std::endl;
+		spdlog::error("Could not open file: {}", filename);
 		return 0;
 	}
 
@@ -291,7 +291,7 @@ int dt::readOBJ(std::string& filename, Mesh& mesh) {
 		// Vertex definition
 		if (tokens[0] == "v") {
 			if (tokens.size() < 4) {
-				std::cout << "Incomplete vertex definition: " << line << std::endl;
+				spdlog::error("Incomplete vertex definition: {}", line);
 				return 0;
 			}
 			std::array<double, 3> vertex = { 0 };
@@ -301,7 +301,7 @@ int dt::readOBJ(std::string& filename, Mesh& mesh) {
 				vertex[2] = std::stod(tokens[3]);
 			}
 			catch (const std::invalid_argument&) {
-				std::cout << "Invalid vertex coordinate: " << line << std::endl;
+				spdlog::error("Invalid vertex coordinate: {}", line);
 				return 0;
 			}
 			mesh.V.push_back(vertex);
@@ -311,7 +311,7 @@ int dt::readOBJ(std::string& filename, Mesh& mesh) {
 			// Only process triangles here
 			// If there's a polygon with more than 3 vertices, you'd need to handle that
 			if (tokens.size() < 4) {
-				std::cout << "Incomplete face definition: " << line << std::endl;
+				spdlog::error("Incomplete face definition: {}", line);
 				return 0;
 			}
 			std::array<int, 4> face = { 0 };
@@ -328,7 +328,7 @@ int dt::readOBJ(std::string& filename, Mesh& mesh) {
 				}
 			}
 			catch (const std::invalid_argument&) {
-				std::cout << "Invalid face index: " << line << std::endl;
+				spdlog::error("Invalid face index: {}", line);
 				return 0;
 			}
 			mesh.F.push_back(face);
@@ -361,14 +361,12 @@ int dt::readMesh(std::string& filename, Mesh& mesh) {
 	);
 
 	if (extension == ".vtk") {
-		spdlog::info("[readMesh] VTK file detected: {} -> calling readVTK...", filename);
 
 		// readVTK currently takes a non-const std::string&
 		std::string filename_non_const = filename;
 		return readVTK(filename_non_const, mesh);
 	}
 	else if (extension == ".obj") {
-		spdlog::info("[readMesh] OBJ file detected: {} -> calling readOBJ...", filename);
 
 		return readOBJ(filename, mesh);
 	}
@@ -455,7 +453,6 @@ int dt::writeVTK(std::string& filename, Mesh& mesh, bool addSurTri)
 	}
 
 	setvbuf(outFile, fileBuffer.data(), _IOFBF, fileBuffer.size());
-	spdlog::info("Writing mesh to - {}", filename);
 
 	fprintf(outFile, "# vtk DataFile Version 2.0\n");
 	fprintf(outFile, "TetWild Mesh\n");
@@ -516,7 +513,7 @@ int dt::writeVTK(std::string& filename, Mesh& mesh, bool addSurTri)
 int dt::readVertex(std::string& filename, std::vector<std::array<double, 4>>& addVertex) {
 	std::ifstream file(filename);
 	if (!file.is_open()) {
-		std::cerr << "无法打开文件: " << filename << std::endl;
+		spdlog::error("无法打开文件: {}", filename);
 		return 0;
 	}
 
@@ -539,7 +536,7 @@ int dt::readVertex(std::string& filename, std::vector<std::array<double, 4>>& ad
 int dt::readRefineT(std::string& filename, std::vector<int>& refine_tet_id) {
 	std::ifstream file(filename);
 	if (!file.is_open()) {
-		std::cerr << "无法打开文件: " << filename << std::endl;
+		spdlog::error("无法打开文件: {}", filename);
 		return 0;
 	}
 
@@ -559,7 +556,7 @@ int dt::readRefineT(std::string& filename, std::vector<int>& refine_tet_id) {
 int dt::readNodesSize(std::string& filename, std::vector<double>& NodeSize) {
 	std::ifstream file(filename);
 	if (!file.is_open()) {
-		std::cerr << "无法打开文件: " << filename << std::endl;
+		spdlog::error("无法打开文件: {}", filename);
 		return 0;
 	}
 
@@ -579,7 +576,7 @@ int dt::readNodesSize(std::string& filename, std::vector<double>& NodeSize) {
 int dt::readPeriodicP(std::string& filename, std::vector<int>& PeriodicP) {
 	std::ifstream file(filename);
 	if (!file.is_open()) {
-		std::cerr << "无法打开文件: " << filename << std::endl;
+		spdlog::error("无法打开文件: {}", filename);
 		return 0;
 	}
 
@@ -600,7 +597,7 @@ int dt::readPeriodicP(std::string& filename, std::vector<int>& PeriodicP) {
 int dt::readAniSol(std::string& filename, std::vector<std::array<double, 6>>& anisol) {
 	std::ifstream file(filename);
 	if (!file.is_open()) {
-		std::cerr << "无法打开文件: " << filename << std::endl;
+		spdlog::error("无法打开文件: {}", filename);
 		return 0;
 	}
 

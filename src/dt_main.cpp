@@ -124,7 +124,7 @@ int main(int argc, char* argv[]) {
 				args.optTh = 0.3;
 				args.optanglestrict = 1;
 				// Keep the user-provided minimum dihedral insertion angle.
-				args.adpangle = 160;
+				args.adpangle = 170;
 				double lamasize = 19.9842;// 45.418557386999999;
 				ret = d.adaptation_by_YunBoSzieControl(mesh, args, lamasize, facetSize, facetNum, elementSize, elementNum);
 			}
@@ -145,7 +145,7 @@ int main(int argc, char* argv[]) {
 }
 #endif
 
-#ifdef DT_LIBRARY
+#if defined(DT_LIBRARY) && !defined(DT_EXEC)
 DECL_VOLTET int API_Tetrahedralize(
 	dt::Mesh& mesh,
 	dt::Args& args)

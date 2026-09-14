@@ -65,7 +65,7 @@ int DT::dt_init(Mesh& mesh, Args& args)
 	spdlogoutfile(args.outlogfile);
     meshLogger->set_level(infolevel == 0 ? spdlog::level::err :
         infolevel == 1 ? spdlog::level::info : spdlog::level::debug);
-	if (infolevel > 0) meshLogger->info("Version 2026.09.13");
+	if (infolevel > 0) meshLogger->info("Version 2026.09.14");
     MeshStageLog initLog(*this, "Initialize");
 	improve_step = false;
 	cos_collinear_ang_tol = cos(179.9999 / 180. * PI);
@@ -104,6 +104,19 @@ int DT::dt_init(Mesh& mesh, Args& args)
 
 	threadsInitialized = false; // dt_init starts a new run, even on a reused DT object.
 	initializeDTThreads(*this, args, mesh.V.size());
+
+    if (infolevel > 0) {
+        meshLogger->info("constrain: {}", args.constrain);
+        if (args.refine == 1)
+            meshLogger->info("refine: {} size={} minEdge={} maxEdge={} growsize={}",
+                args.refine, args.size, args.minEdge, args.maxEdge, args.growsize);
+        else
+            meshLogger->info("refine: {}", args.refine);
+        meshLogger->info("nthread: {} (requested={}, initial={})", num_threads,
+            args.nthread, activeDTThreads(*this, mesh.V.size()));
+        meshLogger->info("optlevel: {} optloop={} optanglestrict={} optTh={} adpangle={}",
+            args.optlevel, args.optloop, args.optanglestrict, args.optTh, args.adpangle);
+    }
 
 	for (int i = 0; i < args.periodic_P.size() / 2; i++) {
 		int a = args.periodic_P[i * 2];

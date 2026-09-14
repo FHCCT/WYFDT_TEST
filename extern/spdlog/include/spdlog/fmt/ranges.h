@@ -5,7 +5,7 @@
 
 #pragma once
 //
-// include bundled or external copy of fmtlib's chrono support
+// include bundled or external copy of fmtlib's ranges support
 //
 #include <spdlog/tweakme.h>
 
@@ -16,8 +16,8 @@
 #define FMT_HEADER_ONLY
 #endif
 #endif
-#include <spdlog/fmt/bundled/chrono.h>
+#include <spdlog/fmt/bundled/ranges.h>
 #else
-#include <fmt/chrono.h>
+#include <fmt/ranges.h>
 #endif
 #endif

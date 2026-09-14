@@ -41,6 +41,10 @@ cmake --build build --config Release --parallel 4
 
 大于 2 的旧参数按 2 处理。Quality 汇总使用当前优化度量，不再输出步骤前后的 SUS 质量快照。infolevel 为 0 时跳过二面角打印函数及其统计；体积优化停止判据需要的二面角仍独立计算。日志等级不改变迭代停止条件或网格结果，也不修改宿主程序的全局日志等级。计时按阶段汇总，不输出逐点性能日志；默认不生成 CSV 或临时网格文件。
 
+`dt_init` 在 `infolevel > 0` 时汇总 `constrain`、`refine`、线程数及优化参数；`refine == 1` 时另列 `size`、`minEdge`、`maxEdge`、`growsize`。线程数区分配置上限、用户请求值和按输入规模选出的初始线程数，后续阶段仍会动态调整。
+
 ## 依赖
 
 第三方代码保留原版权说明。Eigen 的许可见 `extern/eigen/COPYING*`，spdlog 的许可见 `extern/spdlog/LICENSE`，CLI11 的许可位于 `extern/cli11/CLI11.hpp` 文件头。
+
+日志依赖使用 [spdlog 1.17.0](https://github.com/gabime/spdlog/releases/tag/v1.17.0) 及该版本配套的 fmt 12.1.0，位于 `extern/spdlog`。仅保留官方完整头文件和许可证，不引入示例、测试、源码构建目录或额外库目标。fmt 许可证位于 `include/spdlog/fmt/bundled/fmt.license.rst`。MSVC 构建使用 `FMT_UNICODE=0` 兼容现有 Windows 源码编码；通过 CMake 链接 `dt` 时自动继承该配置。

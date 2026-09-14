@@ -69,8 +69,9 @@ int main(int argc, char* argv[]) {
 		}
 
 		if (adptype == 0) {
-			if (d.tetrahedralize(mesh, args)){
-				{ dt::MeshStageLog writeLog(d, "Write output"); dt::writeVTK(out_filename, mesh, outwithsur); }
+			if (d.tetrahedralize(mesh, args)) {
+				if (d.infolevel > 0) d.meshLogger->info("Writing mesh to: {}", out_filename);
+				dt::writeVTK(out_filename, mesh, outwithsur);
 			}
 			else
 				{ d.meshLogger->error("tetrahedralize failed!"); return 1; }
@@ -132,8 +133,10 @@ int main(int argc, char* argv[]) {
 				ret = d.optimization(mesh, args);
 			}
 
-			if (ret == 1)
-				{ dt::MeshStageLog writeLog(d, "Write output"); dt::writeVTK(out_filename, mesh, outwithsur); }
+			if (ret == 1) {
+				if (d.infolevel > 0) d.meshLogger->info("Writing mesh to: {}", out_filename);
+				dt::writeVTK(out_filename, mesh, outwithsur);
+			}
 			else
 				spdlog::error("Mesh Adaptation failed!");
 		}

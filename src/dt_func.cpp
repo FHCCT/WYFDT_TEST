@@ -2957,19 +2957,41 @@ double DT::getPeakMegabytesUsed()
 #endif
 }
 namespace dt {
-MeshStageLog::MeshStageLog(DT& owner, const char* stage, int verbosity)
+MeshStageLog::MeshStageLog(DT& owner, const char* stage, int verbosity, MeshStageSummary report)
     : mesh(owner), name(stage), level(verbosity > 1 ? spdlog::level::debug : spdlog::level::info),
-      active(owner.infolevel >= verbosity && owner.meshLogger->should_log(level)) {
+      active(owner.infolevel >= verbosity && owner.meshLogger->should_log(level)), summary(report) {
     if (!active) return;
+    if (summary == MeshStageSummary::MeshChange) initialTets = countTets();
     mesh.meshLogger->log(level, "{} begin", name);
     started = std::chrono::steady_clock::now();
 }
 
-MeshStageLog::~MeshStageLog() noexcept {
+size_t MeshStageLog::countTets() const {
+    size_t count = 0;
+    for (int t = 0; t < static_cast<int>(mesh.Elems.size()); ++t)
+        if (!mesh.isDelEle(t) && !mesh.isvirtualtet(t) && !mesh.ishulltet(t)) ++count;
+    return count;
+}
+
+MeshStageLog::~MeshStageLog() noexcept { finish(); }
+
+void MeshStageLog::finish(size_t finalTets) noexcept {
     if (!active) return;
+    active = false;
     try {
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-        mesh.meshLogger->log(level, "{}: time={:.6f}s", name, seconds);
+        if (summary == MeshStageSummary::Time) {
+            mesh.meshLogger->log(level, "{}: time={:.6f}s", name, seconds);
+            return;
+        }
+        if (finalTets == size_t(-1)) finalTets = countTets();
+        const double speed = seconds > 0 ? static_cast<double>(finalTets) / seconds / 10000.0 : 0;
+        if (summary == MeshStageSummary::MeshChange)
+            mesh.meshLogger->log(level, "{}: time={:.6f}s tets={}->{} speed={:.3f} W/s",
+                name, seconds, initialTets, finalTets, speed);
+        else
+            mesh.meshLogger->log(level, "{}: time={:.6f}s tets={} speed={:.3f} W/s",
+                name, seconds, finalTets, speed);
     } catch (...) {
         // Diagnostics must not replace an algorithm exception during unwinding.
     }

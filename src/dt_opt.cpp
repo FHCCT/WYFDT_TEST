@@ -51,7 +51,7 @@ int DT::MeshImprove(Args& args) {
 	if (infolevel > 0)
 		meshLogger->debug("Mesh improve start");
 
-    MeshStageLog stageLog(*this, "Optimization", 1);
+    MeshStageLog stageLog(*this, "Optimization", 1, MeshStageSummary::MeshChange);
 	if (!improve_init(args))
 		return 0;
 

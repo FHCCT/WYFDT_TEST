@@ -43,6 +43,8 @@ cmake --build build --config Release --parallel 4
 
 `dt_init` 在 `infolevel > 0` 时汇总 `constrain`、`refine`、线程数及优化参数；`refine == 1` 时另列 `size`、`minEdge`、`maxEdge`、`growsize`。线程数区分配置上限、用户请求值和按输入规模选出的初始线程数，后续阶段仍会动态调整。
 
+初始化同时输出输入点、线段、三角面和四面体数量。生成阶段在细化结束后汇总网格量与速度，计时涵盖边界点插入、边界恢复、区域分类及细化；优化阶段输出四面体数 `A->B` 和速度；`adaptation_by_YunBoSzieControl` 在导出网格后汇总最终四面体数、总耗时和速度。速度统一为 `W/s`（万个四面体每秒），按阶段结束四面体数除以耗时再除以 10000 计算。内部计数排除删除、虚拟和包围单元；自适应结束计数使用实际导出网格。文件写出只显示路径，不再计时。
+
 ## 依赖
 
 第三方代码保留原版权说明。Eigen 的许可见 `extern/eigen/COPYING*`，spdlog 的许可见 `extern/spdlog/LICENSE`，CLI11 的许可位于 `extern/cli11/CLI11.hpp` 文件头。

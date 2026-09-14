@@ -13,17 +13,19 @@ int DT::tetrahedralize(Mesh& mesh, Args& args)
 		return 0;
     MeshStageLog totalLog(*this, "Tetrahedralize");
 
-	if (!BndPntInst(mesh, args)) {
-        meshLogger->error("Boundary point insertion failed");
-        return 0;
+    {
+        MeshStageLog generationLog(*this, "Generation", 1, MeshStageSummary::MeshCount);
+        if (!BndPntInst(mesh, args)) {
+            meshLogger->error("Boundary point insertion failed");
+            return 0;
+        }
+
+        BoudaryRecover(mesh, args);
+
+        ColorVirtualTet(args);
+
+        MeshRefine(args);
     }
-
-	BoudaryRecover(mesh, args);
-
-	ColorVirtualTet(args);
-
-	MeshRefine(args);
-
 
 	MeshImprove(args);
 	RemoveTet(args);
@@ -67,6 +69,9 @@ int DT::dt_init(Mesh& mesh, Args& args)
         infolevel == 1 ? spdlog::level::info : spdlog::level::debug);
 	if (infolevel > 0) meshLogger->info("Version 2026.09.14");
     MeshStageLog initLog(*this, "Initialize");
+    if (infolevel > 0)
+        meshLogger->info("Input mesh: points={} segments={} triangles={} tets={}",
+            mesh.V.size(), mesh.S.size(), mesh.F.size(), mesh.T.size());
 	improve_step = false;
 	cos_collinear_ang_tol = cos(179.9999 / 180. * PI);
 	seg[0] = seg[1] = -1;
@@ -1102,12 +1107,6 @@ void DT::buildPntInfo(Mesh& mesh) {
 	nSurNodes = mesh.V.size();
 	nSurTris = mesh.F.size();
 	int ntet = mesh.T.size();
-	if (infolevel > 0) meshLogger->debug("Input nods: {}", nSurNodes);
-	if (infolevel > 0) meshLogger->debug("Input Tris: {}", nSurTris);
-	if (ntet != 0 && infolevel > 0)
-		meshLogger->debug("Input Tets: {}", mesh.T.size());
-	if (mesh.S.size() != 0 && infolevel > 0)
-		meshLogger->debug("Input Segs: {}", mesh.S.size());
 	//alloc memory
 	if (ntet == 0) {
 		uint64_t freeM = getFreeMemory();

@@ -312,7 +312,7 @@ int DT::adaptation_by_YunBoSzieControl(
 
 	//Rebuild TOPO
 	if (!dt_init(mesh, args)) return 1;
-    MeshStageLog stageLog(*this, "adaptation_by_YunBoSzieControl");
+    MeshStageLog stageLog(*this, "adaptation_by_YunBoSzieControl", 1, MeshStageSummary::MeshCount);
 	buildTetInfo(mesh, args);
 
 	//Split Long Edge
@@ -330,6 +330,7 @@ int DT::adaptation_by_YunBoSzieControl(
 
 	RemoveTet(args);
 	outMesh(mesh, args);
+    stageLog.finish(mesh.T.size());
 
 	return 1;
 }

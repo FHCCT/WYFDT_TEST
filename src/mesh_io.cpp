@@ -2,8 +2,6 @@
 #include <array>
 #include <cstring>
 
-#define BUFFER_LENGTH 256
-
 // Seperate string origin by given a set of patterns.
 std::vector<std::string> seperate_string(std::string origin) {
 	std::vector<std::string> result;
@@ -29,13 +27,13 @@ int dt::readVTK(std::string& filename, Mesh& mesh)
 		return 0;
 	}
 
-	char buffer[BUFFER_LENGTH];
+	std::string line;
 	std::string vtk_type_str = "POLYDATA ";
 
 	// 读取第一行，例如：# vtk DataFile Version 5.1
-	if (!vtk_file.getline(buffer, BUFFER_LENGTH)) return 0;
+	if (!std::getline(vtk_file, line)) return 0;
 
-	std::string versionLine(buffer);
+	const std::string& versionLine = line;
 	std::size_t versionPos = versionLine.find("Version");
 
 	if (versionPos != std::string::npos) {
@@ -45,10 +43,9 @@ int dt::readVTK(std::string& filename, Mesh& mesh)
 
 	bool vtk51 = vtkVersion > 5.0;
 
-	while (vtk_file.getline(buffer, BUFFER_LENGTH)) {
-		std::string line(buffer);
+	while (std::getline(vtk_file, line)) {
 
-		if (line.length() < 2 || buffer[0] == '#') continue;
+		if (line.length() < 2 || line[0] == '#') continue;
 
 		if (line.find("DATASET") != std::string::npos) {
 			std::vector<std::string> words = seperate_string(line);
@@ -167,8 +164,8 @@ int dt::readVTK(std::string& filename, Mesh& mesh)
 		}
 
 		if (line.find("CELL_DATA ") != std::string::npos) {
-			vtk_file.getline(buffer, BUFFER_LENGTH);
-			vtk_file.getline(buffer, BUFFER_LENGTH);
+			std::getline(vtk_file, line);
+			std::getline(vtk_file, line);
 
 			int nS = 0;
 			int nF = 0;

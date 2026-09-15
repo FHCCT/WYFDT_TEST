@@ -2,7 +2,8 @@
 #include "mesh_io.h"
 #include <CLI11.hpp>
 using namespace std;
-
+//--input ../test\20260915_thread\adp/thread2_adpin.vtk --adpin ../test\20260915_thread\adp/thread2_refine_id.txt --adptype 2
+//--input ../test\20260915_thread\sizecontrol/thread2_sizecontrol_input.vtk --adptype 6 --nthread 1
 #ifdef DT_EXEC
 int main(int argc, char* argv[]) {
 	std::string in_filename;
@@ -90,9 +91,10 @@ int main(int argc, char* argv[]) {
 				//args.periodic_P = { 73,74,9,7,81,4,1,67,3,6,67,1,68,0,4,81,74,73,71,69,7,9,5,80,69,71,0,68,2,82,82,2,6,3,83,84,84,83,80,5,79,78,78,79,77,75,75,77,87,88,88,87,8,91,91,8,91,90,90,91,93,94,94,93 };
 				args.adpangle = 160;
 				args.optloop = 3;
-				args.optTh =0.01;
+				args.optTh =1;
+				args.optanglestrict =1.5;
 				// Keep the user-provided minimum dihedral insertion angle.
-				ret = d.adaptation_by_Tetid(mesh, args, refine_tri_id, refine_tet_id, 1.254);
+				ret = d.adaptation_by_Tetid(mesh, args, refine_tri_id, refine_tet_id, 1.3);
 			}
 			else if (adptype == 3) {
 				ret = d.adaptation_Coarse(mesh, args);

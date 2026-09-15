@@ -51,7 +51,9 @@ if(BUILD_EXECUTABLE)
     else()
         target_sources(dt_exec PRIVATE ${DT_SOURCES})
     endif()
-    set_target_properties(dt_exec PROPERTIES OUTPUT_NAME dt)
+    # Keep the executable's import-library output distinct from the static library.
+    # MSBuild otherwise treats dt.lib as its own output and may skip relinking.
+    set_target_properties(dt_exec PROPERTIES OUTPUT_NAME dt ARCHIVE_OUTPUT_NAME dt_exec)
     if(MSVC)
         target_link_options(dt_exec PRIVATE /STACK:8388608)
     endif()

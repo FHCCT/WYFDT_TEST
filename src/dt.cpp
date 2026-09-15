@@ -67,7 +67,7 @@ int DT::dt_init(Mesh& mesh, Args& args)
 	spdlogoutfile(args.outlogfile);
     meshLogger->set_level(infolevel == 0 ? spdlog::level::err :
         infolevel == 1 ? spdlog::level::info : spdlog::level::debug);
-	if (infolevel > 0) meshLogger->info("Version 2026.09.14");
+	if (infolevel > 0) meshLogger->info("Version 2026.09.15");
     MeshStageLog initLog(*this, "Initialize");
     if (infolevel > 0)
         meshLogger->info("Input mesh: points={} segments={} triangles={} tets={}",
@@ -1331,32 +1331,42 @@ int DT::findShell(const int t, const int p2, const int p3,
 }
 //#pragma optimize("",on)
 
-// Read-only traversal: no shared element visit bits and no P2T repairs.
-int DT::findSphere(int node, std::vector<int>& sphere) {
+namespace {
+// Visit in the same breadth-first order as findSphere. A lookup may stop at
+// its first match without building the unused remainder of the vertex star.
+template<class Predicate>
+int visitNodeStar(DT& mesh, int node, std::vector<int>& sphere, Predicate matches) {
     sphere.clear();
-    if (node < 0 || node >= static_cast<int>(Nodes.size())) return 0;
-    int seed = getP2T(node);
-    if (seed < 0 || seed >= static_cast<int>(Elems.size()) || isDelEle(seed) || isNod_in_Tet(node, seed) < 0) {
+    if (node < 0 || node >= static_cast<int>(mesh.Nodes.size())) return -1;
+    int seed = mesh.getP2T(node);
+    if (seed < 0 || seed >= static_cast<int>(mesh.Elems.size()) || mesh.isDelEle(seed) || mesh.isNod_in_Tet(node, seed) < 0) {
         seed = -1;
-        for (int t=0; t<static_cast<int>(Elems.size()); ++t)
-            if (!isDelEle(t) && isNod_in_Tet(node,t)>=0) { seed=t; break; }
+        for (int t=0; t<static_cast<int>(mesh.Elems.size()); ++t)
+            if (!mesh.isDelEle(t) && mesh.isNod_in_Tet(node,t)>=0) { seed=t; break; }
     }
-    if (seed < 0) return 0;
+    if (seed < 0) return -1;
     std::unordered_set<int> visited;
     visited.insert(seed); sphere.push_back(seed);
     for (size_t k=0; k<sphere.size(); ++k) {
         const int t=sphere[k];
-        const int ord=isNod_in_Tet(node,t);
+        if (matches(t)) return t;
+        const int ord=mesh.isNod_in_Tet(node,t);
         for (int face=0; face<4; ++face) {
             if (face==ord) continue;
-            const int next=getNeig(t,face);
-            if (next<0 || next>=static_cast<int>(Elems.size()) || isDelEle(next) || isNod_in_Tet(node,next)<0) continue;
+            const int next=mesh.getNeig(t,face);
+            if (next<0 || next>=static_cast<int>(mesh.Elems.size()) || mesh.isDelEle(next) || mesh.isNod_in_Tet(node,next)<0) continue;
             if (visited.insert(next).second) sphere.push_back(next);
         }
     }
-    return static_cast<int>(sphere.size());
+    return -1;
+}
 }
 
+// Read-only traversal: no shared element visit bits and no P2T repairs.
+int DT::findSphere(int node, std::vector<int>& sphere) {
+    visitNodeStar(*this, node, sphere, [](int) { return false; });
+    return static_cast<int>(sphere.size());
+}
 
 int DT::findSphere_pnt(const int p, std::unordered_set<int>& Sphere_pnt) {
 	int iElm, ord, src[4], i, nig;
@@ -1586,15 +1596,12 @@ bool DT::isMeshEdge(const int p1, const int p2, int* tet) {
 		throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 	}
 
-	std::vector<int> sph;
-	findSphere(p1, sph);
-	for (int i = 0; i < sph.size(); i++) {
-		if (isNod_in_Tet(p2, sph[i]) != -1) {
-			if (tet) *tet = sph[i];//need to store info
-			return true;
-		}
-	}
-	return false;
+    std::vector<int> sphere;
+    const int found = visitNodeStar(*this, p1, sphere,
+        [&](int t) { return isNod_in_Tet(p2, t) != -1; });
+    if (found < 0) return false;
+    if (tet) *tet = found;
+    return true;
 }
 
 bool DT::isMeshFace(const int p1, const int p2, const int p3, int* tet) {
@@ -1606,18 +1613,12 @@ bool DT::isMeshFace(const int p1, const int p2, const int p3, int* tet) {
 		throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
 	}
 
-	std::vector<int> sph;
-	findSphere(p1, sph);
-	for (int i = 0; i < sph.size(); i++) {
-		if (isNod_in_Tet(p2, sph[i]) != -1) {
-			if (isNod_in_Tet(p3, sph[i]) != -1) {
-				if (tet)
-					*tet = sph[i];//need to store info
-				return true;
-			}
-		}
-	}
-	return false;
+    std::vector<int> sphere;
+    const int found = visitNodeStar(*this, p1, sphere,
+        [&](int t) { return isNod_in_Tet(p2, t) != -1 && isNod_in_Tet(p3, t) != -1; });
+    if (found < 0) return false;
+    if (tet) *tet = found;
+    return true;
 }
 
 int DT::recoverEdges(std::queue<int>& lost, int fullsearch, int info) {

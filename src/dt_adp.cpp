@@ -528,5 +528,23 @@ void DT::buildTetInfo(Mesh& mesh, Args& args) {
 			}
 		}
 	}
+    // Local star traversals require one connected incident fan. A vertex shared
+    // by disconnected bodies must stay fixed; otherwise deleting it updates only
+    // one fan and leaves other tetrahedra referencing a deleted vertex.
+    std::vector<int> incidentCount(Nodes.size(), 0);
+    for (const auto& tet : Elems)
+        for (int point : tet.form) ++incidentCount[point];
+    std::unordered_set<int> disconnectedVertices;
+    std::vector<int> sphere;
+    for (int point = 0; point < static_cast<int>(Nodes.size()); ++point) {
+        if (point == ghost || incidentCount[point] == 0) continue;
+        if (findSphere(point, sphere) != incidentCount[point]) {
+            lockV.insert(point);
+            disconnectedVertices.insert(point);
+        }
+    }
+    for (int edge = 0; edge < static_cast<int>(SurEdgs.size()); ++edge)
+        if (disconnectedVertices.count(SurEdgs[edge].iStart) ||
+            disconnectedVertices.count(SurEdgs[edge].iEnd)) lockE.insert(edge);
 	return;
 }

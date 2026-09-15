@@ -2,27 +2,12 @@
 #include <exception>
 #include "spdlog/sinks/null_sink.h"
 
+
 namespace {
 constexpr double topologyShortEdgeRatio = 1.0 / 200.0;
-
-// A tiny edge may join two feature vertices created by a narrow surface strip.
-// Bound any geometric relaxation by both its own length and the local shell
-// scale. Locked vertices, normal changes and positive volumes remain checked.
-double shortBoundaryCollapseTolerance(DT& mesh, int pa, int pb, const std::vector<int>& shell) {
-    if (!mesh.improve_step || !mesh.modifyBnd || !mesh.isbndpnt(pa) || !mesh.isbndpnt(pb)) return 0;
-    double longestSquared = 0;
-    for (int t : shell) {
-        if (mesh.ishulltet(t) || mesh.isvirtualtet(t)) continue;
-        for (int e = 0; e < 6; ++e)
-            longestSquared = std::max(longestSquared, mesh.distance2(
-                mesh.Nodes[mesh.Elems[t].form[Egid[e][0]]].pt,
-                mesh.Nodes[mesh.Elems[t].form[Egid[e][1]]].pt));
-    }
-    const double edgeSquared = mesh.distance2(mesh.Nodes[pa].pt, mesh.Nodes[pb].pt);
-    if (!(longestSquared > 0) || !std::isfinite(longestSquared) ||
-        !(edgeSquared < longestSquared * topologyShortEdgeRatio * topologyShortEdgeRatio)) return 0;
-    return std::min(std::sqrt(edgeSquared), 1e-3 * std::sqrt(longestSquared));
-}
+double shortBoundaryCollapseTolerance(DT& mesh, int pa, int pb, const std::vector<int>& shell);
+bool hasValidCollapseLink(DT& mesh, int a, int b, const std::vector<int>& starA,
+    const std::vector<int>& starB, const std::vector<int>& shell);
 }
 
 //-------------------------mesh improvement-------------------------
@@ -98,14 +83,12 @@ int DT::improve_init(Args& args) {
 	if (!threadsInitialized) initializeDTThreads(*this, args);
 	flipnmRecll.reserve(100000);
 
-	//pre Thread pools
-	int EvacancySize = 100;
-	const int poolThreads = activeDTThreads(*this);
-	for (int i = 0; i < poolThreads; i++) {
-		while (Evacancy_thread[i].size() < EvacancySize) {
-			int loc = addElem();
-			DelEle(loc, i);
-		}
+	// Preserve the serial baseline's reserved slots independently of nthread.
+	// Thread-dependent reservation changes IDs used by later candidate scans.
+	constexpr int EvacancySize = 100;
+	while (Evacancy_thread[0].size() < EvacancySize) {
+		int loc = addElem();
+		DelEle(loc, 0);
 	}
 
 	//printf opt info
@@ -502,9 +485,7 @@ int DT::QuicklyOptCoarsePass(Args& args) {
 		improve_step = false;
 
 		int contract1 = contractEdgPass(1e10);
-		if (infolevel > 0) meshLogger->debug("Contract  BndEdg: {}", contract1);
 		int contract2 = contshortEdgPass(1e10);
-		if (infolevel > 0) meshLogger->debug("Contract MeshEdg: {}", contract2);
 
 		flipEdgPass(1);
 
@@ -738,7 +719,9 @@ int DT::SmoothPass(int nloop, double improve_goal)
     colorBadQualityNodes(colors, improve_goal);
     size_t maxGroup = 0;
     for (const auto& group : colors) maxGroup = std::max(maxGroup, group.size());
-    const int workers = activeDTThreads(*this, 0, maxGroup);
+    // Coloring determines independent jobs; mesh size does not limit smoothing.
+    const int workers = omp_in_parallel() ? 1 :
+        static_cast<int>(std::max<size_t>(1, std::min<size_t>(std::max(1, std::min(128, num_threads)), maxGroup)));
     long long success = 0, attempts = 0;
     // One team per pass; each color ends with a barrier before the next color.
 #pragma omp parallel num_threads(workers) if(workers > 1) reduction(+:success, attempts)
@@ -944,12 +927,9 @@ int DT::TopologicalPass(double improve_goal, double insert_angle_degrees, int nl
             if (Elems[t].q <= improve_goal)
                 candidates.push_back(topologyCandidate(t));
         }
-        const int workers = activeDTThreads(*this, 0, candidates.size());
-        int success;
-        if (workers > 1 && improve_step)
-            success = TopologicalPass_parallel(candidates, improve_goal, insert_angle_degrees, workers);
-        else
-            success = TopologicalPass_serial(candidates, improve_goal, insert_angle_degrees);
+        // Flips and immediate failure repairs follow the same candidate order
+        // for every thread count. Smoothing and quality evaluation stay parallel.
+        const int success = TopologicalPass_serial(candidates, improve_goal, insert_angle_degrees);
         totalSuccess += success;
         totalCandidates += candidates.size();
         if (success < 10) break;
@@ -1189,6 +1169,9 @@ int DT::removebadtet(int& iElm, int thread_n) {
         }
     } seedRelease{this, p, thread_n};
 
+    // Keep capacity across the six edge and four face attempts.
+    std::vector<int> wait_remove;
+
 	for (int i = 0; i < 6; i++) {
 		//find a edge not try
 		int pa = Elems[iElm].form[Egid[i][0]];
@@ -1196,7 +1179,7 @@ int DT::removebadtet(int& iElm, int thread_n) {
 		if (isBndEdg(pa, pb)) {
 			continue;
 		}
-		std::vector<int> wait_remove = { iElm };
+		wait_remove.assign(1, iElm);
 
 		int ret = removeEdge(wait_remove, Egid[i][0], Egid[i][1], deepth, thread_n);
 
@@ -1212,7 +1195,7 @@ int DT::removebadtet(int& iElm, int thread_n) {
 	}
 
 	for (int i = 0; i < 4; i++) {
-		std::vector<int> wait_remove = { iElm };
+		wait_remove.assign(1, iElm);
 
 		int ret = removeface(wait_remove, i, deepth, thread_n);
 		if (ret == 1) {
@@ -2059,7 +2042,6 @@ int DT::sizeControlPass(double lower, double upper) {
 			if (infolevel > 0) meshLogger->debug("Split    BndEdge : {}", splitNum);
 
 			contract = contractEdgPass(lower);
-			if (infolevel > 0) meshLogger->debug("Contract BndEdge : {}", contract);
 			
 			flipEdgPass(3);
 
@@ -2071,7 +2053,6 @@ int DT::sizeControlPass(double lower, double upper) {
 	if (infolevel > 0) meshLogger->debug("Split    : {}", splitNum);
 
 	contract = contshortEdgPass(lower);
-	if (infolevel > 0) meshLogger->debug("Contract : {}", contract);
 
 	improve_step = true;
 
@@ -2322,6 +2303,7 @@ int DT::contractEdgPass(double lower) {
     MeshStageLog stageLog(*this, "Collapse boundary edges", 2);
 	const int edgeCount = static_cast<int>(SurEdgs.size());
 	int contract = 0;
+	size_t attempts = 0;
 
 	for (int i = 0; i < edgeCount; ++i) {
 		if (isDelSurEdg(i) || lockE.count(i))
@@ -2341,10 +2323,12 @@ int DT::contractEdgPass(double lower) {
 		if (!forceByMinEdge && contractionEdgeLength(p1, p2) >= lower)
 			continue;
 
+		++attempts;
 		if (collapseEdg(i) == 1)
 			++contract;
 	}
 
+	if (infolevel > 0) meshLogger->info("Contract BndEdg: {}/{}", contract, attempts);
 	return contract;
 }
 
@@ -2352,6 +2336,7 @@ int DT::contshortEdgPass(double lower) {
     MeshStageLog stageLog(*this, "Collapse short edges", 2);
 	const int elemCount = static_cast<int>(Elems.size());
 	int contract = 0;
+	size_t attempts = 0;
 
 	for (int i = 0; i < elemCount; ++i) {
 		if (isvirtualtet(i) || isDelEle(i) || ishulltet(i))
@@ -2377,10 +2362,12 @@ int DT::contshortEdgPass(double lower) {
 
 		const int ia = Egid[shortestEdge][0];
 		const int ib = Egid[shortestEdge][1];
+		++attempts;
 		if (tryDestroyShortEdge(i, ia, ib, 1e-14) == 1)
 			++contract;
 	}
 
+	if (infolevel > 0) meshLogger->info("Contract MeshEdg: {}/{}", contract, attempts);
 	return contract;
 }
 
@@ -2502,12 +2489,16 @@ int DT::canDestroyShortEdge(int iElm, int ia, int ib, double Threshold) {
 		const int neigb = getNeig(tempE, tb);
 		const int neigaOrd = getNeigOrd(tempE, ta);
 		const int neigbOrd = getNeigOrd(tempE, tb);
+        if (neiga < 0 || neigb < 0 || neiga >= static_cast<int>(Elems.size()) ||
+            neigb >= static_cast<int>(Elems.size()) || isDelEle(neiga) || isDelEle(neigb) ||
+            getNeig(neiga, neigaOrd) != tempE || getNeig(neigb, neigbOrd) != tempE) return 0;
 		if (Elems[neiga].form[neigaOrd] == Elems[neigb].form[neigbOrd])
 			return 0;
 	}
 
 	findSphere(pa, sphereA);
 	findSphere(pb, sphereB);
+    if (!hasValidCollapseLink(*this, pa, pb, sphereA, sphereB, shell)) return 0;
 
 	if (pb != ghost) {
 		std::unordered_set<int> neighbours;
@@ -2726,12 +2717,16 @@ int DT::destroyShortEdge(int iElm, int ia, int ib, double Threshold) {
 		const int neigb = getNeig(tempE, tb);
 		const int neigaOrd = getNeigOrd(tempE, ta);
 		const int neigbOrd = getNeigOrd(tempE, tb);
+        if (neiga < 0 || neigb < 0 || neiga >= static_cast<int>(Elems.size()) ||
+            neigb >= static_cast<int>(Elems.size()) || isDelEle(neiga) || isDelEle(neigb) ||
+            getNeig(neiga, neigaOrd) != tempE || getNeig(neigb, neigbOrd) != tempE) return 0;
 		if (Elems[neiga].form[neigaOrd] == Elems[neigb].form[neigbOrd])
 			return 0;
 	}
 
 	findSphere(pa, sphereA);
 	findSphere(pb, sphereB);
+    if (!hasValidCollapseLink(*this, pa, pb, sphereA, sphereB, shell)) return 0;
 
 	// Only pa moves. Check edges that are newly created between pb and pa's neighbours.
 	if (pb != ghost) {
@@ -3891,6 +3886,8 @@ int DT::ifflipEdg(int index) {
 		}
 	}
 
+	if (p3 < 0 || p4 < 0 || p3 == p4 || BndEdg.find(p3, p4)) return 0;
+
 	if (!checkFlipNormal(p1, p2, p3, p4))
 		return 0;
 
@@ -4016,7 +4013,7 @@ int DT::flipEdg(int index , int deep) {
 	int p2 = SurEdgs[index].iEnd;
 	int f1 = SurEdgs[index].face[0];
 	int f2 = SurEdgs[index].face[1];
-	int p3, p4, p2_f1_idx, p1_f2_idx;
+	int p3 = -1, p4 = -1, p2_f1_idx = -1, p1_f2_idx = -1;
 
 	for (int i = 0; i < 3; i++) {
 		if (SurTris[f1].form[i] != p1 && SurTris[f1].form[i] != p2) {
@@ -4039,6 +4036,9 @@ int DT::flipEdg(int index , int deep) {
 	//{
 	//	printf("%d %d %d %d %d\n", index, p1, p2, p3, p4);
 	//}
+
+	// An existing diagonal would merge distinct surface patches.
+	if (p3 < 0 || p4 < 0 || p3 == p4 || BndEdg.find(p3, p4)) return 0;
 
 	int ia = -1, ib = -1, ic = -1, id = -1;
 	int tet = -1, i1 = -1, i2 = -1;
@@ -5874,4 +5874,112 @@ if (auto* boundaryEntry = BndEdg.find(iNod, iSecond))
 void DT::Smooth_size_ani(Mesh& mesh, std::vector<std::array<double, 6>>& anisol, std::vector<int> lockFactes, std::vector<int> lockVertex) {
 	AniSol = anisol;
 	return;
+}
+
+namespace {
+
+	// A tiny edge may join two feature vertices created by a narrow surface strip.
+	// Bound any geometric relaxation by both its own length and the local shell
+	// scale. Locked vertices, normal changes and positive volumes remain checked.
+	double shortBoundaryCollapseTolerance(DT& mesh, int pa, int pb, const std::vector<int>& shell) {
+		if (!mesh.improve_step || !mesh.modifyBnd || !mesh.isbndpnt(pa) || !mesh.isbndpnt(pb)) return 0;
+		double longestSquared = 0;
+		for (int t : shell) {
+			if (mesh.ishulltet(t) || mesh.isvirtualtet(t)) continue;
+			for (int e = 0; e < 6; ++e)
+				longestSquared = std::max(longestSquared, mesh.distance2(
+					mesh.Nodes[mesh.Elems[t].form[Egid[e][0]]].pt,
+					mesh.Nodes[mesh.Elems[t].form[Egid[e][1]]].pt));
+		}
+		const double edgeSquared = mesh.distance2(mesh.Nodes[pa].pt, mesh.Nodes[pb].pt);
+		if (!(longestSquared > 0) || !std::isfinite(longestSquared) ||
+			!(edgeSquared < longestSquared * topologyShortEdgeRatio * topologyShortEdgeRatio)) return 0;
+		return std::min(std::sqrt(edgeSquared), 1e-3 * std::sqrt(longestSquared));
+	}
+	// The common vertex links must equal the edge link. Checking only opposing
+	// tetrahedra misses shared vertices/edges and can join separate fans.
+	bool hasValidCollapseLink(DT& mesh, int a, int b, const std::vector<int>& starA,
+		const std::vector<int>& starB, const std::vector<int>& shell) {
+		std::set<int> verticesA, edgeVertices;
+		std::set<std::array<int, 2>> edgesA, edgeEdges;
+		std::set<std::array<int, 3>> facesA;
+		for (int t : shell) {
+			std::array<int, 2> opposite;
+			int count = 0;
+			for (int n : mesh.Elems[t].form) if (n != a && n != b) {
+				if (count == 2) return false;
+				opposite[count++] = n;
+				edgeVertices.insert(n);
+			}
+			if (count != 2) return false;
+			std::sort(opposite.begin(), opposite.end());
+			edgeEdges.insert(opposite);
+		}
+		size_t incident = 0;
+		for (int t : starA) {
+			if (mesh.isNod_in_Tet(b, t) >= 0) ++incident;
+			std::array<int, 3> link;
+			int count = 0;
+			for (int n : mesh.Elems[t].form) if (n != a && n != b) link[count++] = n;
+			std::sort(link.begin(), link.begin() + count);
+			for (int i = 0; i < count; ++i) {
+				verticesA.insert(link[i]);
+				for (int j = i + 1; j < count; ++j) edgesA.insert({ link[i], link[j] });
+			}
+			if (count == 3) facesA.insert(link);
+		}
+		if (incident != shell.size()) return false;
+		for (int t : starB) {
+			std::array<int, 3> link;
+			int count = 0;
+			for (int n : mesh.Elems[t].form) if (n != a && n != b) link[count++] = n;
+			std::sort(link.begin(), link.begin() + count);
+			for (int i = 0; i < count; ++i) {
+				if (verticesA.count(link[i]) && !edgeVertices.count(link[i])) return false;
+				for (int j = i + 1; j < count; ++j) {
+					const std::array<int, 2> edge = { link[i], link[j] };
+					if (edgesA.count(edge) && !edgeEdges.count(edge)) return false;
+				}
+			}
+			if (count == 3 && facesA.count(link)) return false;
+		}
+		// Internal material interfaces are also part of the surface complex.
+		// Its link condition prevents duplicate surface edges/triangles after redirecting a.
+		if (mesh.isbndpnt(a) && mesh.isbndpnt(b)) {
+			const auto* entry = mesh.BndEdg.find(a, b);
+			if (!entry) return false;
+			std::set<int> surfaceEdgeVertices, surfaceVerticesA;
+			std::set<std::array<int, 2>> surfaceEdgesA;
+			for (int f : mesh.SurEdgs[*entry].face) {
+				for (int n : mesh.SurTris[f].form) if (n != a && n != b) surfaceEdgeVertices.insert(n);
+			}
+			std::unordered_set<int> faces;
+			mesh.findSphere_tri(a, faces);
+			for (int f : faces) {
+				std::array<int, 2> link;
+				int count = 0;
+				for (int n : mesh.SurTris[f].form) if (n != a && n != b) {
+					if (count == 2) return false;
+					link[count++] = n;
+					surfaceVerticesA.insert(n);
+				}
+				if (count == 2) { std::sort(link.begin(), link.end()); surfaceEdgesA.insert(link); }
+			}
+			mesh.findSphere_tri(b, faces);
+			for (int f : faces) {
+				std::array<int, 2> link;
+				int count = 0;
+				for (int n : mesh.SurTris[f].form) if (n != a && n != b) {
+					if (count == 2) return false;
+					link[count++] = n;
+					if (surfaceVerticesA.count(n) && !surfaceEdgeVertices.count(n)) return false;
+				}
+				if (count == 2) {
+					std::sort(link.begin(), link.end());
+					if (surfaceEdgesA.count(link)) return false;
+				}
+			}
+		}
+		return true;
+	}
 }

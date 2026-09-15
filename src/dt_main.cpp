@@ -128,7 +128,7 @@ int main(int argc, char* argv[]) {
 				args.optanglestrict = 1;
 				// Keep the user-provided minimum dihedral insertion angle.
 				args.adpangle = 170;
-				double lamasize = 19.9842;// 45.418557386999999;
+				constexpr double lamasize = 19.9842;
 				ret = d.adaptation_by_YunBoSzieControl(mesh, args, lamasize, facetSize, facetNum, elementSize, elementNum);
 			}
 			else if (adptype == 7) {

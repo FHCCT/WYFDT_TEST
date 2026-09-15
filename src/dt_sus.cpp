@@ -216,9 +216,9 @@ int dt::DT::smooth_sus(int iNod) {
     }
     // SmoothPass preallocates slots before workers start. Direct serial calls
     // may grow the storage; callers must not run arbitrary adjacent points concurrently.
-    if (susReuseIdle && susIdleStates.size() < Nodes.size() && !omp_in_parallel())
+    if (susIdleStates.size() < Nodes.size() && !omp_in_parallel())
         susIdleStates.resize(Nodes.size());
-    SusIdleState* idleState = susReuseIdle && iNod < susIdleStates.size() ? &susIdleStates[iNod] : nullptr;
+    SusIdleState* const idleState = iNod < susIdleStates.size() ? &susIdleStates[iNod] : nullptr;
     std::vector<double> neighborhood;
     if (idleState) {
         neighborhood.reserve(sph.size() * 17);

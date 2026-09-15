@@ -41,7 +41,7 @@ int dt::readVTK(std::string& filename, Mesh& mesh)
 		ss >> vtkVersion;
 	}
 
-	bool vtk51 = vtkVersion > 5.0;
+	const bool vtk51 = vtkVersion > 5.0;
 
 	while (std::getline(vtk_file, line)) {
 

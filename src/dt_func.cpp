@@ -771,8 +771,6 @@ void DT::clearNodesElems() {
 }
 
 void DT::getMeshEdgebyGeo(Mesh& mesh) {
-	EdgeHasher<int> Edgindex;
-	int te = 1;
 
 	for (int i = 0; i < SurEdgs.size(); i++) {
 		if (isDelSurEdg(i))
@@ -1066,22 +1064,15 @@ double DT::AspectRatio(double v1[3], double v2[3], double v3[3], double v4[3]) {
 }
 
 int DT::getmm(int p1, int p2, int p3, int p4, double* mm) {
-	int form[4] = { p1,p2,p3,p4 };
-	int n = 0;
+	const int form[4] = { p1,p2,p3,p4 };
 
 	for (int k = 0; k < 6; k++) mm[k] = 0;
 	for (int j = 0; j < 4; j++) {
-		//if (isSegmentpnt(form[j])) continue;
-		//n++;
 		for (int k = 0; k < 6; k++) {
 			mm[k] += AniSol[form[j]][k];
 		}
 	}
 
-	//if (n == 0)
-	//	return 0;
-	//double dd = 1.0 / n;
-	//for (int k = 0; k < 6; k++) mm[k] *= dd;
 	for (int k = 0; k < 6; k++) mm[k] /= 4.0;
 	return 1;
 }
@@ -1196,7 +1187,7 @@ double DT::ScaledJacobian(double v1[3],double v2[3],double v3[3],double v4[3], d
 double DT::caltet33_ani(double v1[3], double v2[3], double v3[3], double v4[3], double* mm) {
 	double ab[3], ac[3], ad[3], bc[3], bd[3], cd[3];
 	double  v1c, v2c, v3c, vol, det, h1, h2, h3, h4, h5, h6, rap, num, cal;
-	double minV = 1e-7;
+	constexpr double minV = 1e-7;
 
 	// Edge vectors
 	for (int i = 0; i < 3; i++) {
@@ -2260,7 +2251,7 @@ void DT::addRandomP(double x, double y, double z, int n) {
 	std::random_device rd;
 	std::default_random_engine eng(rd());
 	std::uniform_real_distribution<double> distr(0.0, 1.0);
-	double dis = 1e-3;
+	constexpr double dis = 1e-3;
 	for (int i = 0; i < n; i++) {
 
 		int newp = addNode(x+ dis * distr(eng),y+ dis * distr(eng),z+ dis * distr(eng),0);

@@ -201,7 +201,7 @@ int DT::OrthogonalityOptPass(Args& args) {
 	int nLoop = 3, nbad = 0;
 	double  minD = 0, minAvgD = 0, maxD = 0, maxAvgD = 0, minq;
 
-	double improve_goal = 0.1;
+	constexpr double improve_goal = 0.1;
 
 	nLoop = std::max(args.optloop, nLoop);
 	improve_Metric = 8; //Orthogonality
@@ -218,7 +218,7 @@ int DT::OrthogonalityOptPass(Args& args) {
 
 int DT::QuicklyOptPass(Args& args) {
 	int nLoop = 1, nbad = 0;
-	double  minD = 0, minAvgD = 0, maxD = 0, maxAvgD = 0, minq;
+	double minq;
 	double improve_goal = 1;// // (2.0 * std::sin(ANGLE2RADIO(args.optangle)) * args.optratio) / (std::sin(ANGLE2RADIO(args.optangle)) + args.optratio);
 	optflipdeep = 0;
 
@@ -237,9 +237,10 @@ int DT::QuicklyOptPass(Args& args) {
 		//printQuality(improve_goal, nbad, minq, false);
 		TopologicalPass(improve_goal, args.optanglestrict, 1);
 		SmoothPass(1, improve_goal);
-		printQuality(improve_goal, nbad, minq, false);
+		const int worstTet = printQuality(improve_goal, nbad, minq, false);
 
-		if (!hasBadDihedral(args.optanglestrict))
+		// Use the worst quality cell as the inexpensive stopping proxy.
+		if (!needsTopologyInsertion(worstTet, args.optanglestrict))
 			break;
 	}
 	return 1;
@@ -250,30 +251,47 @@ int DT::OptSizeControl_yunbo(double lamasize,
 	std::unordered_map<int, int>& facetNum,
 	std::unordered_map<int, double>& elementSize,
 	std::unordered_map<int, int>& elementNum, Args& args) {
-	int nLoop = 3, nbad = 0, nstop = 0;
-	double minD = 0, minAvgD = 0, maxD = 0, maxAvgD = 0, minq;
-	double improve_goal = 1;// = args.optTh;// (2.0 * std::sin(ANGLE2RADIO(args.optangle)) * args.optratio) / (std::sin(ANGLE2RADIO(args.optangle)) + args.optratio);
+    const int nLoop = std::max(args.optloop, 3);
+    int nbad = 0;
+    double minq;
+    const double improve_goal = args.optTh;
+    struct splitSort {
+        int EdgeID;
+        int geoID;
+        double len;
+    };
+    // Reuse capacity between rounds; contents describe only the frozen scan below.
+    std::vector<splitSort> waitsplit;
+    std::vector<unsigned char> boundarySelected;
+    std::vector<double> boundaryLength;
+    std::vector<int> nearTets;
 	optflipdeep = 0;
 
-	QuantityControl = true;//for BW/flip geoNum Quantity Control
+    QuantityControl = true; // BW updates the live region counts during insertion.
+    const auto needsSplit = [&](int geoID, double maxEdgLen) {
+        if (lamasize > 0 && maxEdgLen > lamasize * 4.0 / 3.0) return true;
+        const double size = elementSize[geoID];
+        if (size > 0 && maxEdgLen > size) return true;
+        const int count = elementNum[geoID];
+        return count > 0 && GeoNum[geoID] < count;
+    };
 
-	nLoop = std::max(args.optloop, nLoop);
 	for (int loop = 0; loop < nLoop; loop++) {
-		//Get min volume,yunbo size control don't use minvolume
+        // 1. Optimize before evaluating any size/count targets.
 
 		updateminVolume();
 
 		flipEdgPass(1);
 
 		improve_Metric = SUS_METRIC;
-		improve_goal = args.optTh;
 		prepareQuality();
-		//printQuality(improve_goal, nbad, minq, false);
 		TopologicalPass(improve_goal, args.optanglestrict, 1);
 		SmoothPass(1, improve_goal);
-		printQuality(improve_goal, nbad, minq, false);
+		const int worstTet = printQuality(improve_goal, nbad, minq, false);
+        // Evaluate before refinement can replace this cell or invalidate its ID.
+        const bool worstNeedsOptimization = needsTopologyInsertion(worstTet, args.optanglestrict);
 
-		// flip boundary Edges,it is not correct, need to do
+        // 2. Snapshot counts, then collect boundary splits without changing the mesh.
 		improve_step = false;
 		GeoNum.clear();
 		for (int i = 0; i < Elems.size(); i++) {
@@ -290,86 +308,64 @@ int DT::OptSizeControl_yunbo(double lamasize,
 			FacetNum[fid]++;
 		}
 
-		struct splitSort {
-			int EdgeID;
-			int geoID;
-			double len;
-		};
-
-		std::vector<splitSort> waitsplit;
+        waitsplit.clear();
+        boundarySelected.assign(SurEdgs.size(), 0);
+        boundaryLength.assign(SurEdgs.size(), -1.0);
 
 		for (int i = 0; i < Elems.size(); i++) {
 			if (isDelEle(i) || ishulltet(i) || isvirtualtet(i))
 				continue;
 
-			bool ifsplit = false;
 			int geoID = Elems[i].geo;
 
 			double maxEdgLen = 0;
-			int maxEdgIdx = -1;
+            int maxBoundaryEdge = -1;
 			for (int j = 0; j < 6; j++) {
 				int p1 = Elems[i].form[Egid[j][0]];
 				int p2 = Elems[i].form[Egid[j][1]];
 
-				if (!isbndpnt(p1) || !isbndpnt(p2) || !isBndEdg(p1, p2))
-					continue;
-
-				////Old Edg idndex may be destroy
-				double dis = distance(Nodes[p1].pt, Nodes[p2].pt);
-				if (dis > maxEdgLen) {
-					maxEdgLen = dis;
-					maxEdgIdx = j;
-				}
+                if (!isbndpnt(p1) || !isbndpnt(p2)) continue;
+                const int* entry = BndEdg.find(p1, p2);
+                if (!entry) continue;
+                const int edge = *entry;
+                double& dis = boundaryLength[edge];
+                if (dis < 0) dis = distance(Nodes[p1].pt, Nodes[p2].pt);
+                if (dis > maxEdgLen) {
+                    maxEdgLen = dis;
+                    maxBoundaryEdge = edge;
+                }
 			}
 
-			if (lamasize > 0 && maxEdgLen > lamasize * 4.0 / 3.0)
-				ifsplit = true;
+            const bool ifsplit = needsSplit(geoID, maxEdgLen);
 
-			if (!ifsplit) {
-				if (elementSize[geoID] > 0 && maxEdgLen > elementSize[geoID]) {
-					ifsplit = true;
-				}
-				else if (elementNum[geoID] > 0 && GeoNum[geoID] < elementNum[geoID]) {
-					ifsplit = true;
-				}
-			}
-
-			if (ifsplit && maxEdgIdx != -1) {
-				int p1 = Elems[i].form[Egid[maxEdgIdx][0]];
-				int p2 = Elems[i].form[Egid[maxEdgIdx][1]];
-				if (auto* boundaryEntry = BndEdg.find(p1, p2)) {
-					const int boundaryIndex = *boundaryEntry;
-					int Edgid = boundaryIndex;
-					if (isDelSurEdg(Edgid))
-						continue;
-					waitsplit.push_back({ Edgid,geoID ,maxEdgLen });
-				}
-			}
+            if (ifsplit && maxBoundaryEdge != -1) {
+                if (isDelSurEdg(maxBoundaryEdge)) continue;
+                // Preserve duplicate tet-origin candidates and their sorting order.
+                waitsplit.push_back({ maxBoundaryEdge, geoID, maxEdgLen });
+                boundarySelected[maxBoundaryEdge] = 1;
+            }
 		}
 		
-		for (int i = 0; i < SurEdgs.size() ; i++) {
-			if (isDelSurEdg(i) || lockE.count(i))
-				continue;
-			// not find
-			double dis = distance(Nodes[SurEdgs[i].iStart].pt, Nodes[SurEdgs[i].iEnd].pt);
+        const bool hasFacetTargets = !facetSize.empty() || !facetNum.empty();
+		for (int i = 0; hasFacetTargets && i < SurEdgs.size(); i++) {
+            if (isDelSurEdg(i) || lockE.count(i) || boundarySelected[i]) continue;
+            double& dis = boundaryLength[i];
+            if (dis < 0) dis = distance(Nodes[SurEdgs[i].iStart].pt, Nodes[SurEdgs[i].iEnd].pt);
 			for (int j = 0; j < SurEdgs[i].face.size(); j++) {
-				auto it = std::find_if(waitsplit.begin(), waitsplit.end(),
-					[i](const splitSort& s) { return s.EdgeID == i; });
-				if (it != waitsplit.end()) {
-					break;
-				}
-				int fid = SurTris[SurEdgs[i].face[j]].parent;
-				if (facetSize.count(fid) && facetSize[fid] > 0) {
-					if (dis > facetSize[fid]) {
-						if (facetNum.count(fid) && facetNum[fid] > 0 && FacetNum[fid] >= facetNum[fid]) {
-							continue;
-						}
-						waitsplit.push_back({ i,-fid,dis });
-					}
-				}
-				else if (facetNum.count(fid) && facetNum[fid] > 0 && FacetNum[fid] < facetNum[fid]) {
-					waitsplit.push_back({ i,-fid,dis });
-				}
+                const int fid = SurTris[SurEdgs[i].face[j]].parent;
+                const auto size = facetSize.find(fid);
+                if (size != facetSize.end() && size->second > 0) {
+                    if (!(dis > size->second)) continue;
+                    const auto count = facetNum.find(fid);
+                    if (count != facetNum.end() && count->second > 0 && FacetNum[fid] >= count->second)
+                        continue;
+                } else {
+                    const auto count = facetNum.find(fid);
+                    if (count == facetNum.end() || count->second <= 0 || FacetNum[fid] >= count->second)
+                        continue;
+                }
+                waitsplit.push_back({ i, -fid, dis });
+                break;
 			}
 		}
 
@@ -379,6 +375,7 @@ int DT::OptSizeControl_yunbo(double lamasize,
 				return a.len > b.len;
 			});
 
+        // 3. Execute the same length-sorted boundary candidates and live count guards.
 		int stop = 0;
 
 		for (auto it : waitsplit) {
@@ -393,18 +390,21 @@ int DT::OptSizeControl_yunbo(double lamasize,
 			stop++;
 		}
 
-		GeoNum.clear();
-		for (int i = 0; i < Elems.size(); i++) {
-			if (isDelEle(i) || ishulltet(i) || isvirtualtet(i))
-				continue;
-			GeoNum[Elems[i].geo]++;
-		}
+        // 4. Recount after boundary attempts; a failed split can still touch state.
+        // With no calls, the first count is still valid.
+        if (stop != 0) {
+            GeoNum.clear();
+            for (int i = 0; i < Elems.size(); i++) {
+                if (isDelEle(i) || ishulltet(i) || isvirtualtet(i)) continue;
+                GeoNum[Elems[i].geo]++;
+            }
+        }
+        // 5. Visit live tet IDs in order, including new IDs appended by BW insertion.
 
 		for (int i = 0; i < Elems.size(); i++) {
 			if (isDelEle(i) || ishulltet(i) || isvirtualtet(i))
 				continue;
 
-			bool ifsplit = false;
 			int geoID = Elems[i].geo;
 
 			double maxEdgLen = 0;
@@ -413,27 +413,15 @@ int DT::OptSizeControl_yunbo(double lamasize,
 				int p1 = Elems[i].form[Egid[j][0]];
 				int p2 = Elems[i].form[Egid[j][1]];
 
-				if (isBndEdg(p1, p2))
-					continue;
-				////Old Edg idndex may be destroy
-				double dis = distance(Nodes[p1].pt, Nodes[p2].pt);
-				if (dis > maxEdgLen) {
+                const double dis = distance(Nodes[p1].pt, Nodes[p2].pt);
+                // A non-longest edge cannot change the selected candidate.
+                if (dis > maxEdgLen && !isBndEdg(p1, p2)) {
 					maxEdgLen = dis;
 					maxEdgIdx = j;
 				}
 			}
 
-			if (lamasize > 0 && maxEdgLen > lamasize * 4.0 / 3.0)
-				ifsplit = true;
-
-			if (!ifsplit) {
-				if (elementSize[geoID] > 0 && maxEdgLen > elementSize[geoID]) {
-					ifsplit = true;
-				}
-				else if (elementNum[geoID] > 0 && GeoNum[geoID] < elementNum[geoID]) {
-					ifsplit = true;
-				}
-			}
+            const bool ifsplit = needsSplit(geoID, maxEdgLen);
 
 			if (ifsplit) {
 				int p1 = Elems[i].form[Egid[maxEdgIdx][0]];
@@ -451,7 +439,7 @@ int DT::OptSizeControl_yunbo(double lamasize,
 				}
 
 				//add inner point
-				std::vector<int> nearTets = { searchtet };
+				nearTets.assign(1, searchtet);
 
 				int ret = BW_insert_vertex(iNod, nearTets, 1);
 				if (ret == 1) {//success
@@ -464,7 +452,7 @@ int DT::OptSizeControl_yunbo(double lamasize,
 			}
 		}
 
-		if (stop < 10 && minq>improve_goal)
+		if (stop < 10 && !worstNeedsOptimization)
 			break;
 		improve_step = true;
 	}
@@ -630,9 +618,9 @@ int DT::prepareQuality() {
 	return 1;
 }
 
-void DT::printQuality(double  improve_goal, int& nbad, double& minq, bool outWorst) {
+int DT::printQuality(double  improve_goal, int& nbad, double& minq, bool outWorst) {
 	// Quality drives stopping conditions at every verbosity level.
-	int nElem = Elems.size(), nSum = 0;
+	int nElem = Elems.size(), nSum = 0, worstTet = -1;
 	double SumQ = 0;
 	minq = DBL_MAX;
 	nbad = 0;
@@ -641,15 +629,16 @@ void DT::printQuality(double  improve_goal, int& nbad, double& minq, bool outWor
 		if (isDelEle(i) || isvirtualtet(i) || ishulltet(i))
 			continue;
 
-		double q = Elems[i].q;
+		const double q = Elems[i].q;
 
-		SumQ += Elems[i].q;
+		SumQ += q;
 		nSum++;
-		if (Elems[i].q < improve_goal)
+		if (q < improve_goal)
 			nbad++;
 
-		if (Elems[i].q < minq) {
-			minq = Elems[i].q;
+		if (q < minq) {
+			minq = q;
+			worstTet = i;
 		}
 	}
 
@@ -657,7 +646,7 @@ void DT::printQuality(double  improve_goal, int& nbad, double& minq, bool outWor
 		meshLogger->info("Quality : bad:{} minQ:{:3e} avg:{:.3e}", nbad, minq, nSum ? SumQ / nSum : 0.0);
 	}
 
-	return;
+	return worstTet;
 }
 
 void DT::updateQuality(int i) {
@@ -714,7 +703,7 @@ int DT::SmoothPass(int nloop, double improve_goal)
 {
     MeshStageLog stageLog(*this, "Smooth", 2);
     DTParallelScope parallelScope;
-    if (susReuseIdle) susIdleStates.resize(Nodes.size());
+    susIdleStates.resize(Nodes.size());
     std::vector<std::vector<int>> colors;
     colorBadQualityNodes(colors, improve_goal);
     size_t maxGroup = 0;
@@ -1169,8 +1158,8 @@ int DT::removebadtet(int& iElm, int thread_n) {
         }
     } seedRelease{this, p, thread_n};
 
-    // Keep capacity across the six edge and four face attempts.
-    std::vector<int> wait_remove;
+    // Reuse both ring buffers across this cell's edge attempts.
+    std::vector<int> wait_remove, shellPoints;
 
 	for (int i = 0; i < 6; i++) {
 		//find a edge not try
@@ -1181,14 +1170,15 @@ int DT::removebadtet(int& iElm, int thread_n) {
 		}
 		wait_remove.assign(1, iElm);
 
-		int ret = removeEdge(wait_remove, Egid[i][0], Egid[i][1], deepth, thread_n);
+		int ret = removeInteriorEdge(wait_remove, Egid[i][0], Egid[i][1], deepth, thread_n, shellPoints);
 
 		if (ret == 1) {
 			return 1;
 		}
 
-		//remove fail but tet still idx change
-		iElm = findtet(p, wait_remove);
+		// Recover only if the failed flip replaced or reordered the seed tet.
+		if (isDelEle(iElm) || !std::equal(p, p + 4, Elems[iElm].form))
+			iElm = findtet(p, wait_remove);
 		if (iElm == -1) {
 			return 0;
 		}
@@ -1201,8 +1191,9 @@ int DT::removebadtet(int& iElm, int thread_n) {
 		if (ret == 1) {
 			return 1;//remove success
 		}
-		//remove fail but tet still idx change
-		iElm = findtet(p, wait_remove);
+		// Recover only if the failed flip replaced or reordered the seed tet.
+		if (isDelEle(iElm) || !std::equal(p, p + 4, Elems[iElm].form))
+			iElm = findtet(p, wait_remove);
 		if (iElm == -1) {
 			return 0;
 		}
@@ -1243,7 +1234,6 @@ int DT::removebadtet_addPnt(int iElm) {
 
 	if (nBndpnt >= 4) {
 		{
-			int maxIdx = -1;
 			double maxDis = 0;
 			/******** Split Long Edge ********/
 			std::set<int> alltet;
@@ -1469,6 +1459,8 @@ int DT::findtet(int p[], std::vector<int> sph) {
 
 //Adjust the order of the 4 points of the tet
 int DT::matchtet(int p[], int t) {
+	// An unchanged ordering already has the required reciprocal face bonds.
+	if (std::equal(p, p + 4, Elems[t].form)) return t;
 	int oldp[4] = { 0 }, neig[4] = { 0 }, neigOrd[4] = { 0 };
 	for (int i = 0; i < 4; i++) {
 		if (Elems[t].form[i] == p[0]) { oldp[0] = i; }
@@ -1751,8 +1743,8 @@ int DT::smooth_volume(int iNod, bool equalAngle) {
 		vecTimesMatrix13_33(VolGrad_initial, HessianT, VolGrad);
 
 		double alpha = 1;
-		double beta = 0.8;
-		double gamma = 1e-4;//0.01;
+		constexpr double beta = 0.8;
+		constexpr double gamma = 1e-4;
 		while (1) {
 			//new position
 			for (i = 0; i < 3; i++)
@@ -2378,6 +2370,8 @@ int DT::flipEdgPass(int nloop) {
 		return 0;
     }
 
+    // One trial mesh per pass; dt_init resets its state before each candidate.
+    std::unique_ptr<DT> trial;
 	int nsuccess = 0;
     size_t attempts = 0;
 	for (int loop = 0; loop < nloop; loop++) {
@@ -2413,7 +2407,7 @@ int DT::flipEdgPass(int nloop) {
 				}
 			}
 
-			if (flipEdg(i)) {
+			if (flipEdgWithTrial(i, 0, trial)) {
 				tpsuc++;
 			}
 			else {
@@ -3004,8 +2998,6 @@ void DT::Type_Vertex_Edg(double Angle, const Mesh& mesh) {
 		if (isSegmentpnt(iNod)) {
 			std::unordered_map<int, bool> seen;
 			const auto& neig_p = pp_neig[iNod];
-			/*std::unordered_set<int> neig_p;
-			findSphere_tri_p(iNod, neig_p);*/
 
 			for (auto it : neig_p) {
 				if (isCornerpnt(it) || isSegmentpnt(it))
@@ -4006,7 +3998,12 @@ int DT::checkFlipNormal(int p1, int p2, int p3, int p4) {
         && std::max(next2.dot(old1), next2.dot(old2)) >= minFaceCos;
 }
 //waiting TODO:virtual tet seting
-int DT::flipEdg(int index , int deep) {
+int DT::flipEdg(int index, int deep) {
+    std::unique_ptr<DT> trial;
+    return flipEdgWithTrial(index, deep, trial);
+}
+
+int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
 	if (deep > 1)
 		return 0;
 	int p1 = SurEdgs[index].iStart;
@@ -4032,11 +4029,6 @@ int DT::flipEdg(int index , int deep) {
 		}
 	}
 
-	//if ((p1 == 93872 || p1 == 14013) && (p2 == 93872 || p2 == 14013))
-	//{
-	//	printf("%d %d %d %d %d\n", index, p1, p2, p3, p4);
-	//}
-
 	// An existing diagonal would merge distinct surface patches.
 	if (p3 < 0 || p4 < 0 || p3 == p4 || BndEdg.find(p3, p4)) return 0;
 
@@ -4056,7 +4048,7 @@ int DT::flipEdg(int index , int deep) {
 		return 0;
 	}
 
-	std::vector<int> shell, shell_p, shell1, shell_p1;
+	std::vector<int> shell, shell_p;
 
 	findShell(tet, i1, i2, shell, shell_p);
 
@@ -4073,41 +4065,30 @@ int DT::flipEdg(int index , int deep) {
 	dt::Mesh mesh;
 
 	int gp = -1;
-	double gpnt[3] = { 0,0,0 };
 	std::unordered_map<int, int> nodemp;
-	std::unordered_map<int, int> mpn;
+	std::vector<int> mpn;
+    // Local indices are dense; preserve first-seen input ordering.
+    const size_t maxLocalNodes = shell.size() + 2;
+    nodemp.reserve(maxLocalNodes);
+    mpn.reserve(maxLocalNodes);
+    mesh.V.reserve(maxLocalNodes);
+    mesh.F.reserve(shell.size() * 2 + 2);
 	for (int i = 0; i < shell.size(); ++i) {
 		for (int j = 0; j < 4; j++) {
 			int ip = Elems[shell[i]].form[j];
-			if (nodemp.count(ip))
+			if (!nodemp.emplace(ip, static_cast<int>(mesh.V.size())).second)
 				continue;
 			if (ip != ghost) {
 				mesh.V.push_back({ Nodes[ip].pt[0], Nodes[ip].pt[1], Nodes[ip].pt[2] });
-				gpnt[0] += Nodes[ip].pt[0];
-				gpnt[1] += Nodes[ip].pt[1];
-				gpnt[2] += Nodes[ip].pt[2];
 			}
 			else {
 				gp = mesh.V.size();
 				mesh.V.push_back({ 0,0,0 });
 			}
-			nodemp[ip] = mesh.V.size() - 1;
-			mpn[mesh.V.size() - 1] = ip;
+			mpn.push_back(ip);
 		}
 
 	}
-
-	//update ghost point place
-	//if (gp != -1) {
-	//	double mid[3] = { 0,0,0 };
-	//	for (int i = 0; i < 3; ++i) {
-	//		mid[i] = (Nodes[p1].pt[i] + Nodes[p2].pt[i] + Nodes[p3].pt[i] + Nodes[p4].pt[i]) / 4.0;
-	//	}
-
-	//	mesh.V[gp][0] = 2 * mid[0] - gpnt[0] / (nodemp.size() - 1);
-	//	mesh.V[gp][1] = 2 * mid[1] - gpnt[1] / (nodemp.size() - 1);
-	//	mesh.V[gp][2] = 2 * mid[2] - gpnt[2] / (nodemp.size() - 1);
-	//}
 
 	if (gp != -1) {
 		double mid[3] = { 0.0, 0.0, 0.0 };
@@ -4168,8 +4149,8 @@ int DT::flipEdg(int index , int deep) {
 		double n1[3] = { 0.0, 0.0, 0.0 };
 		double n2[3] = { 0.0, 0.0, 0.0 };
 
-		bool ok1 = getSolidFaceNormal(p1, p2, p3, n1);
-		bool ok2 = getSolidFaceNormal(p1, p2, p4, n2);
+		const bool ok1 = getSolidFaceNormal(p1, p2, p3, n1);
+		const bool ok2 = getSolidFaceNormal(p1, p2, p4, n2);
 
 		double dir[3] = { 0.0, 0.0, 0.0 };
 
@@ -4214,6 +4195,9 @@ int DT::flipEdg(int index , int deep) {
 	}
 
 
+    // Reuse the shell boundary faces for input construction and rebonding.
+    std::vector<std::array<int, 2>> shellBoundary;
+    shellBoundary.reserve(shell.size() * 2);
 	for (int i = 0; i < shell.size(); i++) {
 		for (int j = 0; j < 4; j++) {
 			int neig = getNeig(shell[i], j);
@@ -4223,21 +4207,13 @@ int DT::flipEdg(int index , int deep) {
 				int pb = Elems[shell[i]].form[ic];
 				int pc = Elems[shell[i]].form[id];
 				mesh.F.push_back({ nodemp[pa],nodemp[pb],nodemp[pc] });
+                shellBoundary.push_back({ shell[i], j });
 			}
 
 		}
 	}
 	mesh.F.push_back({ nodemp[p3],nodemp[p4],nodemp[p1] });
 	mesh.F.push_back({ nodemp[p3],nodemp[p4],nodemp[p2] });
-
-	//printSph_VTK(shell, "./shell_" + std::to_string(index) + ".vtk");
-	//if (index == 242504) {
-	//	printSph_VTK(shell,"./shell.vtk");
-	//	//// Explicit mesh export is left to the caller.
-	//	checkMeshError();
-	//	std::string load = "./"+std::to_string(index) + "_out.vtk";
-	//	writeVTK(load, mesh, true);
-	//}
 
 	dt::Args tempargs;
 	tempargs.infolevel = 0;
@@ -4248,23 +4224,26 @@ int DT::flipEdg(int index , int deep) {
 	tempargs.constrain = 1;
 	tempargs.outlogfile = 0;
 
-	dt::DT d;
-    d.parallelMinPointsPerThread = parallelMinPointsPerThread;
-    // This is a speculative local mesh. A rejected trial is a recoverable
-    // optimization detail, not an error of the caller's mesh generation.
-    d.meshLogger = std::make_shared<spdlog::logger>("topology_trial",
-        std::make_shared<spdlog::sinks::null_sink_mt>());
+    if (!trial) {
+        trial = std::make_unique<DT>();
+        // Rejected local trials must not emit errors through the host logger.
+        trial->meshLogger = std::make_shared<spdlog::logger>("topology_trial",
+            std::make_shared<spdlog::sinks::null_sink_mt>());
+    }
+    trial->parallelMinPointsPerThread = parallelMinPointsPerThread;
     try {
-        if (!d.tetrahedralize(mesh, tempargs)) {
+        if (!trial->tetrahedralize(mesh, tempargs)) {
+            trial.reset();
             meshLogger->debug("Local topology trial rejected");
             return 0;
         }
     } catch (...) {
+        trial.reset(); // Discard partially initialized state after an exception.
         meshLogger->debug("Local topology trial rejected");
         return 0;
     }
 
-	if (mesh.V.size() > nodemp.size()/* || shell.size()< mesh.T.size()*/)
+	if (mesh.V.size() > nodemp.size())
 		return 0;
 
 	std::set<int> color;
@@ -4311,20 +4290,15 @@ int DT::flipEdg(int index , int deep) {
 	std::unordered_map<Int3, int64_t, Int3Hasher> Tri;
 	std::unordered_map<Int3, int, Int3Hasher> checkTri;
 
-	for (int i = 0; i < shell.size(); i++) {
-		for (int j = 0; j < 4; j++) {
-			int neig = getNeig(shell[i], j);
-			int neigord = getNeigOrd(shell[i], j);
-			if (std::find(shell.begin(), shell.end(), neig) == shell.end()) {
-				DNC(j, ia, ib, ic, id);
-				int pa = Elems[shell[i]].form[ib];
-				int pb = Elems[shell[i]].form[ic];
-				int pc = Elems[shell[i]].form[id];
-				Tri[Int3(pa, pb, pc)] = ((int64_t)neig << 2) | neigord;
-				checkTri[Int3(pa, pb, pc)] = 1;
-			}
-		}
-	}
+    Tri.reserve(shellBoundary.size() + mesh.T.size() * 2);
+    checkTri.reserve(shellBoundary.size() + mesh.T.size() * 2);
+    for (const auto& face : shellBoundary) {
+        const int t = face[0], j = face[1];
+        DNC(j, ia, ib, ic, id);
+        const Int3 key(Elems[t].form[ib], Elems[t].form[ic], Elems[t].form[id]);
+        Tri[key] = (static_cast<int64_t>(getNeig(t, j)) << 2) | getNeigOrd(t, j);
+        checkTri.emplace(key, 1);
+    }
 
 	//check if dt is right
 	for (int i = 0; i < mesh.T.size(); i++) {
@@ -4334,13 +4308,7 @@ int DT::flipEdg(int index , int deep) {
 			int pb = mpn[mesh.T[i][ic]];
 			int pc = mpn[mesh.T[i][id]];
 			Int3 query_key(pa, pb, pc);
-			auto it = checkTri.find(query_key);
-			if (it != checkTri.end()) {
-				it->second++;
-			}
-			else {
-				checkTri[Int3(pa, pb, pc)] = 1;
-			}
+			++checkTri[query_key];
 		}
 	}
 	for (auto it : checkTri) {
@@ -4358,7 +4326,7 @@ int DT::flipEdg(int index , int deep) {
 						int eid = boundaryIndex;
 						if (eid == index)
 							continue;
-						if (flipEdg(eid,1)) {
+						if (flipEdgWithTrial(eid, 1, trial)) {
 							break;
 						}
 						else {
@@ -4376,7 +4344,6 @@ int DT::flipEdg(int index , int deep) {
 	}
 
 	std::queue<int> newEvec;
-	std::vector<int> newEvec2;
 
 	for (int i = 0; i < mesh.T.size(); i++) {
 		int forghost = 0;
@@ -4389,7 +4356,6 @@ int DT::flipEdg(int index , int deep) {
 		int	newE = addElem(mpn[mesh.T[i][ib]], mpn[mesh.T[i][ic]], mpn[mesh.T[i][id]], mpn[mesh.T[i][ia]]);
 
 		newEvec.push(newE);
-		newEvec2.push_back(newE);
 		for (int j = 0; j < 4; j++) {
 			setP2T(Elems[newE].form[j], newE);
 			DNC(j, ia, ib, ic, id);
@@ -4397,15 +4363,12 @@ int DT::flipEdg(int index , int deep) {
 			int pb = Elems[newE].form[ic];
 			int pc = Elems[newE].form[id];
 			Int3 query_key(pa, pb, pc);
-			auto it = Tri.find(query_key);
-			if (it != Tri.end()) {
-				int64_t neiginfo = it->second;
+			auto entry = Tri.emplace(query_key, (static_cast<int64_t>(newE) << 2) | j);
+			if (!entry.second) {
+				int64_t neiginfo = entry.first->second;
 				int neig = neiginfo >> 2;
 				int neigo = neiginfo & 3;
 				bond(newE, j, neig, neigo);
-			}
-			else {
-				Tri[Int3(pa, pb, pc)] = ((int64_t)newE << 2) | j;
 			}
 		}
 	}
@@ -4541,15 +4504,6 @@ int DT::flipEdg(int index , int deep) {
 
 		}
 	}
-
-	//for (int i = 0; i < 4; i++) {
-	//	int ie = neigEdg[i];
-	//	if (isDelSurEdg(ie) || SurEdgs[ie].info > 1 || SurEdgs[ie].constrain > 0)
-	//		continue;
-	//	if (ifflipEdg(ie)) {
-	//		flipEdg(ie, deep+1);
-	//	}
-	//}
 
 	return 1;
 }
@@ -5270,8 +5224,8 @@ if (auto* boundaryEntry = BndEdg.find(iNod, iSecond))
 
 		// 初始二分区间
 		double left = 0.0, right = 1.0;
-		double tol = 1e-6;
-		int max_iter = 30;
+		constexpr double tol = 1e-6;
+		constexpr int max_iter = 30;
 
 		double  pos[3];
 		double* A = Nodes[p1].pt;
@@ -5298,8 +5252,7 @@ if (auto* boundaryEntry = BndEdg.find(iNod, iSecond))
 
 		double projected[3] = { pos[0], pos[1], pos[2] };
 		double proj_tol = 0.3 * distance(A, B);
-		bool segment_proj_ok = project_segment_point_to_fine_mesh(pos, projected, proj_tol);
-		if (segment_proj_ok) {
+		if (project_segment_point_to_fine_mesh(pos, projected, proj_tol)) {
 			minq = std::min(minq, 1e-10);
 		}
 

@@ -32,10 +32,10 @@ enum class MeshStageSummary { Time, MeshCount, MeshChange };
 
 class MeshStageLog {
     DT& mesh;
-    const char* name;
-    spdlog::level::level_enum level;
+    const char* const name;
+    const spdlog::level::level_enum level;
     bool active;
-    MeshStageSummary summary;
+    const MeshStageSummary summary;
     size_t initialTets = 0;
     size_t countTets() const;
     std::chrono::steady_clock::time_point started;

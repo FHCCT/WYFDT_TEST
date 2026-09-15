@@ -8,6 +8,7 @@
 #include <cmath>
 #include <string>
 #include <mutex>
+#include <memory>
 #include <cfloat>
 #include <queue>
 #include <bitset>
@@ -108,7 +109,6 @@ namespace dt {
 		int fliplevel_face;
         struct SusIdleState { std::vector<double> neighborhood; int skips = 0; };
         std::vector<SusIdleState> susIdleStates;
-        bool susReuseIdle = true;
 		int improve_Metric;
 		int num_threads = 1; // Single thread-count upper bound for every stage.
         size_t parallelMinPointsPerThread = 8192;
@@ -173,7 +173,6 @@ namespace dt {
 		int findSphere_pnt(const  int p, std::unordered_set<int>& Sphere_pnt);
 		int findSphere_global(const  int p, std::vector<int>& Sphere);
 		int findSphere_tri(const  int p, std::unordered_set<int>& Sphere_tri);
-		//int findSphere_tri_p(const  int p, std::unordered_set<int>& neig_p);
 		//boundary recover
 		void buildBndInfo(Mesh& mesh, Args& args, bool buildSize = true);
 		void SurMeshClean(Mesh& mesh, Args& args);
@@ -235,7 +234,8 @@ namespace dt {
 		int OptbyAnisotropicPass(Args& args);
 		int VolumeImprovePass(Args& args);
 		int prepareQuality();
-		void printQuality(double  improve_goal, int& nbad, double& minq, bool outWorst = false);
+		// Returns the first minimum-quality live physical cell, or -1 if none.
+		int printQuality(double  improve_goal, int& nbad, double& minq, bool outWorst = false);
 		void updateQuality(int i);
 		void updateminVolume(void);
 		///****************** Smoothing **************/
@@ -464,6 +464,9 @@ namespace dt {
 		bool project_boundary_point_to_fine_mesh(double* in, double* out, double max_projection_distance);
 		bool project_segment_point_to_fine_mesh(double* in, double* out, double max_projection_distance);
     private:
+        int removeInteriorEdge(std::vector<int>& oldtet, int ia, int ib, int info,
+            int thread_n, std::vector<int>& shellPoints);
+        int flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial);
         int calculateDihedral(double& minD, double& minAvgD, double& maxD, double& maxAvgD);
         void resetMeshState();
         void removeInteriorSteiner();

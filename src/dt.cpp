@@ -162,7 +162,7 @@ int DT::BndPntInst(Mesh& mesh, Args& args)
 	/************************ init first tet *************************/
 	{
 		if (infolevel > 0) meshLogger->debug("Create first tet");
-		double epsilon = 1e-30;
+		constexpr double epsilon = 1e-30;
 		// Calculate the diagonal size of its bounding box.
 		double boxsize = sqrt(norm2(maxW[0] - minW[0], maxW[0] - minW[0], maxW[2] - minW[0]));
 
@@ -1499,90 +1499,6 @@ int DT::findSphere_tri(const  int p, std::unordered_set<int>& Sphere_tri) {
 	return Sphere_tri.size();
 }
 
-//int DT::findSphere_tri_p(const  int p, std::unordered_set<int>& neig_p) {
-//	neig_p.clear();
-//
-//	//find first tri contain p
-//	int iElm, src[4], it = -1;//it is first triangle contain  p
-//	std::vector<int> visitE;
-//	std::queue<int> que;
-//	iElm = getP2T(p);
-//	if (isNod_in_Tet(p, iElm) == -1) {
-//		if (meshLogger->level() != spdlog::level::off) printf("Wrong point to tet! P:%d T:%d\n", p, iElm);
-//		meshLogger->error("Wrong point to tet! P:{} T:{}", p, iElm);
-//		throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
-//	}
-//
-//	set_bit(Elems[iElm].info, 31);//o_bit mean this tet has been visited
-//	que.push(iElm);
-//	visitE.emplace_back(iElm);
-//
-//	while (!que.empty()) {
-//		iElm = que.front();
-//		que.pop();
-//		int ord = isNod_in_Tet(p, iElm);
-//
-//		if (ord == -1) {//p don't in iElm
-//			if (meshLogger->level() != spdlog::level::off) printf("Wrong point to tet! P:%d T:%d\n", p, iElm);
-//			meshLogger->error("Wrong point to tet! P:{} T:{}", p, iElm);
-//			throw EXCEPTIONSTRING(std::string("error exit in") + std::string(__FILE__) + std::to_string(__LINE__));
-//		}
-//
-//		DNC(ord, src[0], src[1], src[2], src[3]);
-//		for (int i = 1; i < 4; i++) {
-//			if (isBndTri(Elems[iElm].form[(src[i] + 1) % 4], Elems[iElm].form[(src[i] + 2) % 4], Elems[iElm].form[(src[i] + 3) % 4])) {
-//				it = BndTri.get(Elems[iElm].form[(src[i] + 1) % 4], Elems[iElm].form[(src[i] + 2) % 4], Elems[iElm].form[(src[i] + 3) % 4]);
-//			}
-//			int nig = getNeig(iElm, src[i]);
-//			if (nig == -1)
-//				continue;
-//			if (get_bit(Elems[nig].info, 31))//neig has been visited
-//				continue;
-//			set_bit(Elems[nig].info, 31);//o_bit mean this tet has been visited
-//			que.push(nig);
-//			visitE.emplace_back(nig);
-//		}
-//
-//		if (it != -1)
-//			break;
-//	}
-//	//clear info
-//	for (int i = 0; i < visitE.size(); i++) {
-//		clear_bit(Elems[visitE[i]].info, 31);//Clear position 0 bit
-//	}
-//
-//	if (it == -1)
-//		return 0;
-//
-//	while (!que.empty()) {
-//		que.pop();
-//	}
-//
-//	std::unordered_map<int, bool> visitf;
-//	visitf[it] = true;
-//
-//	que.push(it);
-//	while (!que.empty()) {
-//		it = que.front();
-//		que.pop();
-//
-//		for (int i = 0; i < 3; i++) {
-//			int p1 = SurTris[it].form[i];
-//			if (p1 == p)
-//				continue;
-//			neig_p.insert(p1);
-//			for (auto neigf : SurEdgs[BndEdg.get(p, p1)].face) {
-//				if (visitf[neigf])
-//					continue;
-//				que.push(neigf);
-//				visitf[neigf] = true;
-//			}
-//		}
-//	}
-//
-//	return neig_p.size();
-//}
-
 /*
 * if p1,p2 is MeshEdge,the first tet have p1,p2,will destroy BW
 */
@@ -2756,7 +2672,6 @@ int DT::finddirection_global(const int p1, const int p2, int& srctet) {
 		if (!ishulltet(tempsrc))
 			continue;
 		int dir = isNod_in_Tet(p1, tempsrc);
-		double dis = 0;
 		int p3 = -1, p4 = -1;
 		for (int j = 0; j < 3; j++) {
 			if (dir == j)
@@ -4116,7 +4031,7 @@ int DT::removeEdgStiner(const int idx, int level) {
 			double oldp[3] = { Nodes[iNod].pt[0],Nodes[iNod].pt[1],Nodes[iNod].pt[2] };
 			double newp[3] = { oldp[0] + edgelen * normal[i][0] ,oldp[1] + edgelen * normal[i][1] ,oldp[2] + edgelen * normal[i][2] };
 			double ori, len = edgelen/10.0;
-			double ShortestDistance = 1e-16;
+			constexpr double ShortestDistance = 1e-16;
 
 			for (j = bndpt.size() - 1; j >= bndpt.size() - 2; j--) {
 				ori = dt::GEOM_FUNC::orient3d(Nodes[bndpt[j][0]].pt, Nodes[bndpt[j][1]].pt, newp, Nodes[bndpt[j][2]].pt);
@@ -4399,7 +4314,6 @@ int DT::removeTriStiner(const int idx) {
 			int nsubsph = sphcla[i].size();
 			std::vector<std::vector<int>> bndpt(nsubsph, std::vector<int>(3, -1));
 			std::map<int, int> PTV;//parent bnd tri have been visited?
-			int SubTriord = 0;
 			for (j = 0; j < nsubsph; j++) {
 				int t0 = sphcla[i][j];
 				for (m = 0; m < 4; m++) {
@@ -4440,7 +4354,7 @@ int DT::removeTriStiner(const int idx) {
 			double edgelen = std::min(std::min(distance(Nodes[p1].pt, Nodes[iNod].pt), distance(Nodes[p2].pt, Nodes[iNod].pt)), distance(Nodes[p3].pt, Nodes[iNod].pt));
 			double oldp[3] = { Nodes[iNod].pt[0],Nodes[iNod].pt[1],Nodes[iNod].pt[2] };
 			//try to find a position,let all tet's volume is positive
-			double ShortestDistance = 1e-10;
+			constexpr double ShortestDistance = 1e-10;
 			while (edgelen > ShortestDistance) {
 				bool allpositive = true;
 				double newp[3] = { oldp[0] + edgelen * normal[i][0] ,oldp[1] + edgelen * normal[i][1] ,oldp[2] + edgelen * normal[i][2] };
@@ -4700,15 +4614,18 @@ int DT::removeface(std::vector<int>& oldtet, int ia, int info, int thread_n) {
 			double minq = std::min(Elems[oldtet[0]].q, Elems[oldtet[1]].q);
 			double q1 = 0, q2 = 0, q3 = 0;
 			if (improve_Metric != 8) {
-				double AniMetric1[6] = { 0 }, AniMetric2[6] = { 0 }, AniMetric3[6] = { 0 };
-				if (improve_step && AniSol.size() != 0) {
-					getmm(a, b, d, e, AniMetric1);
-					getmm(a, d, c, e, AniMetric2);
-					getmm(a, c, b, e, AniMetric3);
+				double metric[6] = { 0 };
+				if (!AniSol.empty()) getmm(a, b, d, e, metric);
+				q1 = tetquality(pa, pb, pd, pe, metric, improve_Metric);
+				// Later candidate qualities cannot rescue an already rejected flip.
+				if (!(q1 < minq)) {
+					if (!AniSol.empty()) getmm(a, d, c, e, metric);
+					q2 = tetquality(pa, pd, pc, pe, metric, improve_Metric);
+					if (!(q2 < minq)) {
+						if (!AniSol.empty()) getmm(a, c, b, e, metric);
+						q3 = tetquality(pa, pc, pb, pe, metric, improve_Metric);
+					}
 				}
-				q1 = tetquality(pa, pb, pd, pe, AniMetric1, improve_Metric);
-				q2 = tetquality(pa, pd, pc, pe, AniMetric2, improve_Metric);
-				q3 = tetquality(pa, pc, pb, pe, AniMetric3, improve_Metric);
 
 			}
 			else {
@@ -4759,6 +4676,16 @@ int DT::removeface(std::vector<int>& oldtet, int ia, int info, int thread_n) {
 }
 
 int DT::removeEdge(std::vector<int>& oldtet, int ia, int ib, int info, int thread_n) {
+    const int seed = oldtet[0];
+    if (info < 0 || isDelEle(seed)) return 0;
+    if (isBndEdg(Elems[seed].form[ia], Elems[seed].form[ib])) return 0;
+    std::vector<int> shellPoints;
+    return removeInteriorEdge(oldtet, ia, ib, info, thread_n, shellPoints);
+}
+
+// The caller has checked that this edge is not constrained by the boundary.
+int DT::removeInteriorEdge(std::vector<int>& oldtet, int ia, int ib, int info,
+    int thread_n, std::vector<int>& shell_point) {
     auto& flipHistory = thread_n < 0 ? flipnmRecll : parallelFlipHistory[thread_n];
     auto& flipCount = thread_n < 0 ? tempfliptime : parallelFlipCount[thread_n];
 
@@ -4769,10 +4696,6 @@ int DT::removeEdge(std::vector<int>& oldtet, int ia, int ib, int info, int threa
 	int pa = Elems[ie].form[ia];
 	int pb = Elems[ie].form[ib];
 
-	if (isBndEdg(pa, pb)) {//can't remove Boundary Edge
-		return 0;
-	}
-	std::vector<int> shell_point;
 	//find shell around edge pa_pb,store at old tet
 	if (findShell(ie, ia, ib, oldtet, shell_point, thread_n) == -1)
 		return -1;
@@ -4909,14 +4832,13 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 
 					double qa = 0, qb = 0;
 					if (improve_Metric != 8) {
-						double AniMetric1[6] = { 0 }, AniMetric2[6] = { 0 };
-						if (AniSol.size() != 0) {
-							getmm(pd, pc, pe, pa, AniMetric1);
-							getmm(pc, pd, pe, pb, AniMetric2);
+						double metric[6] = { 0 };
+						if (!AniSol.empty()) getmm(pd, pc, pe, pa, metric);
+						qa = tetquality(Nodes[pd].pt, Nodes[pc].pt, Nodes[pe].pt, Nodes[pa].pt, metric, improve_Metric);
+						if (!(qa <= minq + 1e-15)) {
+							if (!AniSol.empty()) getmm(pc, pd, pe, pb, metric);
+							qb = tetquality(Nodes[pc].pt, Nodes[pd].pt, Nodes[pe].pt, Nodes[pb].pt, metric, improve_Metric);
 						}
-
-						qa = tetquality(Nodes[pd].pt, Nodes[pc].pt, Nodes[pe].pt, Nodes[pa].pt, AniMetric1, improve_Metric);
-						qb = tetquality(Nodes[pc].pt, Nodes[pd].pt, Nodes[pe].pt, Nodes[pb].pt, AniMetric2, improve_Metric);
 					}
 					else {
 						int tetde = -1;
@@ -5037,14 +4959,13 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 
 				double qa = 0, qb = 0;
 				if (improve_Metric != 8) {
-					double AniMetric1[6] = { 0 }, AniMetric2[6] = { 0 };
-					if (AniSol.size() != 0) {
-						getmm(pc, pb, pd, pe, AniMetric1);
-						getmm(pa, pc, pd, pe, AniMetric2);
+					double metric[6] = { 0 };
+					if (!AniSol.empty()) getmm(pc, pb, pd, pe, metric);
+					qa = tetquality(Nodes[pc].pt, Nodes[pb].pt, Nodes[pd].pt, Nodes[pe].pt, metric, improve_Metric);
+					if (!(qa <= minq + 1e-15)) {
+						if (!AniSol.empty()) getmm(pa, pc, pd, pe, metric);
+						qb = tetquality(Nodes[pa].pt, Nodes[pc].pt, Nodes[pd].pt, Nodes[pe].pt, metric, improve_Metric);
 					}
-
-					qa = tetquality(Nodes[pc].pt, Nodes[pb].pt, Nodes[pd].pt, Nodes[pe].pt, AniMetric1, improve_Metric);
-					qb = tetquality(Nodes[pa].pt, Nodes[pc].pt, Nodes[pd].pt, Nodes[pe].pt, AniMetric2, improve_Metric);
 				}
 				else {
 					qa = orthogonal(Nodes[pc].pt, Nodes[pb].pt, Nodes[pd].pt, Nodes[pe].pt,
@@ -5176,6 +5097,7 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 					}
 				}
 				else if (improve_step) {
+					std::vector<int> shell, shellp;
 					while (!flipHistory.empty())
 					{
 						auto it = flipHistory.back();
@@ -5185,7 +5107,6 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 							if (isMeshEdge(it[0], it[1], &te)) {
 								int ia = isNod_in_Tet(it[0], te);
 								int ib = isNod_in_Tet(it[1], te);
-								std::vector<int> shell, shellp;
 								findShell(te, ia, ib, shell, shellp);
 								flip32(shell, ia, ib, thread_n);
 							}
@@ -5201,7 +5122,7 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 								int ic = isNod_in_Tet(it[2], te);
 								int id = 0 + 1 + 2 + 3 - ia - ib - ic;
 								int neig = getNeig(te, id);
-								std::vector<int> shell = { te,neig };
+								shell.assign({ te,neig });
 								flip23(shell, id, thread_n);
 							}
 						}
@@ -5212,7 +5133,6 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 							if (Elems[newtet].form[k] == pa) a = k;
 							else if (Elems[newtet].form[k] == pb) b = k;
 						}
-						std::vector<int> shellp;
 						findShell(newtet, b, a, oldtet, shellp);//find new shell ab
 						for (k = 0; k < oldtet.size(); k++) {
 							if (Elems[oldtet[k]].info == 0) {//set thit tet in star
@@ -6318,7 +6238,7 @@ void DT::SurMeshClean(Mesh& mesh, Args& args){
 		double L2 = distance2(Nodes[p1].pt, Nodes[p3].pt);
 		double L3 = distance2(Nodes[p1].pt, Nodes[p2].pt);
 
-		double shortE = 1e-16;
+		constexpr double shortE = 1e-16;
 		if (L1 < shortE || L2 < shortE || L3 < shortE) {
 			//because of short edge, destroy it
 			if (L2 < shortE) {

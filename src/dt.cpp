@@ -2,7 +2,7 @@
 
 using namespace std;
 
-constexpr int DT::virtualID; // C++14 definition for reference-taking callers.
+constexpr int DT::virtualID; // C++11/14 definition for reference-taking callers.
 
 DT::DT() {};
 DT::~DT() {};

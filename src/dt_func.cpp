@@ -787,6 +787,7 @@ void DT::getMeshEdgebyGeo(Mesh& mesh) {
 //--------------------- Mesh Quality ---------------------
 double DT::tetquality(double v1[3], double v2[3], double v3[3], double v4[3], double* AniMetric, int qualmeasure) {
 	if (qualmeasure == SUS_METRIC) return quality_sus(v1, v2, v3, v4);
+
 	double quality = 0;
 	if (qualmeasure == 1) {
 		//efective in removing large dihedral angles.

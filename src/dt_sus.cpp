@@ -98,6 +98,38 @@ Vec smallHullNearest(const std::vector<Vec>& g) {
     return best;
 }
 
+// Shared convex-hull solve for SUS and individual dihedral-angle gradients.
+Vec commonAscentDirection(std::vector<Vec>& gradients, double scale) {
+    if (gradients.empty()) return Vec::Zero();
+    if (!(scale > 0) || !std::isfinite(scale)) return Vec::Zero();
+    for (auto& g : gradients) g /= scale;
+    Vec nearest = gradients.front();
+    if (gradients.size() <= 4) {
+        nearest = smallHullNearest(gradients);
+    }
+    for (int iteration = 0; gradients.size() > 4 && iteration < 256; ++iteration) {
+        size_t index = 0;
+        for (size_t i = 1; i < gradients.size(); ++i)
+            if (nearest.dot(gradients[i]) < nearest.dot(gradients[index])) index = i;
+        const Vec toward = gradients[index] - nearest;
+        // Frank-Wolfe dual gap measures remaining objective improvement.
+        const double gap = -nearest.dot(toward);
+        if (gap <= 1e-6 * std::max(1e-12, nearest.squaredNorm()) || toward.squaredNorm() <= 1e-30) {
+            break;
+        }
+        const double step = std::max(0.0, std::min(1.0, -nearest.dot(toward) / toward.squaredNorm()));
+        if (step < 1e-14) { break; }
+        nearest += step * toward;
+    }
+    if (nearest.norm() <= 1e-12) return Vec::Zero();
+    const Vec direction = 0.5 * nearest.normalized();
+    bool ascent = true;
+    for (const auto& g : gradients)
+        if (g.dot(direction) <= 1e-12) { ascent = false; break; }
+    if (ascent) return direction;
+    return Vec::Zero();
+}
+
 // Minimum-norm point in the convex hull of the near-worst gradients.
 // A common ascent direction must have positive dot product with every one.
 Vec activeSetDirection(const std::vector<SusTet>& tets, const Vec& x) {
@@ -119,34 +151,54 @@ Vec activeSetDirection(const std::vector<SusTet>& tets, const Vec& x) {
             if (!g.allFinite()) return Vec::Zero();
             gradients.push_back(g); scale = std::max(scale, g.norm());
         }
-        if (!(scale > 0) || !std::isfinite(scale)) return Vec::Zero();
-        for (auto& g : gradients) g /= scale;
-        Vec nearest = gradients.front();
-        if (gradients.size() <= 4) {
-            nearest = smallHullNearest(gradients);
-        }
-        for (int iteration = 0; gradients.size() > 4 && iteration < 256; ++iteration) {
-            size_t index = 0;
-            for (size_t i = 1; i < gradients.size(); ++i)
-                if (nearest.dot(gradients[i]) < nearest.dot(gradients[index])) index = i;
-            const Vec toward = gradients[index] - nearest;
-            // Frank-Wolfe dual gap measures remaining objective improvement.
-            const double gap = -nearest.dot(toward);
-            if (gap <= 1e-6 * std::max(1e-12, nearest.squaredNorm()) || toward.squaredNorm() <= 1e-30) {
-                break;
-            }
-            const double step = std::max(0.0, std::min(1.0, -nearest.dot(toward) / toward.squaredNorm()));
-            if (step < 1e-14) { break; }
-            nearest += step * toward;
-        }
-        if (nearest.norm() <= 1e-12) continue;
-        const Vec direction = 0.5 * nearest.normalized();
-        bool ascent = true;
-        for (const auto& g : gradients)
-            if (g.dot(direction) <= 1e-12) { ascent = false; break; }
-        if (ascent) return direction;
+        const Vec direction = commonAscentDirection(gradients, scale);
+        if (direction.squaredNorm() > 0) return direction;
     }
     return Vec::Zero();
+}
+
+// All six angles are separate smooth constraints. Differentiating the minimum
+// of a tet directly would lose tied worst edges (notably symmetric slivers).
+bool dihedralGradients(const SusTet& tet, const Vec& x,
+                       std::array<double, 6>& angles, std::array<Vec, 6>& gradients) {
+    auto p = tet.points;
+    p[tet.freeIndex] = x;
+    const double det = sigma(p) / std::sqrt(2.0);
+    if (!(det > 0) || !std::isfinite(det)) return false;
+    const Vec a = p[1]-p[0], b = p[2]-p[0], c = p[3]-p[0];
+    std::array<Vec, 4> gd;
+    gd[1] = b.cross(c); gd[2] = c.cross(a); gd[3] = a.cross(b);
+    gd[0] = -gd[1]-gd[2]-gd[3];
+    const int faces[4][3] = {{1,2,3},{0,3,2},{0,1,3},{0,2,1}};
+    std::array<Vec, 4> normals;
+    std::array<Mat, 4> dn;
+    for (int f=0; f<4; ++f) {
+        const int i=faces[f][0], j=faces[f][1], k=faces[f][2];
+        const Vec u=p[j]-p[i], v=p[k]-p[i];
+        normals[f]=u.cross(v);
+        for (int axis=0; axis<3; ++axis) {
+            const Vec e=Vec::Unit(axis);
+            dn[f].col(axis)=((j==tet.freeIndex)-(i==tet.freeIndex))*e.cross(v)
+                + ((k==tet.freeIndex)-(i==tet.freeIndex))*u.cross(e);
+        }
+    }
+    int edge=0;
+    for (int i=0; i<3; ++i) for (int j=i+1; j<4; ++j,++edge) {
+        const int k=i>0?0:(j>1?1:2), l=6-i-j-k;
+        const Vec d=p[j]-p[i];
+        const double length=d.norm();
+        if (!(length>0)) return false;
+        const double y=det*length, z=-normals[k].dot(normals[l]);
+        const Vec gy=length*gd[tet.freeIndex]
+            + det*((j==tet.freeIndex)-(i==tet.freeIndex))*d/length;
+        const Vec gz=-dn[k].transpose()*normals[l]-dn[l].transpose()*normals[k];
+        const double denom=y*y+z*z;
+        if (!(denom>0) || !std::isfinite(denom)) return false;
+        angles[edge]=std::atan2(y,z);
+        gradients[edge]=(z*gy-y*gz)/denom;
+        if (!std::isfinite(angles[edge]) || !gradients[edge].allFinite()) return false;
+    }
+    return true;
 }
 
 double energy(const std::vector<SusTet>& tets, const Vec& x, double delta,
@@ -197,7 +249,7 @@ double dt::DT::quality_sus(double* a, double* b, double* c, double* d) {
     return signedQuality(p);
 }
 
-int dt::DT::smooth_sus(int iNod) {
+int dt::DT::smooth_sus(int iNod, double minimumQualityFloor) {
     if (iNod < 0 || iNod >= static_cast<int>(Nodes.size()) || iNod == ghost ||
         isDelNod(iNod) || isbndpnt(iNod) || isCornerpnt(iNod) ||
         lockV.count(iNod) || periodic_P.count(iNod)) return 0;
@@ -221,7 +273,7 @@ int dt::DT::smooth_sus(int iNod) {
     SusIdleState* const idleState = iNod < susIdleStates.size() ? &susIdleStates[iNod] : nullptr;
     std::vector<double> neighborhood;
     if (idleState) {
-        neighborhood.reserve(sph.size() * 17);
+        neighborhood.reserve(sph.size() * 17 + 1);
         for (int t : sph) {
             neighborhood.push_back(t);
             for (int n : Elems[t].form) {
@@ -229,6 +281,8 @@ int dt::DT::smooth_sus(int iNod) {
                 for (int j = 0; j < 3; ++j) neighborhood.push_back(Nodes[n].pt[j]);
             }
         }
+        // A changed pass floor must invalidate the unchanged-neighborhood cache.
+        neighborhood.push_back(minimumQualityFloor);
         if (!idleState->neighborhood.empty() && idleState->neighborhood == neighborhood && idleState->skips < 3) {
             ++idleState->skips;
             return 0;
@@ -283,6 +337,7 @@ int dt::DT::smooth_sus(int iNod) {
     };
     const double initialMinQuality = minimumQuality(origin, -std::numeric_limits<double>::infinity());
     if (!std::isfinite(initialMinQuality)) return 0;
+    const double allowedMinimum = std::min(initialMinQuality, minimumQualityFloor);
     double currentMinQuality = initialMinQuality;
     std::vector<SusTet> tets;
     double minimum = DBL_MAX, mean = 0;
@@ -344,8 +399,8 @@ int dt::DT::smooth_sus(int iNod) {
                 bool valid = false;
                 nextF = evaluateEnergy(nextX, nullptr, &valid);
                 if (valid && std::isfinite(nextF) && nextF <= f + 1e-4 * step * slope) {
-                    nextMinQuality = minimumQuality(origin + scale * nextX, currentMinQuality);
-                    if (nextMinQuality >= currentMinQuality) { accepted = true; break; }
+                    nextMinQuality = minimumQuality(origin + scale * nextX, std::min(currentMinQuality, allowedMinimum));
+                    if (nextMinQuality >= std::min(currentMinQuality, allowedMinimum)) { accepted = true; break; }
                     blockedByQuality = true;
                     // Allow several smaller SUS steps before changing objectives.
                     if (++qualityRejections >= maxSusQualityRejections) break;
@@ -427,12 +482,132 @@ int dt::DT::smooth_sus(int iNod) {
         finalMinQuality = std::min(finalMinQuality, q);
         qualities.push_back(q);
     }
-    if (finalMinQuality < initialMinQuality) return 0;
+    if (finalMinQuality < allowedMinimum) return 0;
     const bool improvedQuality = finalMinQuality > initialMinQuality + qualityTolerance;
     const bool improvedEnergy = verified < initial - 1e-12 * std::max(1.0, std::fabs(initial));
     if (!improvedQuality && !improvedEnergy) { rememberIdle(); return 0; }
     for (int j = 0; j < 3; ++j) Nodes[iNod].pt[j] = result[j];
-    for (size_t j = 0; j < sph.size(); ++j) Elems[sph[j]].q = qualities[j];
+    // Store the active pass metric, while the movement guard remains SUS.
+    for (size_t j = 0; j < sph.size(); ++j) {
+        if (improve_Metric == SUS_METRIC) Elems[sph[j]].q = qualities[j];
+        else updateQuality(sph[j]);
+    }
     if (finalMinQuality - initialMinQuality <= 1e-8 && x.norm() <= 1e-8) rememberIdle();
+    return 1;
+}
+
+// Quality-driven interior smoothing must enter here, including topology repair.
+// Other legacy metrics retain their previous SUS fallback.
+int dt::DT::smoothInteriorPoint(int iNod, double minimumQualityFloor) {
+    if (improve_Metric == 2) return smooth_angle(iNod, minimumQualityFloor);
+    return smooth_sus(iNod, minimumQualityFloor);
+}
+
+int dt::DT::smooth_angle(int iNod, double minimumQualityFloor) {
+    if (iNod < 0 || iNod >= static_cast<int>(Nodes.size()) || iNod == ghost ||
+        isDelNod(iNod) || isbndpnt(iNod) || isCornerpnt(iNod) ||
+        lockV.count(iNod) || periodic_P.count(iNod)) return 0;
+    std::vector<int> star;
+    findSphere(iNod, star);
+    if (star.empty()) return 0;
+    const Vec origin=Eigen::Map<Vec>(Nodes[iNod].pt);
+    double scale=0;
+    std::vector<SusTet> tets(star.size());
+    std::vector<std::array<Vec,4>> physical(star.size());
+    for (size_t k=0; k<star.size(); ++k) {
+        const int t=star[k];
+        if (t<0 || t>=static_cast<int>(Elems.size()) || isDelEle(t) ||
+            isvirtualtet(t) || ishulltet(t)) return 0;
+        tets[k].freeIndex=-1;
+        for (int j=0; j<4; ++j) {
+            const int n=Elems[t].form[j];
+            if (n<0 || n>=static_cast<int>(Nodes.size()) || isDelNod(n)) return 0;
+            physical[k][j]=Eigen::Map<Vec>(Nodes[n].pt);
+            scale=std::max(scale,(physical[k][j]-origin).norm());
+            if (n==iNod) tets[k].freeIndex=j;
+        }
+        if (tets[k].freeIndex<0) return 0;
+    }
+    if (!(scale>0) || !std::isfinite(scale)) return 0;
+    for (size_t k=0; k<tets.size(); ++k)
+        for (int j=0; j<4; ++j) tets[k].points[j]=(physical[k][j]-origin)/scale;
+
+    // Trial evaluation uses physical coordinates and the existing CalDihedral
+    // convention. No mesh coordinate is written until the final acceptance.
+    std::vector<double> angles;
+    double initialSus=DBL_MAX, initialSusSum=0;
+    for (auto p:physical) {
+        const double q=quality_sus(p[0].data(),p[1].data(),p[2].data(),p[3].data());
+        if (!(q>0) || !std::isfinite(q)) return 0;
+        initialSus=std::min(initialSus,q); initialSusSum+=q;
+    }
+    const double floor=std::min(initialSus,minimumQualityFloor);
+    double initialAngleSum=-DBL_MAX, evaluatedAngleSum=0;
+    auto evaluate = [&](const Vec& position, double cutoff) {
+        double minimum=DBL_MAX, angleSum=0, susSum=0;
+        for (size_t k=0; k<tets.size(); ++k) {
+            auto p=physical[k]; p[tets[k].freeIndex]=position;
+            const double sus=quality_sus(p[0].data(),p[1].data(),p[2].data(),p[3].data());
+            if (!(sus>0) || !std::isfinite(sus) || sus<floor) return -DBL_MAX;
+            double lo,hi;
+            if (!CalDihedral(p[0].data(),p[1].data(),p[3].data(),p[2].data(),lo,hi,angles)
+                || !std::isfinite(lo) || lo<cutoff) return -DBL_MAX;
+            minimum=std::min(minimum,lo); angleSum+=lo; susSum+=sus;
+        }
+        // A max-min direction can damage many already-good cells. Retain the
+        // angle and SUS averages at entry while improving the worst angle.
+        if (angleSum<initialAngleSum || susSum<initialSusSum) return -DBL_MAX;
+        evaluatedAngleSum=angleSum;
+        return minimum;
+    };
+    double worst=evaluate(origin,0);
+    if (!(worst>0)) return 0;
+    const double initialAngle=worst;
+    initialAngleSum=evaluatedAngleSum;
+    Vec x=Vec::Zero();
+    double previousStep=1;
+    int smallProgress=0;
+    std::vector<std::array<double,6>> values(tets.size());
+    std::vector<std::array<Vec,6>> derivatives(tets.size());
+    std::vector<Vec> active;
+    active.reserve(tets.size()*6);
+    for (int iteration=0; iteration<12; ++iteration) {
+        double normalizedWorst=DBL_MAX;
+        bool valid=true;
+        for (size_t k=0; k<tets.size(); ++k) {
+            if (!dihedralGradients(tets[k],x,values[k],derivatives[k])) { valid=false; break; }
+            for (double q:values[k]) normalizedWorst=std::min(normalizedWorst,q);
+        }
+        if (!valid) break;
+        Vec direction=Vec::Zero();
+        for (double relativeBand : {1e-3,1e-5,0.0}) {
+            const double band=std::max(1e-12,relativeBand*std::max(1e-3,normalizedWorst));
+            active.clear(); double gradientScale=0;
+            for (size_t k=0; k<tets.size(); ++k) for (int e=0; e<6; ++e) {
+                if (values[k][e]>normalizedWorst+band) continue;
+                active.push_back(derivatives[k][e]);
+                gradientScale=std::max(gradientScale,active.back().norm());
+            }
+            direction=commonAscentDirection(active,gradientScale);
+            if (direction.squaredNorm()>0) break;
+        }
+        if (direction.squaredNorm()==0) break;
+        double step=std::min(1.0,2*previousStep), nextWorst=worst;
+        Vec next=x;
+        bool accepted=false;
+        for (int trial=0; trial<24; ++trial,step*=0.5) {
+            next=x+step*direction;
+            nextWorst=evaluate(origin+scale*next,worst+1e-12);
+            if (nextWorst>worst+1e-12) { accepted=true; break; }
+        }
+        if (!accepted) break;
+        smallProgress=nextWorst-worst<=1e-5?smallProgress+1:0;
+        x=next; worst=nextWorst; previousStep=step;
+        if (smallProgress>=2 || step*direction.norm()<1e-10) break;
+    }
+    const Vec result=origin+scale*x;
+    if (!result.allFinite() || !(evaluate(result,initialAngle+1e-12)>initialAngle+1e-12)) return 0;
+    for (int j=0; j<3; ++j) Nodes[iNod].pt[j]=result[j];
+    for (int t:star) updateQuality(t);
     return 1;
 }

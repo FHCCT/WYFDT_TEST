@@ -107,7 +107,13 @@ namespace dt {
 		int fac[3];
 		int fliplevel;
 		int fliplevel_face;
-        struct SusIdleState { std::vector<double> neighborhood; int skips = 0; };
+        struct SusIdleState {
+            std::vector<double> neighborhood;
+            int skips = 0;
+            SusIdleState() = default;
+            SusIdleState(const std::vector<double>& savedNeighborhood, int savedSkips)
+                : neighborhood(savedNeighborhood), skips(savedSkips) {}
+        };
         std::vector<SusIdleState> susIdleStates;
 		int improve_Metric;
 		int num_threads = 1; // Single thread-count upper bound for every stage.
@@ -241,7 +247,9 @@ namespace dt {
 		///****************** Smoothing **************/
 		int SmoothPass(int nloop, double improve_goal);
 		// smooth
-		int smooth_sus(int iNod);
+		int smoothInteriorPoint(int iNod, double minimumQualityFloor = DBL_MAX);
+		int smooth_angle(int iNod, double minimumQualityFloor = DBL_MAX);
+		int smooth_sus(int iNod, double minimumQualityFloor = DBL_MAX);
 		double quality_sus(double* a, double* b, double* c, double* d);
 
 		// Volume Control
@@ -464,6 +472,15 @@ namespace dt {
 		bool project_boundary_point_to_fine_mesh(double* in, double* out, double max_projection_distance);
 		bool project_segment_point_to_fine_mesh(double* in, double* out, double max_projection_distance);
     private:
+        struct BoundarySmoothWorkspace {
+            std::vector<int> star, neighbors, points;
+            std::vector<std::array<int, 3>> faces;
+            std::vector<double> qualities;
+        };
+        int smoothPlanarBoundaryPoint(int node, double minimumQualityFloor, BoundarySmoothWorkspace& workspace);
+        void mergeThinLayers(Mesh& mesh, TriHasher<int64_t>& tetFaces,
+            const std::vector<double>& tetVolumes);
+        int splitEdgImpl(int index, int deep, bool retryVolume);
         int removeInteriorEdge(std::vector<int>& oldtet, int ia, int ib, int info,
             int thread_n, std::vector<int>& shellPoints);
         int flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial);

@@ -3,7 +3,8 @@
 #include <CLI11.hpp>
 using namespace std;
 //--input ../test\20260915_thread\adp/thread2_adpin.vtk --adpin ../test\20260915_thread\adp/thread2_refine_id.txt --adptype 2
-//--input ../test\20260915_thread\sizecontrol/thread2_sizecontrol_input.vtk --adptype 6 --nthread 1
+//--input ../test\20260916_dtAdp\pcb2\in.vtk --adpin ../test\20260916_dtAdp\pcb2\in.txt --adptype 2
+//--input ../test\20260916_dtAdp\usb_hw\in.vtk --adpin ../test\20260916_dtAdp\usb_hw\in.txt --adptype 2
 #ifdef DT_EXEC
 int main(int argc, char* argv[]) {
 	std::string in_filename;
@@ -32,10 +33,10 @@ int main(int argc, char* argv[]) {
 	app.add_option("--digbnd", args.hole_bnd_vec, "Dig hole boundary idx,1  (int)");
 	app.add_option("--refine", args.refine, "If refine mesh. (int, optional, int:1)");
 	app.add_option("--optlevel", args.optlevel, "Mesh improvement level. (int, optional, int:2)");
-	app.add_option("--optloop", args.optloop, "Mesh improvement loop. (int, optional, int:3)");
-	app.add_option("--optanglestrict", args.optanglestrict, "Insertion threshold for minimum dihedral angle in degrees (0 disables insertion, default:20)");
-	app.add_option("--optjacob", args.optTh, "Mesh improvement target opt jacobian. (double, optional, default:0.01)");
-	app.add_option("--adpangle", args.adpangle, "Mesh Adptation Angle. (double, optional, default:160)");
+	app.add_option("--optloop", args.optloop, "Mesh improvement rounds (default:5, adptype 2:18)");
+	app.add_option("--optanglestrict", args.optanglestrict, "Insertion threshold for minimum dihedral angle in degrees (0 disables insertion; default:1, adptype 2:0)");
+	app.add_option("--optjacob", args.optTh, "Quality candidate threshold in the active metric (default:0.2, adptype 2:0.8)");
+	app.add_option("--adpangle", args.adpangle, "Adaptation boundary angle (default:170, adptype 2:180)");
 	app.add_option("--nthread", args.nthread, "Maximum threads for every stage; active teams adapt to mesh size (-1: automatic).");
 	app.add_option("--extrashell", args.extrashell, "Extraction Shell. (int, optional, int:-1)");
 	app.add_option("--autoflip", args.autoflip, "use new auto flip. (int, optional, int:1)");
@@ -89,11 +90,11 @@ int main(int argc, char* argv[]) {
 				std::vector<int> refine_tri_id;// = { 137,35 };
 				dt::readRefineT(in_adp_filename, refine_tet_id);
 				//args.periodic_P = { 73,74,9,7,81,4,1,67,3,6,67,1,68,0,4,81,74,73,71,69,7,9,5,80,69,71,0,68,2,82,82,2,6,3,83,84,84,83,80,5,79,78,78,79,77,75,75,77,87,88,88,87,8,91,91,8,91,90,90,91,93,94,94,93 };
+                // Shared isotropic quality profile; explicit CLI values take precedence.
 				args.adpangle = 160;
-				args.optloop = 3;
-				args.optTh =1;
-				args.optanglestrict =1.5;
-				// Keep the user-provided minimum dihedral insertion angle.
+				args.optloop = 9;
+				args.optTh = 0.5;
+				args.optanglestrict =0;
 				ret = d.adaptation_by_Tetid(mesh, args, refine_tri_id, refine_tet_id, 1.3);
 			}
 			else if (adptype == 3) {

@@ -4,12 +4,14 @@ DT 三维四面体网格生成与优化库，提供 C++ 库和命令行程序。
 
 ## 构建
 
-需要 CMake 3.15 或更高版本、支持 C++14 的编译器及 OpenMP。所需 Eigen、spdlog、CLI11 头文件随源码提供。
+需要 CMake 3.15 或更高版本、支持 C++11 的编译器及 OpenMP。所需 Eigen、spdlog、CLI11 头文件随源码提供。
 
 ```powershell
 cmake -S . -B build
 cmake --build build --config Release --parallel 4
 ```
+
+构建目标使用 C++11，并禁用编译器语言扩展；链接 `dt` 的 CMake 项目会继承 C++11 的最低语言要求。MSVC 没有严格的 `/std:c++11` 开关，其最低选项是 `/std:c++14`；严格兼容性使用 GCC 的 `-std=c++11 -pedantic-errors` 编译验证。
 
 Windows / Visual Studio 构建生成 `build/Release/dt.exe` 和 `build/Release/dt.lib`。
 
@@ -28,6 +30,20 @@ cmake --build build --config Release --parallel 4
 ```
 
 对外 C++ 接口见 `src/dt_API.h`。CMake 库目标为 `dt`，命令行目标为 `dt_exec`。
+
+## 各向同性自适应质量优化
+
+`--adptype 2` 使用统一默认参数：`--optloop 18 --optjacob 0.8 --optanglestrict 0 --adpangle 160`。显式传入的这四个选项优先，不再被入口覆盖。这里 `optjacob` 是当前阶段质量度量的候选阈值，不是最终平均雅可比的保证值；`optanglestrict=0` 仅关闭优化阶段的插点，按输入单元 ID 进行的自适应加密仍照常执行。
+
+所有常规优化入口统一使用 `flipEdgPass → TopologicalPass → SmoothPass`，按各流程原有约束决定是否执行边界翻转。`TopologicalPass` 直接收集并稳定排序候选，再执行翻转及失败修复；不再设置中间转发 Pass。`QuicklyOptPass` 在默认 18 轮预算下，前 12 轮使用 SUS 质量、最后 6 轮使用最小二面角质量；内部点在 SUS 阶段使用 SUS 能量，在角度阶段使用最小二面角活跃集。SUS 和角度阶段各至少一轮：总预算最低为 2，角度轮数为 max(1, floor(总轮数 / 3))，余下分配给 SUS，不再限制角度阶段最多 6 轮。SUS 阶段无差单元时直接进入角度阶段，角度阶段无差单元时才整体退出。不再使用雅可比组合度量。退出使用轮数预算或无候选差单元，插点角度阈值不作为整体质量的收敛判据。
+
+`SmoothPass` 每轮统一选择并染色边界点、内部点；染色覆盖所有相邻物理四面体（包括好单元），同色点并行、不同颜色依次执行。在同一个循环中，边界点调用切向光滑，内部点调用 `smoothInteriorPoint`，其中 `improve_Metric == 2` 分派到 `smooth_angle`，其余度量保留原来的 `smooth_sus` 路径，临时边界缓冲区按线程复用。`modifyBnd == false` 时染色不纳入边界点，边界光滑函数自身也直接拒绝移动；边界只在允许修改边界的 SUS/角度流程中参与；平面/直线特征移动必须位于全部相邻边界三角形的平面内，跳过角点、曲面点、周期点及锁定点/边/面。
+
+每轮光滑开始时固定全局最低 SUS 质量作为共同下限，允许较好局部单元降低质量以改善整体；不承诺每个点邻域的最低质量不变，也不承诺整个拓扑阶段的 SUS 最低值不变。单独调用 `smoothInteriorPoint(node)`、`smooth_sus(node)` 或 `smooth_angle(node)` 仍默认保护局部最低 SUS 质量；可通过第二个参数显式传入质量下限。光滑完成后缓存仍使用当前阶段度量，角度阶段不会混入 SUS 质量缓存。
+
+角度活跃集以各相邻四面体的六个二面角为独立约束，收集接近最小角的解析梯度，通过梯度凸包的最小范数点寻找共同上升方向，并回溯步长。每次接受必须提高邻域最小二面角，同时保持正体积和 SUS 下限，并保护本次点光滑开始时的邻域平均最小二面角、平均 SUS 质量，避免只改善最差角却损伤大量较好单元；这些局部保护不等同于整个拓扑流程的最终平均质量保证。优化插点后的光滑也经过 `smoothInteriorPoint`，随当前度量分派。边界恢复/Steiner 移除和体积均匀化所用的专门光滑算法保留原有层级。
+
+库调用 `adaptation_by_Tetid` 时设置同一组 `Args` 即可复现该配置：`optloop=18, optTh=0.8, optanglestrict=0, adpangle=160`。库保留调用方的参数，不按模型名称选择策略。提高轮数会增加耗时；以上配置侧重最终质量，具体平均角度与雅可比仍取决于输入网格和边界约束。
 
 ## 日志等级
 

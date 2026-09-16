@@ -21,7 +21,9 @@ function(dt_configure_target target)
         ${PROJECT_SOURCE_DIR}/extern/eigen
         ${PROJECT_SOURCE_DIR}/extern/spdlog/include
         ${PROJECT_SOURCE_DIR}/extern/tree)
-    target_compile_features(${target} PRIVATE cxx_std_14)
+    target_compile_features(${target} PUBLIC cxx_std_11)
+    set_target_properties(${target} PROPERTIES
+        CXX_STANDARD 11 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     target_link_libraries(${target} PRIVATE OpenMP::OpenMP_CXX)
     if(MSVC)
         # Preserve the existing Windows code-page encoding with bundled fmt.
@@ -29,6 +31,11 @@ function(dt_configure_target target)
         target_compile_options(${target} PRIVATE /W0)
     else()
         target_compile_options(${target} PRIVATE -w)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            # Reject newer-language extensions even when other warnings are muted.
+            target_compile_options(${target} PRIVATE
+                "$<$<COMPILE_LANGUAGE:CXX>:-pedantic-errors>")
+        endif()
     endif()
     if(WIN32)
         target_link_libraries(${target} PRIVATE psapi)

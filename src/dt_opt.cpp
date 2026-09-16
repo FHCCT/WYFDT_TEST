@@ -5,6 +5,20 @@
 
 namespace {
 constexpr double topologyShortEdgeRatio = 1.0 / 200.0;
+constexpr double topologyInsertionRetryVolumeRatio = 0.5;
+// Retry only after the original insertion fails; callers preserve local bounds.
+int insertWithVolumeRetry(DT& mesh, int node, std::vector<int>& seeds,
+    int info, double retryMinVolume) {
+    const int result = mesh.BW_insert_vertex(node, seeds, info);
+    if (result == 1 || !(retryMinVolume < mesh.minVolume_bw)) return result;
+    struct RestoreVolume {
+        double& value;
+        double saved;
+        ~RestoreVolume() { value = saved; }
+    } restore{mesh.minVolume_bw, mesh.minVolume_bw};
+    mesh.minVolume_bw = retryMinVolume;
+    return mesh.BW_insert_vertex(node, seeds, info);
+}
 double shortBoundaryCollapseTolerance(DT& mesh, int pa, int pb, const std::vector<int>& shell);
 bool hasValidCollapseLink(DT& mesh, int a, int b, const std::vector<int>& starA,
     const std::vector<int>& starB, const std::vector<int>& shell);
@@ -216,34 +230,217 @@ int DT::OrthogonalityOptPass(Args& args) {
 	return 1;
 }
 
+int DT::smoothPlanarBoundaryPoint(int n, double floor, BoundarySmoothWorkspace& workspace) {
+    if (!modifyBnd) return 0;
+    auto& star = workspace.star;
+    auto& neighbors = workspace.neighbors;
+    auto& points = workspace.points;
+    auto& faces = workspace.faces;
+    auto& qualities = workspace.qualities;
+    if (isDelNod(n) || n == ghost || !isbndpnt(n) || isCornerpnt(n) || lockV.count(n) ||
+        periodic_P.count(n))
+        return 0;
+    findSphere(n, star);
+    star.erase(std::remove_if(star.begin(), star.end(),
+                              [&](int t) { return isDelEle(t) || ishulltet(t) || isvirtualtet(t); }),
+               star.end());
+    neighbors.clear();
+    points.clear();
+    faces.clear();
+    std::array<double, 3> normal = {{0, 0, 0}};
+    double len = 0, scale = 0;
+    bool locked = false;
+    double minimum = DBL_MAX, oldSum = 0;
+    int count = 0;
+    for (int t : star) {
+        minimum = std::min(minimum, Elems[t].q);
+        oldSum += Elems[t].q;
+        ++count;
+        for (int p : Elems[t].form) {
+            if (p == n || !isbndpnt(p)) continue;
+            int *e = BndEdg.find(n, p);
+            if (!e) continue;
+            if (lockE.count(*e)) locked = true;
+            if (isSegmentpnt(n) && SurEdgs[*e].constrain <= 0) continue;
+            if (std::find(neighbors.begin(), neighbors.end(), p) == neighbors.end())
+                neighbors.push_back(p);
+        }
+        for (int j = 0; j < 4; ++j) {
+            if (Elems[t].form[j] == n) continue;
+            std::array<int, 3> f;
+            int k = 0;
+            for (int a = 0; a < 4; ++a)
+                if (a != j) f[k++] = Elems[t].form[a];
+            int *index = BndTri.find(f[0], f[1], f[2]);
+            if (!index) continue;
+            if (lockF.count(*index)) locked = true;
+            faces.push_back(f);
+            for (int p : f) {
+                points.push_back(p);
+                scale = std::max(scale, distance(Nodes[p].pt, Nodes[n].pt));
+            }
+            if (len == 0) {
+                double *a = Nodes[f[0]].pt;
+                double *b = Nodes[f[1]].pt;
+                double *c = Nodes[f[2]].pt;
+                for (int x = 0; x < 3; ++x) {
+                    int y = (x + 1) % 3, z = (x + 2) % 3;
+                    normal[x] = (b[y] - a[y]) * (c[z] - a[z]) - (b[z] - a[z]) * (c[y] - a[y]);
+                }
+                len = std::sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
+            }
+        }
+    }
+    if (locked || neighbors.empty() || !(minimum > 0) || !(scale > 0)) return 0;
+    // Move only on an existing plane or straight feature segment.
+    if (isFacetpnt(n)) {
+        if (!(len > 0)) return 0;
+        bool planar = true;
+        for (int p : points) {
+            double dot = 0;
+            for (int k = 0; k < 3; ++k)
+                dot += normal[k] * (Nodes[p].pt[k] - Nodes[n].pt[k]);
+            if (std::abs(dot) > 1e-10 * len * scale) {
+                planar = false;
+                break;
+            }
+        }
+        if (!planar) return 0;
+    } else if (isSegmentpnt(n)) {
+        if (neighbors.size() != 2) return 0;
+        Eigen::Vector3d v = Eigen::Map<Eigen::Vector3d>(Nodes[neighbors[0]].pt) -
+                            Eigen::Map<Eigen::Vector3d>(Nodes[n].pt);
+        Eigen::Vector3d w = Eigen::Map<Eigen::Vector3d>(Nodes[neighbors[1]].pt) -
+                            Eigen::Map<Eigen::Vector3d>(Nodes[n].pt);
+        if (v.cross(w).norm() > 1e-10 * scale * scale || v.dot(w) >= 0) return 0;
+        // A straight feature may still border a curved triangle fan. Its
+        // motion must stay in every incident surface plane, not just the line.
+        bool tangent = true;
+        const Eigen::Vector3d axis = v - w;
+        for (const auto& f : faces) {
+            const Eigen::Vector3d a(Nodes[f[0]].pt), b(Nodes[f[1]].pt), c(Nodes[f[2]].pt);
+            const Eigen::Vector3d faceNormal = (b - a).cross(c - a);
+            if (!(faceNormal.squaredNorm() > 0) ||
+                std::abs(faceNormal.dot(axis)) > 1e-10 * faceNormal.norm() * axis.norm()) {
+                tangent = false;
+                break;
+            }
+        }
+        if (!tangent) return 0;
+    } else return 0;
+    double direction[3];
+    {
+        // Central differences of mean quality, projected to the permitted tangent.
+        Eigen::Vector3d gradient = Eigen::Vector3d::Zero();
+        const double h = scale * 1e-5;
+        for (int axis = 0; axis < 3; ++axis) {
+            double values[2] = {0, 0};
+            for (int side = 0; side < 2; ++side) {
+                double pos[3];
+                for (int k = 0; k < 3; ++k)
+                    pos[k] = Nodes[n].pt[k];
+                pos[axis] += (side ? 1 : -1) * h;
+                for (int t : star) {
+                    double *v[4];
+                    for (int k = 0; k < 4; ++k)
+                        v[k] = Elems[t].form[k] == n ? pos : Nodes[Elems[t].form[k]].pt;
+                    values[side] += tetquality(v[0], v[1], v[2], v[3], nullptr, improve_Metric);
+                }
+            }
+            gradient[axis] = (values[1] - values[0]) / (2 * h);
+        }
+        if (isFacetpnt(n)) {
+            Eigen::Vector3d axis(normal.data());
+            axis /= len;
+            gradient -= axis * gradient.dot(axis);
+        } else {
+            Eigen::Vector3d axis = Eigen::Map<Eigen::Vector3d>(Nodes[neighbors[0]].pt) -
+                                   Eigen::Map<Eigen::Vector3d>(Nodes[neighbors[1]].pt);
+            axis.normalize();
+            gradient = axis * gradient.dot(axis);
+        }
+        if (!gradient.allFinite() || !(gradient.norm() > 0)) return 0;
+        gradient *= scale * .25 / gradient.norm();
+        for (int k = 0; k < 3; ++k)
+            direction[k] = gradient[k];
+    }
+    qualities.resize(star.size());
+    // Protect the poor tail while allowing good cells to trade quality.
+    const double cutoff = std::min(minimum, 0.1);
+    double alpha = 1;
+    for (int trial = 0; trial < 10; ++trial, alpha *= .5) {
+        double position[3];
+        for (int k = 0; k < 3; ++k)
+            position[k] = Nodes[n].pt[k] + alpha * direction[k];
+        bool valid = true;
+        double sum = 0;
+        for (size_t j = 0; j < star.size(); ++j) {
+            int t = star[j];
+            double *v[4];
+            for (int k = 0; k < 4; ++k)
+                v[k] = Elems[t].form[k] == n ? position : Nodes[Elems[t].form[k]].pt;
+            double q = tetquality(v[0], v[1], v[2], v[3], nullptr, improve_Metric);
+            if (!(q >= cutoff) || !(quality_sus(v[0], v[1], v[2], v[3]) >= floor)) {
+                valid = false;
+                break;
+            }
+            qualities[j] = q;
+            sum += q;
+        }
+        if (!valid || !(sum > oldSum + 1e-12 * count)) continue;
+        // Positive volume alone does not exclude a folded boundary triangle.
+        for (auto f : faces) {
+            Eigen::Vector3d a(Nodes[f[0]].pt), b(Nodes[f[1]].pt), c(Nodes[f[2]].pt);
+            Eigen::Vector3d before = (b - a).cross(c - a);
+            if (f[0] == n) a = Eigen::Map<Eigen::Vector3d>(position);
+            if (f[1] == n) b = Eigen::Map<Eigen::Vector3d>(position);
+            if (f[2] == n) c = Eigen::Map<Eigen::Vector3d>(position);
+            if (!(before.dot((b - a).cross(c - a)) > 0)) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) continue;
+        for (int k = 0; k < 3; ++k)
+            Nodes[n].pt[k] = position[k];
+        for (size_t j = 0; j < star.size(); ++j) {
+            int t = star[j];
+            Elems[t].q = qualities[j];
+        }
+        return 1;
+    }
+    return 0;
+}
+
 int DT::QuicklyOptPass(Args& args) {
-	int nLoop = 1, nbad = 0;
-	double minq;
-	double improve_goal = 1;// // (2.0 * std::sin(ANGLE2RADIO(args.optangle)) * args.optratio) / (std::sin(ANGLE2RADIO(args.optangle)) + args.optratio);
-	optflipdeep = 0;
+    // Keep at least one round per metric; integer remainder goes to SUS.
+    const int rounds = std::max(2, args.optloop);
+    const int angleRounds = std::max(1, rounds / 3);
+    const int polishStart = rounds - angleRounds;
+    optflipdeep = 0;
+    for (int loop = 0; loop < rounds; ++loop) {
+        updateminVolume();
+        improve_step = false;
+        flipEdgPass(1);
+        improve_step = true;
 
-	nLoop = std::max(args.optloop, nLoop);
-	for (int loop = 0; loop < nLoop ; loop++) {
-		updateminVolume();
-
-		//Get min volume,yunbo size control don't use minvolume
-		improve_step = false;
-		flipEdgPass(1);
-		improve_step = true;
-
-		improve_Metric = SUS_METRIC;
-		improve_goal = args.optTh;
-		prepareQuality();
-		//printQuality(improve_goal, nbad, minq, false);
-		TopologicalPass(improve_goal, args.optanglestrict, 1);
-		SmoothPass(1, improve_goal);
-		const int worstTet = printQuality(improve_goal, nbad, minq, false);
-
-		// Use the worst quality cell as the inexpensive stopping proxy.
-		if (!needsTopologyInsertion(worstTet, args.optanglestrict))
-			break;
-	}
-	return 1;
+        // Start with SUS shape quality, then polish the poor-angle tail.
+        // Both phases use the same fixed candidate ordering for all thread counts.
+        improve_Metric = loop < polishStart ? SUS_METRIC : 2;
+        prepareQuality();
+        TopologicalPass(args.optTh, args.optanglestrict, 1);
+        SmoothPass(1, args.optTh);
+        int nbad = 0;
+        double minq;
+        printQuality(args.optTh, nbad, minq, false);
+        // An insertion threshold is not a convergence test for mean/tail quality.
+        if (nbad == 0) {
+            if (loop >= polishStart) break;
+            // SUS convergence must not skip the mandatory angle phase.
+            loop = polishStart - 1;
+        }
+    }
+    return 1;
 }
 
 int DT::OptSizeControl_yunbo(double lamasize, 
@@ -699,30 +896,39 @@ void DT::updateminVolume(void) {
 
 //Smooth loop_parallel
 //if checkQ open ,keep every smooth is improvement
-int DT::SmoothPass(int nloop, double improve_goal)
-{
+int DT::SmoothPass(int nloop, double improve_goal) {
     MeshStageLog stageLog(*this, "Smooth", 2);
     DTParallelScope parallelScope;
     susIdleStates.resize(Nodes.size());
     std::vector<std::vector<int>> colors;
-    colorBadQualityNodes(colors, improve_goal);
-    size_t maxGroup = 0;
-    for (const auto& group : colors) maxGroup = std::max(maxGroup, group.size());
-    // Coloring determines independent jobs; mesh size does not limit smoothing.
-    const int workers = omp_in_parallel() ? 1 :
-        static_cast<int>(std::max<size_t>(1, std::min<size_t>(std::max(1, std::min(128, num_threads)), maxGroup)));
     long long success = 0, attempts = 0;
-    // One team per pass; each color ends with a barrier before the next color.
+    for (int loop = 0; loop < nloop; ++loop) {
+        // Both point algorithms preserve the same immutable global SUS floor.
+        double minimumQualityFloor = DBL_MAX;
+        for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
+            if (isDelEle(t) || isvirtualtet(t) || ishulltet(t)) continue;
+            const auto& f = Elems[t].form;
+            minimumQualityFloor = std::min(minimumQualityFloor,
+                quality_sus(Nodes[f[0]].pt, Nodes[f[1]].pt, Nodes[f[2]].pt, Nodes[f[3]].pt));
+        }
+        colorBadQualityNodes(colors, improve_goal);
+        size_t maxGroup = 0;
+        for (const auto& group : colors) maxGroup = std::max(maxGroup, group.size());
+        const int workers = omp_in_parallel() ? 1 : static_cast<int>(
+            std::max<size_t>(1, std::min<size_t>(std::max(1, std::min(128, num_threads)), maxGroup)));
+        // One conflict graph covers boundary and interior nodes, including good
+        // incident cells. Each color finishes before the next color starts.
 #pragma omp parallel num_threads(workers) if(workers > 1) reduction(+:success, attempts)
-    {
-        for (int loop = 0; loop < nloop; ++loop) {
-            for (size_t color = 0; color < colors.size(); ++color) {
-                const auto& group = colors[color];
+        {
+            BoundarySmoothWorkspace boundaryWorkspace;
+            for (const auto& group : colors) {
 #pragma omp for schedule(dynamic, 16)
-                for (int i = 0; i < static_cast<int>(group.size()); ++i)
-                {
+                for (int i = 0; i < static_cast<int>(group.size()); ++i) {
+                    const int node = group[i];
                     ++attempts;
-                    success += smooth_sus(group[i]) == 1;
+                    success += (isbndpnt(node)
+                        ? smoothPlanarBoundaryPoint(node, minimumQualityFloor, boundaryWorkspace)
+                        : smoothInteriorPoint(node, minimumQualityFloor)) == 1;
                 }
             }
         }
@@ -916,6 +1122,10 @@ int DT::TopologicalPass(double improve_goal, double insert_angle_degrees, int nl
             if (Elems[t].q <= improve_goal)
                 candidates.push_back(topologyCandidate(t));
         }
+        std::stable_sort(candidates.begin(), candidates.end(),
+            [&](const TopologyCandidate& a, const TopologyCandidate& b) {
+                return Elems[a.tet].q < Elems[b.tet].q;
+            });
         // Flips and immediate failure repairs follow the same candidate order
         // for every thread count. Smoothing and quality evaluation stay parallel.
         const int success = TopologicalPass_serial(candidates, improve_goal, insert_angle_degrees);
@@ -1214,38 +1424,45 @@ int DT::removebadtet_addPnt(int iElm) {
 	int p3 = Elems[iElm].form[3];
 
 	double pnt[3] = { 0.0 }, space = 0;
-	int a, b, c, d;
 	std::vector<int> shell, shellp;
+	const auto interpolateCenterMetric = [&](int node, const int* vertices, size_t count) {
+		if (AniSol.empty()) return;
+		std::array<double, 6> metric{};
+		for (size_t i = 0; i < count; ++i)
+			for (int k = 0; k < 6; ++k) metric[k] += AniSol[vertices[i]][k];
+		for (double& value : metric) value /= static_cast<double>(count);
+		if (AniSol.size() <= static_cast<size_t>(node))
+			AniSol.resize(std::max(AniSol.size() * 2, static_cast<size_t>(node + 1)));
+		AniSol[node] = metric;
+	};
 
 	int nBndpnt = isbndpnt(p0) + isbndpnt(p1) + isbndpnt(p2) + isbndpnt(p3);
 	int nBndedg = 0;
-	for (int j = 0; j < 6; j++) {
-		int pa = Elems[iElm].form[Egid[j][0]];
-		int pb = Elems[iElm].form[Egid[j][1]];
-
-		if (isBndEdg(pa, pb)) {
-			nBndedg++;
-		}
-	}
-
-	//printf("%d %d\n", nBndpnt, nBndedg);
-	//std::vector<int> worst = { iElm };
-	//printSph_VTK(worst, "./" + std::to_string(iElm) + "_" + std::to_string(nBndpnt) + "_" + std::to_string(nBndedg) + "_" + ".vtk");
 
 	if (nBndpnt >= 4) {
+		for (int j = 0; j < 6; j++) {
+			int pa = Elems[iElm].form[Egid[j][0]];
+			int pb = Elems[iElm].form[Egid[j][1]];
+
+			if (isBndEdg(pa, pb)) {
+				nBndedg++;
+			}
+		}
 		{
 			double maxDis = 0;
 			/******** Split Long Edge ********/
-			std::set<int> alltet;
+			std::vector<int> alltet, sph;
 			for (int i = 0; i < 4; i++) {
-				std::vector<int> sph;
 				findSphere(Elems[iElm].form[i], sph);
 				for (auto it : sph) {
 					if (ishulltet(it) || isvirtualtet(it))
 						continue;
-					alltet.insert(it);
+					alltet.push_back(it);
 				}
 			}
+
+			std::sort(alltet.begin(), alltet.end());
+			alltet.erase(std::unique(alltet.begin(), alltet.end()), alltet.end());
 
 			int tp1 = -1, tp2 = -1;
 			for (auto it : alltet) {
@@ -1281,8 +1498,6 @@ int DT::removebadtet_addPnt(int iElm) {
 				}
 				else {
 					int tempt = iElm;
-					isMeshEdge(tp1, tp2, &tempt);
-					//findShell(tempt, isNod_in_Tet(tp1, tempt), isNod_in_Tet(tp2, tempt), shell, shellp);
 
 					space = (Nodes[tp1].space + Nodes[tp2].space) * 0.5;
 					for (int k = 0; k < 3; k++)
@@ -1304,7 +1519,7 @@ int DT::removebadtet_addPnt(int iElm) {
 						//B_W
 						int ret = BW_insert_vertex(newp, shell, 1);
 						if (ret == 1) {
-							smooth_sus(newp);
+							smoothInteriorPoint(newp);
 						}
 						else {
 							DelNod(newp);
@@ -1347,7 +1562,7 @@ int DT::removebadtet_addPnt(int iElm) {
 					const int boundaryIndex = *boundaryEntry;
 					if (modifyBnd) {
 						int Edgid = boundaryIndex;
-						int ret = splitEdg(Edgid);
+						int ret = splitEdgImpl(Edgid, 0, true);
 					}
 					continue;
 				}
@@ -1378,6 +1593,16 @@ int DT::removebadtet_addPnt(int iElm) {
 				}
 
 				int newp = addNode(pnt[0], pnt[1], pnt[2], space);
+				if (!AniSol.empty()) {
+					if (nBndedg == 5) {
+						std::vector<int> vertices(shellp.begin(), shellp.end());
+						vertices.push_back(pa);
+						vertices.push_back(pb);
+						interpolateCenterMetric(newp, vertices.data(), vertices.size());
+					} else {
+						Interpolate_met(pa, pb, newp, 0.5);
+					}
+				}
 
 				int tempt = iElm;
 				int loc = locate_pnt(newp, tempt);
@@ -1388,9 +1613,10 @@ int DT::removebadtet_addPnt(int iElm) {
 					shell.clear();
 					shell.push_back(tempt);
 					//B_W
-					int ret = BW_insert_vertex(newp, shell, 1);
+					int ret = insertWithVolumeRetry(*this, newp, shell, 1,
+                        minVolume_bw * topologyInsertionRetryVolumeRatio);
 					if (ret == 1) {
-						smooth_sus(newp);
+						smoothInteriorPoint(newp);
 					}
 					else {
 						DelNod(newp);
@@ -1399,6 +1625,7 @@ int DT::removebadtet_addPnt(int iElm) {
 			}
 		}
 	
+#if 0 // Temporarily disable level 3 (centroid insertion); retain levels 1 and 2.
 		if (!isDelEle(iElm) && Elems[iElm].form[0] == p0 && Elems[iElm].form[1] == p1 && Elems[iElm].form[2] == p2 && Elems[iElm].form[3] == p3) {
 			for (int k = 0; k < 3; k++)
 				pnt[k] = (Nodes[p0].pt[k] + Nodes[p1].pt[k] + Nodes[p2].pt[k] + Nodes[p3].pt[k]) / 4.0;
@@ -1406,6 +1633,8 @@ int DT::removebadtet_addPnt(int iElm) {
 			space = (Nodes[p0].space + Nodes[p1].space + Nodes[p2].space + Nodes[p3].space) / 4.0;
 
 			int newp = addNode(pnt[0], pnt[1], pnt[2], space);
+			const int vertices[4] = { p0, p1, p2, p3 };
+			interpolateCenterMetric(newp, vertices, 4);
 
 			int tempt = iElm;
 			int loc = locate_pnt(newp, tempt);
@@ -1419,13 +1648,14 @@ int DT::removebadtet_addPnt(int iElm) {
 				//B_W
 				int ret = BW_insert_vertex(newp, shell, 1);
 				if (ret == 1) {
-					smooth_sus(newp);
+					smoothInteriorPoint(newp);
 				}
 				else {
 					DelNod(newp);
 				}
 			}
 		}
+#endif
 	}
     else {
         // The current insertion strategy handles cells with four boundary vertices.
@@ -3037,8 +3267,12 @@ if (auto* boundaryEntry = BndEdg.find(iNod, it))
 	return;
 }
 
+int DT::splitEdg(int index, int deep) {
+    return splitEdgImpl(index, deep, false);
+}
+
 #pragma optimize("",off)
-int DT::splitEdg(int index,int deep) {
+int DT::splitEdgImpl(int index, int deep, bool retryVolume) {
 	//split Bnd Edge
 	int i, j, newp, srchtet = -1, p1, p2;
 	double pnt[3] = { 0 }, space = 0;
@@ -3077,7 +3311,6 @@ int DT::splitEdg(int index,int deep) {
 	f.resize(manifold * 3);
 	for (i = 0; i < manifold; i++) {
 		f[i] = SurEdgs[index].face[i];
-		FacetNum[SurTris[f[i]].parent]--;
 		int p3 = -1;
 		for (j = 0; j < 3; j++) {
 			if (SurTris[f[i]].form[j] != p1 && SurTris[f[i]].form[j] != p2) {
@@ -3121,7 +3354,11 @@ int DT::splitEdg(int index,int deep) {
 	BndEdg.erase(p1, p2);
 
 	//Boundary edge splitting allows for lower constraints.
-	if (BW_insert_vertex(newp, shell, 3) != 1) {
+    const int inserted = retryVolume
+        ? insertWithVolumeRetry(*this, newp, shell, 3,
+            std::max(shellVol / 10.0, oldminVolume_bw * topologyInsertionRetryVolumeRatio))
+        : BW_insert_vertex(newp, shell, 3);
+	if (inserted != 1) {
 		minVolume_bw = oldminVolume_bw;
 		//recover edge min constraints
 		DelNod(newp);
@@ -3134,6 +3371,10 @@ int DT::splitEdg(int index,int deep) {
 		return 0;
 	}
 	minVolume_bw = oldminVolume_bw;
+
+	// Update live surface counts only after the insertion succeeds.
+	for (int face : SurEdgs[index].face)
+		--FacetNum[SurTris[face].parent];
 
 	//set new point type
 	// F=1 S=3 C=else
@@ -3285,7 +3526,7 @@ int DT::splitEdg(int index,int deep) {
 							int eid = boundaryIndex;
 							if (!processedEdges.insert(eid).second)
 								continue;
-							int ret = splitEdg(eid, 1);
+							int ret = splitEdgImpl(eid, 1, retryVolume);
 							if (ret != 0) {
 								if (std::find(periodic_P[ret].begin(), periodic_P[ret].end(), newp) == periodic_P[ret].end())
 									periodic_P[ret].push_back(newp);
@@ -4225,7 +4466,7 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
 	tempargs.outlogfile = 0;
 
     if (!trial) {
-        trial = std::make_unique<DT>();
+        trial.reset(new DT());
         // Rejected local trials must not emit errors through the host logger.
         trial->meshLogger = std::make_shared<spdlog::logger>("topology_trial",
             std::make_shared<spdlog::sinks::null_sink_mt>());
@@ -4509,6 +4750,7 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
 }
 
 int DT::smoothBndPntPass(int loop) {
+    if (!modifyBnd) return 0;
 	for (int i = 0; i < loop; i++)
 		for (int j = 0; j < Nodes.size(); j++)
 			smoothBndPnt(j);
@@ -4517,7 +4759,8 @@ int DT::smoothBndPntPass(int loop) {
 
 // constrain boundary vertex
 int DT::smoothBndPnt(int iNod) {
-	if (improve_Metric == SUS_METRIC) return 0; // SUS keeps boundary nodes fixed.
+    if (!modifyBnd) return 0;
+	if (improve_Metric == SUS_METRIC) return 0; // Legacy boundary smoother does not implement SUS.
 	if (periodic_P.size() != 0) {
 		// Temporarily not smooth
 		if (periodic_P.find(iNod) != periodic_P.end())
@@ -5135,6 +5378,7 @@ else if (isFacetpnt(iNod)) {
 
 // Legacy anisotropic boundary-point smoothing. Kept for reference.
 int DT::smoothBndPnt_ani(int iNod) {
+    if (!modifyBnd) return 0;
 	if (!isbndpnt(iNod)) {
 		// if it's not boundary vertex
 		return 0;

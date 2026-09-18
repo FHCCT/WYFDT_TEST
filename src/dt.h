@@ -182,6 +182,8 @@ namespace dt {
 		//boundary recover
 		void buildBndInfo(Mesh& mesh, Args& args, bool buildSize = true);
 		void SurMeshClean(Mesh& mesh, Args& args);
+		int mergeShortSurfaceEdges(Mesh& mesh, Args& args);
+        int imprintNearbySurfaceFaces(Mesh& mesh, Args& args);
 		void AttachSeg2Pnt(int ie);
 		void DelSingleEdge(int ie);
 		int AttachPnt2Seg(int iNod, int targetE);
@@ -321,7 +323,7 @@ namespace dt {
 		int canTryDestroyShortEdge(int iElm, int ia, int ib, double Threshold, int* destroyIa = nullptr, int* keepIb = nullptr);
 		// filp
 		int flipEdgPass(int nloop);
-		void Type_Vertex_Edg(double Angle, const Mesh& mesh);;
+		void Type_Vertex_Edg(double Angle, const Mesh& mesh);
 		int ifflipEdg(int index);
 		int checkFlipNormal(int p1, int p2, int p3, int p4);
 		int flipEdg(int index, int deep = 0);

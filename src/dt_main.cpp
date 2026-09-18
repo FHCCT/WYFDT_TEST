@@ -92,9 +92,9 @@ int main(int argc, char* argv[]) {
 				//args.periodic_P = { 73,74,9,7,81,4,1,67,3,6,67,1,68,0,4,81,74,73,71,69,7,9,5,80,69,71,0,68,2,82,82,2,6,3,83,84,84,83,80,5,79,78,78,79,77,75,75,77,87,88,88,87,8,91,91,8,91,90,90,91,93,94,94,93 };
                 // Shared isotropic quality profile; explicit CLI values take precedence.
 				args.adpangle = 160;
-				args.optloop = 9;
-				args.optTh = 0.5;
-				args.optanglestrict =0;
+				args.optloop = 6;
+				args.optTh = 0.3;
+				args.optanglestrict =0.01;
 				ret = d.adaptation_by_Tetid(mesh, args, refine_tri_id, refine_tet_id, 1.3);
 			}
 			else if (adptype == 3) {

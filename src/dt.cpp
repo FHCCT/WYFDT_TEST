@@ -145,6 +145,8 @@ int DT::BndPntInst(Mesh& mesh, Args& args)
     MeshStageLog stageLog(*this, "Boundary points", 1);
 	int i, j;
 	double v1[3], v2[3], n[3];
+	// Clean before insertion so removed surface vertices never enter the volume.
+	SurMeshClean(mesh, args);
 	// Read input Pnts
 	buildPntInfo(mesh);
 	if (infolevel > 0)
@@ -5710,10 +5712,6 @@ void DT::buildBndInfo(Mesh& mesh, Args& args, bool buildSize) {
 	SurTris.reserve(nSurTris * 1.5);
 	SurEdgs.reserve(nSurTris * 2);//nSurTris*3/2
 
-
-	//std::map<int, int> mp;
-	//int fff = 100;
-
 	int EdgNum = 0;
 	for (i = 0; i < nSurTris; i++) {//input SurTri
 		SurTris.emplace_back(SurTri());
@@ -6212,8 +6210,258 @@ void DT::DelSingleEdge(int ie) {
 	return;
 }
 
+// Clean only the input surface, before any vertex is inserted into the volume.
+// Workspaces and the spatial index belong to this call, not to the DT instance.
+int DT::mergeShortSurfaceEdges(Mesh& mesh, Args& args) {
+    if (args.constrain != 0 || !Nodes.empty() || !Elems.empty() ||
+        !mesh.T.empty() || mesh.V.empty() || mesh.F.empty()) return 0;
+    const int count = static_cast<int>(mesh.V.size());
+    for (const auto& f : mesh.F)
+        for (int j=0; j<3; ++j) if (f[j]<0 || f[j]>=count) return 0;
+    // Partial point-size arrays have positional semantics; leave these inputs alone.
+    if (!mesh.pointSize.empty() && mesh.pointSize.size()!=mesh.V.size()) return 0;
+    using Vec = Eigen::Vector3d;
+    using Triangle = Eigen::Matrix3d;
+    using Tree = BinaryTree<Triangle>;
+    constexpr double shortRatio = 0.02;
+    const double normalCos = std::cos(5.0 * PI / 180.0);
+    const double featureCos = std::cos((180.0-args.adpangle)*PI/180.0);
+    std::vector<int> parent(count);
+    std::vector<unsigned char> protectedPoint(count,0);
+    for (int n=0; n<count; ++n) parent[n]=n;
+    for (const auto& s : mesh.S) for (int j=0; j<2; ++j)
+        if (s[j]>=0 && s[j]<count) protectedPoint[s[j]]=1;
+    for (int n : args.periodic_P) if (n>=0 && n<count) protectedPoint[n]=1;
+    auto point = [&](int n) { return Vec(mesh.V[n][0],mesh.V[n][1],mesh.V[n][2]); };
+    auto triangle = [&](const std::array<int,4>& f) {
+        Triangle t; for (int j=0; j<3; ++j) t.row(j)=point(f[j]).transpose(); return t;
+    };
+    auto root = [&](int n) { while (parent[n]!=n) { parent[n]=parent[parent[n]]; n=parent[n]; } return n; };
+    Tree::BoundingBox bounds;
+    for (int j=0; j<3; ++j) bounds[j]=bounds[j+3]=mesh.V[0][j];
+    for (const auto& p : mesh.V) for (int j=0; j<3; ++j) {
+        bounds[j]=std::min(bounds[j],p[j]); bounds[j+3]=std::max(bounds[j+3],p[j]);
+    }
+    Tree tree(bounds);
+    std::map<int,int> faceCounts;
+    std::vector<std::vector<int>> incident(count);
+    for (int t=0; t<static_cast<int>(mesh.F.size()); ++t) {
+        tree.insert(triangle(mesh.F[t]),t);
+        ++faceCounts[mesh.F[t][3]];
+        for (int j=0; j<3; ++j) incident[mesh.F[t][j]].push_back(t);
+    }
+    struct VertexInfo {
+        std::set<int> neighbors, ids;
+        int level, features;
+        double longest;
+    };
+    auto vertexInfo = [&](int n) {
+        VertexInfo info; info.features=0; info.longest=0;
+        std::map<int,std::vector<int>> edges;
+        for (int t:incident[n]) {
+            const auto& f=mesh.F[t]; if (f[0]<0) continue;
+            info.ids.insert(f[3]);
+            for (int j=0; j<3; ++j) if (f[j]!=n) edges[f[j]].push_back(t);
+        }
+        std::vector<int> features;
+        for (const auto& e:edges) {
+            const int other=e.first; const auto& fs=e.second;
+            info.neighbors.insert(other);
+            info.longest=std::max(info.longest,(point(other)-point(n)).norm());
+            bool feature=fs.size()!=2 || mesh.F[fs[0]][3]!=mesh.F[fs[1]][3];
+            if (!feature) {
+                int opposite[2]={-1,-1};
+                for (int j=0;j<2;++j) for (int k=0;k<3;++k)
+                    if (mesh.F[fs[j]][k]!=n && mesh.F[fs[j]][k]!=other) opposite[j]=mesh.F[fs[j]][k];
+                if (opposite[0]<0 || opposite[1]<0) feature=true;
+                else {
+                    const Vec e=point(other)-point(n);
+                    const Vec a=e.cross(point(opposite[0])-point(n));
+                    const Vec b=(point(opposite[1])-point(n)).cross(e);
+                    feature=!(a.norm()*b.norm()>0) || a.dot(b)<featureCos*a.norm()*b.norm();
+                }
+            }
+            if (feature) features.push_back(other);
+        }
+        info.features=static_cast<int>(features.size());
+        info.level=features.empty()?1:3;
+        if (features.size()==2) {
+            const Vec a=point(features[0])-point(n), b=point(features[1])-point(n);
+            if (a.dot(b)<=-0.996*a.norm()*b.norm()) info.level=2;
+        }
+        return info;
+    };
+    auto priority = [](const VertexInfo& a, const VertexInfo& b) {
+        if (a.level!=b.level) return a.level<b.level;
+        if (a.ids.size()!=b.ids.size()) return a.ids.size()<b.ids.size();
+        return a.features<b.features;
+    };
+    auto intersects = [&](const std::array<int,4>& a, const std::array<int,4>& b) {
+        int ia[3]={a[0],a[1],a[2]}, ib[3]={b[0],b[1],b[2]};
+        double* pa[3]={mesh.V[a[0]].data(),mesh.V[a[1]].data(),mesh.V[a[2]].data()};
+        double* pb[3]={mesh.V[b[0]].data(),mesh.V[b[1]].data(),mesh.V[b[2]].data()};
+        return GEOM_FUNC::tri_tri_intersect3d_fast(ia,ib,pa,pb)!=0;
+    };
+    int merged=0;
+    for (;;) {
+        std::set<std::pair<int,int>> edges;
+        std::vector<double> longest(count,0);
+        for (const auto& f:mesh.F) if (f[0]>=0) for (int j=0;j<3;++j) {
+            const int a=f[j], b=f[(j+1)%3]; if (a==b) continue;
+            edges.emplace(std::min(a,b),std::max(a,b));
+            const double length=(point(a)-point(b)).norm();
+            longest[a]=std::max(longest[a],length); longest[b]=std::max(longest[b],length);
+        }
+        std::vector<std::pair<double,std::pair<int,int>>> candidates;
+        for (const auto& e:edges) {
+            if (protectedPoint[e.first] || protectedPoint[e.second]) continue;
+            const double length=(point(e.first)-point(e.second)).norm();
+            if (length<shortRatio*std::min(longest[e.first],longest[e.second]))
+                candidates.emplace_back(length,e);
+        }
+        std::sort(candidates.begin(),candidates.end());
+        int changed=0;
+        for (const auto& candidate:candidates) {
+            int remove=root(candidate.second.first), keep=root(candidate.second.second);
+            if (remove==keep || protectedPoint[remove] || protectedPoint[keep]) continue;
+            VertexInfo a=vertexInfo(remove), b=vertexInfo(keep);
+            if (!a.neighbors.count(keep)) continue;
+            const double length=(point(remove)-point(keep)).norm();
+            if (!(length<shortRatio*std::min(a.longest,b.longest))) continue;
+            if (priority(b,a) || (!priority(a,b) && keep>remove)) { std::swap(remove,keep); std::swap(a,b); }
+            // Preserve the richer junction, even when both endpoints are corners.
+            if (!std::includes(b.ids.begin(),b.ids.end(),a.ids.begin(),a.ids.end())) continue;
+            std::set<int> common, opposite;
+            std::set_intersection(a.neighbors.begin(),a.neighbors.end(),b.neighbors.begin(),b.neighbors.end(),std::inserter(common,common.end()));
+            std::map<int,int> deletedCounts;
+            std::map<int,std::array<int,4>> replacement;
+            bool valid=true;
+            for (int t:incident[remove]) {
+                const auto& old=mesh.F[t]; if (old[0]<0) continue;
+                auto f=old;
+                if (std::find(f.begin(),f.begin()+3,keep)!=f.begin()+3) {
+                    for (int j=0;j<3;++j) if (f[j]!=remove && f[j]!=keep) opposite.insert(f[j]);
+                    ++deletedCounts[f[3]]; f[0]=f[1]=f[2]=-1;
+                } else {
+                    for (int j=0;j<3;++j) if (f[j]==remove) f[j]=keep;
+                    const Vec before=(point(old[1])-point(old[0])).cross(point(old[2])-point(old[0]));
+                    const Vec after=(point(f[1])-point(f[0])).cross(point(f[2])-point(f[0]));
+                    if (!(before.norm()>0) || !(after.norm()>0.05*before.norm()) ||
+                        after.dot(before)<normalCos*after.norm()*before.norm()) { valid=false; break; }
+                }
+                replacement.emplace(t,f);
+            }
+            if (!valid || common!=opposite) continue;
+            for (const auto& d:deletedCounts) if (faceCounts[d.first]<=d.second) valid=false;
+            // Labels may contain disconnected sheets. The edge must belong
+            // to each affected sheet; identifying unrelated vertices is unsafe.
+            for (int id:a.ids) {
+                std::set<int> na, nb, opp, shared;
+                bool remaining=false;
+                for (int t:incident[remove]) {
+                    const auto& f=mesh.F[t];
+                    if (f[0]<0 || f[3]!=id) continue;
+                    for (int j=0; j<3; ++j) if (f[j]!=remove) na.insert(f[j]);
+                    if (std::find(f.begin(),f.begin()+3,keep)!=f.begin()+3) {
+                        for (int j=0; j<3; ++j)
+                            if (f[j]!=remove && f[j]!=keep) opp.insert(f[j]);
+                    }
+                    if (replacement.at(t)[0]>=0) remaining=true;
+                }
+                for (int t:incident[keep]) {
+                    const auto& f=mesh.F[t];
+                    if (f[0]<0 || f[3]!=id) continue;
+                    for (int j=0; j<3; ++j) if (f[j]!=keep) nb.insert(f[j]);
+                    const auto it=replacement.find(t);
+                    if (it==replacement.end() || it->second[0]>=0) remaining=true;
+                }
+                std::set_intersection(na.begin(),na.end(),nb.begin(),nb.end(),
+                    std::inserter(shared,shared.end()));
+                if (opp.empty() || shared!=opp || !remaining) { valid=false; break; }
+            }
+            if (!valid) continue;
+            std::set<std::array<int,3>> faces;
+            std::set<int> local(incident[keep].begin(),incident[keep].end());
+            local.insert(incident[remove].begin(),incident[remove].end());
+            for (int t:local) {
+                auto it=replacement.find(t);const auto& f=it==replacement.end()?mesh.F[t]:it->second;
+                if(f[0]<0)continue;
+                std::array<int,3> key={{f[0],f[1],f[2]}};std::sort(key.begin(),key.end());
+                if (!faces.insert(key).second) {valid=false;break;}
+            }
+            if (!valid) continue;
+            // Query the updated surface index; include modified triangles from
+            // this same transaction, and reject newly introduced intersections.
+            for (const auto& change:replacement) {
+                const auto& f=change.second; if(f[0]<0)continue;
+                Tree::BoundingBox box;
+                for(int j=0;j<3;++j){box[j]=std::min({mesh.V[f[0]][j],mesh.V[f[1]][j],mesh.V[f[2]][j]});box[j+3]=std::max({mesh.V[f[0]][j],mesh.V[f[1]][j],mesh.V[f[2]][j]});}
+                std::vector<size_t> nearby;tree.query(box,nearby);
+                for(const auto& other:replacement)nearby.push_back(other.first);
+                std::sort(nearby.begin(),nearby.end());nearby.erase(std::unique(nearby.begin(),nearby.end()),nearby.end());
+                for(size_t t:nearby) {
+                    if(t==static_cast<size_t>(change.first)||mesh.F[t][0]<0)continue;
+                    auto it=replacement.find(static_cast<int>(t));const auto& other=it==replacement.end()?mesh.F[t]:it->second;
+                    if(other[0]<0)continue;
+                    if(intersects(f,other) && !intersects(mesh.F[change.first],mesh.F[t])) {valid=false;break;}
+                }
+                if(!valid)break;
+            }
+            if (!valid) continue;
+            for (const auto& change:replacement) {
+                const int t=change.first;tree.remove(t,t);mesh.F[t]=change.second;
+                if(mesh.F[t][0]>=0) {
+                    tree.reinsert(triangle(mesh.F[t]),t);
+                    incident[keep].push_back(t);
+                }
+            }
+            incident[remove].clear();
+            for(const auto& d:deletedCounts)faceCounts[d.first]-=d.second;
+            if(!mesh.pointSize.empty() && mesh.pointSize[remove]>0 &&
+                (mesh.pointSize[keep]<=0 || mesh.pointSize[remove]<mesh.pointSize[keep]))mesh.pointSize[keep]=mesh.pointSize[remove];
+            parent[remove]=keep;++merged;++changed;
+            if(infolevel>=2)meshLogger->debug("Merge short surface edge: {} -> {}, length={:.9g}",remove,keep,length);
+        }
+        if (!changed) break;
+    }
+    if (!merged) return 0;
+    std::vector<int> mapping(count,-1);
+    int next=0;
+    for (int n=0; n<count; ++n) if (parent[n]==n) {
+        mapping[n]=next; mesh.V[next]=mesh.V[n];
+        if (!mesh.pointSize.empty()) mesh.pointSize[next]=mesh.pointSize[n];
+        ++next;
+    }
+    for (int n=0; n<count; ++n) mapping[n]=mapping[root(n)];
+    mesh.V.resize(next);
+    if (!mesh.pointSize.empty()) mesh.pointSize.resize(next);
+    size_t write=0;
+    for (auto f:mesh.F) if (f[0]>=0) {
+        for (int j=0; j<3; ++j) f[j]=mapping[f[j]];
+        mesh.F[write++]=f;
+    }
+    mesh.F.resize(write);
+    for (auto& s:mesh.S) for (int j=0; j<2; ++j)
+        if (s[j]>=0 && s[j]<count) s[j]=mapping[s[j]];
+    for (int& n:args.periodic_P) if (n>=0 && n<count) n=mapping[n];
+    periodic_P.clear();
+    for (size_t j=0; j+1<args.periodic_P.size(); j+=2) {
+        const int a=args.periodic_P[j], b=args.periodic_P[j+1];
+        auto& va=periodic_P[a]; auto& vb=periodic_P[b];
+        if (std::find(va.begin(),va.end(),b)==va.end()) va.push_back(b);
+        if (std::find(vb.begin(),vb.end(),a)==vb.end()) vb.push_back(a);
+    }
+    if (infolevel>0) meshLogger->info("Merge short surface edges: {}",merged);
+    return merged;
+}
+
 //O(N^2),slow, but seldom
 void DT::SurMeshClean(Mesh& mesh, Args& args){
+    if (Nodes.empty()) {
+        mergeShortSurfaceEdges(mesh, args);
+        //imprintNearbySurfaceFaces(mesh, args);
+        return;
+    }
 	for(int targetF=0; targetF< mesh.F.size(); targetF++){
 	
 		int p1 = mesh.F[targetF][0];//one of old Tri point

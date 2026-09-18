@@ -243,9 +243,22 @@ double dt::DT::quality_sus(double* a, double* b, double* c, double* d) {
         Vec(c[0], c[1], c[2]), Vec(d[0], d[1], d[2]) };
     const Vec origin = p[0];
     double scale = 0;
-    for (auto& v : p) { v -= origin; scale = std::max(scale, v.cwiseAbs().maxCoeff()); }
+    for (const auto& v : p) scale = std::max(scale, (v - origin).cwiseAbs().maxCoeff());
     if (!(scale > 0) || !std::isfinite(scale)) return 0;
-    for (auto& v : p) v /= scale;
+    // Scale the original coordinates by a power of two BEFORE any subtraction.
+    // Arbitrary division (even followed by exact orient3d) can reverse the sign
+    // of a nearly coplanar tetrahedron by rounding its input coordinates.
+    int exponent = 0;
+    std::frexp(scale, &exponent);
+    if (-exponent < std::numeric_limits<double>::max_exponent) {
+        const double factor = std::scalbn(1.0, -exponent);
+        for (auto& v : p) v *= factor;
+    } else {
+        // A subnormal edge scale can require an unrepresentable reciprocal.
+        for (auto& v : p)
+            for (int axis = 0; axis < 3; ++axis)
+                v[axis] = std::scalbn(v[axis], -exponent);
+    }
     return signedQuality(p);
 }
 
@@ -407,9 +420,10 @@ int dt::DT::smooth_sus(int iNod, double minimumQualityFloor) {
                 }
             }
         }
-        // Try smaller SUS steps first. If minQ blocks progress (including
-        // a numerically tiny step), switch objectives at the current position.
-        if (activeMode || stationary || (blockedByQuality && (!accepted || (nextX - x).norm() <= 1e-10))) {
+        // Exhausted validity/Armijo trials also need a different direction:
+        // they never reach the minQ check and do not set blockedByQuality.
+        // Retain the existing fallback for an accepted but negligible step.
+        if (!accepted || (blockedByQuality && (nextX - x).norm() <= 1e-10)) {
             activeMode = true;
             {
                 direction = activeSetDirection(tets, x);

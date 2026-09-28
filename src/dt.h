@@ -478,7 +478,11 @@ namespace dt {
             std::vector<int> star, neighbors, points;
             std::vector<std::array<int, 3>> faces;
             std::vector<double> qualities;
+            std::array<double, 3> normal;
+            double normalLength, scale, minimum, qualitySum;
         };
+        int prepareBoundarySmoothPoint(int node, BoundarySmoothWorkspace& workspace);
+        int smoothPeriodicBoundaryGroup(const std::vector<int>& group, double minimumQualityFloor);
         int smoothPlanarBoundaryPoint(int node, double minimumQualityFloor, BoundarySmoothWorkspace& workspace);
         void mergeThinLayers(Mesh& mesh, TriHasher<int64_t>& tetFaces,
             const std::vector<double>& tetVolumes);

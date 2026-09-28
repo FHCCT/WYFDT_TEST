@@ -1818,23 +1818,35 @@ bool DT::P_in_Line(double* mid, double* left, double* right) {
 
 bool DT::isParallel(double* p1, double* p2, double* p3, double* p4)
 {
-	const double eps = 1e-12;
+	// Periodic replicas may contain small coordinate perturbations. Compare
+	// sin(angle), not an absolute cross product that depends on edge length.
+	const double sinAngleTolerance = 1e-4; // Approximately 0.00573 degrees.
+	double v1[3], v2[3];
+	double scale1 = 0.0, scale2 = 0.0;
+	for (int i = 0; i < 3; ++i) {
+		v1[i] = p2[i] - p1[i];
+		v2[i] = p4[i] - p3[i];
+		if (!std::isfinite(v1[i]) || !std::isfinite(v2[i])) return false;
+		scale1 = std::max(scale1, std::abs(v1[i]));
+		scale2 = std::max(scale2, std::abs(v2[i]));
+	}
+	if (scale1 == 0.0 || scale2 == 0.0) return false;
 
-	// 两条线方向向量
-	double v1[3] = { p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2] };
-	double v2[3] = { p4[0] - p3[0], p4[1] - p3[1], p4[2] - p3[2] };
-
-	// 叉积
-	double c[3] = {
+	// Rescale before squaring to avoid overflow/underflow on very large/small meshes.
+	double lengthSquared1 = 0.0, lengthSquared2 = 0.0;
+	for (int i = 0; i < 3; ++i) {
+		v1[i] /= scale1;
+		v2[i] /= scale2;
+		lengthSquared1 += v1[i] * v1[i];
+		lengthSquared2 += v2[i] * v2[i];
+	}
+	const double c[3] = {
 		v1[1] * v2[2] - v1[2] * v2[1],
 		v1[2] * v2[0] - v1[0] * v2[2],
 		v1[0] * v2[1] - v1[1] * v2[0]
 	};
-
-	// 若叉积长度接近0，则平行
-	double norm2 = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
-
-	return norm2 < eps;
+	const double crossSquared = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
+	return crossSquared <= sinAngleTolerance * sinAngleTolerance * lengthSquared1 * lengthSquared2;
 }
 /*
 * lu_decmp()    Compute the LU decomposition of a matrix.Reference tetgen

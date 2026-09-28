@@ -67,7 +67,7 @@ int DT::dt_init(Mesh& mesh, Args& args)
 	spdlogoutfile(args.outlogfile);
     meshLogger->set_level(infolevel == 0 ? spdlog::level::err :
         infolevel == 1 ? spdlog::level::info : spdlog::level::debug);
-	if (infolevel > 0) meshLogger->info("Version 2026.09.15");
+	if (infolevel > 0) meshLogger->info("Version 2026.09.28");
     MeshStageLog initLog(*this, "Initialize");
     if (infolevel > 0)
         meshLogger->info("Input mesh: points={} segments={} triangles={} tets={}",
@@ -146,7 +146,7 @@ int DT::BndPntInst(Mesh& mesh, Args& args)
 	int i, j;
 	double v1[3], v2[3], n[3];
 	// Clean before insertion so removed surface vertices never enter the volume.
-	SurMeshClean(mesh, args);
+	//SurMeshClean(mesh, args);
 	// Read input Pnts
 	buildPntInfo(mesh);
 	if (infolevel > 0)
@@ -237,7 +237,8 @@ int DT::BndPntInst(Mesh& mesh, Args& args)
 		bond(t_2, 0, t_0, 1);
 	}
 
-	insertDelaunayPoints(*this, order);
+	// Keep insertion order and recovery seeds independent of the thread count.
+	insertDelaunayPointsSerial(*this, order);
 	
 	AddBox(2.0);
 	return 1;
@@ -6458,11 +6459,14 @@ int DT::mergeShortSurfaceEdges(Mesh& mesh, Args& args) {
 //O(N^2),slow, but seldom
 void DT::SurMeshClean(Mesh& mesh, Args& args){
     if (Nodes.empty()) {
-        mergeShortSurfaceEdges(mesh, args);
+	 //make adaptation fail,dont do this now.
+	 
+        //mergeShortSurfaceEdges(mesh, args);
         //imprintNearbySurfaceFaces(mesh, args);
         return;
     }
-	for(int targetF=0; targetF< mesh.F.size(); targetF++){
+	else
+		for(int targetF=0; targetF< mesh.F.size(); targetF++){
 	
 		int p1 = mesh.F[targetF][0];//one of old Tri point
 		int p2 = mesh.F[targetF][1];//one of old Tri point

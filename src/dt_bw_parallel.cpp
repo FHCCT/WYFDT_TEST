@@ -382,34 +382,53 @@ bool currentCandidate(DT& mesh, const RefineLane& lane) {
         if (mesh.Elems[t].form[j] != lane.candidateVertices[j]) return false;
     return true;
 }
-}
 
-void insertDelaunayPoints(DT& mesh, const std::vector<int>& order) {
-    MeshStageLog stageLog(mesh, "Delaunay insertion", 2);
-    DTParallelScope parallelScope;
-    if (order.size() <= 4) return;
-    if (mesh.infolevel > 0) mesh.meshLogger->debug("Incremental insert points.");
-    const int workers = activeDTThreads(mesh, order.size());
-    const int remainingCount = static_cast<int>(order.size()) - 4;
-    BWPlan serialPlan;
-    std::vector<int> serialSlots;
-    int anchor = order[0];
-    auto insertSerial = [&](int node, int& hint) {
+// Reuse the same serial insertion operation for the serial entry point and
+// the parallel path's scaffold and tail, retaining scratch storage per call.
+struct SerialDelaunayInserter {
+    DT& mesh;
+    BWPlan plan;
+    std::vector<int> slots;
+
+    explicit SerialDelaunayInserter(DT& mesh) : mesh(mesh) {}
+
+    void operator()(int node, int& hint) {
         BWRequest request = makeBWRequest(mesh, node, {liveHint(mesh, hint)}, 0);
         request.trackAccess = false;
-        planBW(mesh, request, serialPlan);
-        if (serialPlan.status == BWStatus::Ready) {
-            serialSlots.clear();
-            for (size_t f = 0; f < serialPlan.faces.size(); ++f) serialSlots.push_back(mesh.addElem());
-            commitBW(mesh, serialPlan, node, serialSlots);
-            finishBW(mesh, serialPlan);
+        planBW(mesh, request, plan);
+        if (plan.status == BWStatus::Ready) {
+            slots.clear();
+            for (size_t f = 0; f < plan.faces.size(); ++f) slots.push_back(mesh.addElem());
+            commitBW(mesh, plan, node, slots);
+            finishBW(mesh, plan);
         }
-        recordInitialResult(mesh, serialPlan, hint);
-    };
+        recordInitialResult(mesh, plan, hint);
+    }
+};
+}
+
+void insertDelaunayPointsSerial(DT& mesh, const std::vector<int>& order) {
+    MeshStageLog stageLog(mesh, "Delaunay insertion", 2);
+    if (order.size() <= 4) return;
+    if (mesh.infolevel > 0) mesh.meshLogger->debug("Incremental insert points.");
+    SerialDelaunayInserter insertSerial(mesh);
+    int anchor = order[0];
+    for (int i = 4; i < static_cast<int>(order.size()); ++i) insertSerial(order[i], anchor);
+}
+
+void insertDelaunayPointsParallel(DT& mesh, const std::vector<int>& order) {
+    DTParallelScope parallelScope;
+    const int workers = activeDTThreads(mesh, order.size());
     if (workers == 1) {
-        for (int i = 4; i < static_cast<int>(order.size()); ++i) insertSerial(order[i], anchor);
+        insertDelaunayPointsSerial(mesh, order);
         return;
     }
+    MeshStageLog stageLog(mesh, "Delaunay insertion", 2);
+    if (order.size() <= 4) return;
+    if (mesh.infolevel > 0) mesh.meshLogger->debug("Incremental insert points.");
+    const int remainingCount = static_cast<int>(order.size()) - 4;
+    SerialDelaunayInserter insertSerial(mesh);
+    int anchor = order[0];
 
     const int laneCount = regionCount(workers, remainingCount);
     const SpatialFrame frame(mesh);

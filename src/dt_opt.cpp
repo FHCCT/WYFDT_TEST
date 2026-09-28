@@ -230,15 +230,14 @@ int DT::OrthogonalityOptPass(Args& args) {
 	return 1;
 }
 
-int DT::smoothPlanarBoundaryPoint(int n, double floor, BoundarySmoothWorkspace& workspace) {
+int DT::prepareBoundarySmoothPoint(int n, BoundarySmoothWorkspace& workspace) {
     if (!modifyBnd) return 0;
     auto& star = workspace.star;
     auto& neighbors = workspace.neighbors;
     auto& points = workspace.points;
     auto& faces = workspace.faces;
-    auto& qualities = workspace.qualities;
-    if (isDelNod(n) || n == ghost || !isbndpnt(n) || isCornerpnt(n) || lockV.count(n) ||
-        periodic_P.count(n))
+    if (n < 0 || n >= static_cast<int>(Nodes.size()) || isDelNod(n) || n == ghost ||
+        !isbndpnt(n) || isCornerpnt(n) || lockV.count(n))
         return 0;
     findSphere(n, star);
     star.erase(std::remove_if(star.begin(), star.end(),
@@ -251,11 +250,9 @@ int DT::smoothPlanarBoundaryPoint(int n, double floor, BoundarySmoothWorkspace& 
     double len = 0, scale = 0;
     bool locked = false;
     double minimum = DBL_MAX, oldSum = 0;
-    int count = 0;
     for (int t : star) {
         minimum = std::min(minimum, Elems[t].q);
         oldSum += Elems[t].q;
-        ++count;
         for (int p : Elems[t].form) {
             if (p == n || !isbndpnt(p)) continue;
             int *e = BndEdg.find(n, p);
@@ -328,6 +325,24 @@ int DT::smoothPlanarBoundaryPoint(int n, double floor, BoundarySmoothWorkspace& 
         }
         if (!tangent) return 0;
     } else return 0;
+    workspace.normal = normal;
+    workspace.normalLength = len;
+    workspace.scale = scale;
+    workspace.minimum = minimum;
+    workspace.qualitySum = oldSum;
+    return 1;
+}
+
+int DT::smoothPlanarBoundaryPoint(int n, double floor, BoundarySmoothWorkspace& workspace) {
+    if (periodic_P.count(n) || !prepareBoundarySmoothPoint(n, workspace)) return 0;
+    auto& star = workspace.star;
+    auto& neighbors = workspace.neighbors;
+    auto& faces = workspace.faces;
+    auto& qualities = workspace.qualities;
+    const auto& normal = workspace.normal;
+    const double len = workspace.normalLength, scale = workspace.scale;
+    const double minimum = workspace.minimum, oldSum = workspace.qualitySum;
+    const int count = static_cast<int>(star.size());
     double direction[3];
     {
         // Central differences of mean quality, projected to the permitted tangent.
@@ -407,6 +422,150 @@ int DT::smoothPlanarBoundaryPoint(int n, double floor, BoundarySmoothWorkspace& 
             int t = star[j];
             Elems[t].q = qualities[j];
         }
+        return 1;
+    }
+    return 0;
+}
+
+namespace {
+// Treat periodic links as an undirected graph: corners can have more than one
+// partner, and a full translation orbit must move as one unit.
+std::vector<std::vector<int>> periodicSmoothGroups(const DT& mesh) {
+    std::map<int, std::vector<int>> graph;
+    for (const auto& entry : mesh.periodic_P) for (int partner : entry.second) {
+        graph[entry.first].push_back(partner);
+        graph[partner].push_back(entry.first);
+    }
+    std::set<int> visited;
+    std::vector<std::vector<int>> groups;
+    for (const auto& entry : graph) {
+        if (!visited.insert(entry.first).second) continue;
+        std::vector<int> group(1, entry.first);
+        for (size_t i = 0; i < group.size(); ++i)
+            for (int partner : graph[group[i]])
+                if (visited.insert(partner).second) group.push_back(partner);
+        std::sort(group.begin(), group.end());
+        if (group.size() > 1) groups.push_back(group);
+    }
+    return groups;
+}
+}
+
+int DT::smoothPeriodicBoundaryGroup(const std::vector<int>& group, double floor) {
+    if (!modifyBnd || group.size() < 2 ||
+        (improve_Metric != SUS_METRIC && improve_Metric != 2)) return 0;
+    // Called only between parallel color sweeps. Validate every member before
+    // evaluating any trial, and commit all coordinates/caches together.
+    std::vector<BoundarySmoothWorkspace> work(group.size());
+    std::vector<std::array<double, 3>> origins(group.size()), positions(group.size());
+    std::map<int, size_t> member;
+    std::map<int, double> cellCutoffs;
+    std::set<std::array<int, 3>> faces;
+    std::vector<Eigen::Vector3d> normals;
+    double scale = DBL_MAX;
+    auto constrain = [&](Eigen::Vector3d normal) {
+        const double length = normal.norm();
+        if (!(length > 0)) return;
+        normal /= length;
+        for (const auto& basis : normals) normal -= basis * normal.dot(basis);
+        if (normal.norm() > 1e-10 && normals.size() < 3) normals.push_back(normal.normalized());
+    };
+    for (size_t i = 0; i < group.size(); ++i) {
+        const int n = group[i];
+        if (!prepareBoundarySmoothPoint(n, work[i])) return 0;
+        member[n] = i;
+        std::copy(Nodes[n].pt, Nodes[n].pt + 3, origins[i].begin());
+        scale = std::min(scale, work[i].scale);
+        for (int t : work[i].star)
+            cellCutoffs[t] = std::max(cellCutoffs[t], std::min(work[i].minimum, 0.1));
+        for (auto face : work[i].faces) {
+            const Eigen::Vector3d a(Nodes[face[0]].pt), b(Nodes[face[1]].pt), c(Nodes[face[2]].pt);
+            constrain((b - a).cross(c - a));
+            std::sort(face.begin(), face.end());
+            faces.insert(face);
+        }
+        if (isSegmentpnt(n)) {
+            const Eigen::Vector3d axis =
+                (Eigen::Vector3d(Nodes[work[i].neighbors[0]].pt) -
+                 Eigen::Vector3d(Nodes[work[i].neighbors[1]].pt)).normalized();
+            const Eigen::Vector3d normal = axis.unitOrthogonal();
+            constrain(normal);
+            constrain(axis.cross(normal));
+        }
+    }
+    if (normals.size() == 3 || !(scale > 0) || !std::isfinite(scale)) return 0;
+    std::vector<int> cells;
+    std::vector<double> cutoffs, qualities;
+    std::map<int, size_t> cellIndex;
+    double oldSum = 0;
+    for (const auto& entry : cellCutoffs) {
+        cellIndex[entry.first] = cells.size();
+        cells.push_back(entry.first);
+        cutoffs.push_back(entry.second);
+        oldSum += Elems[entry.first].q;
+    }
+    qualities.resize(cells.size());
+    auto place = [&](const Eigen::Vector3d& delta) {
+        for (size_t i = 0; i < group.size(); ++i)
+            for (int k = 0; k < 3; ++k) positions[i][k] = origins[i][k] + delta[k];
+    };
+    auto point = [&](int n) -> double* {
+        const auto it = member.find(n);
+        return it == member.end() ? Nodes[n].pt : positions[it->second].data();
+    };
+    auto evaluate = [&](bool validate, double& sum) {
+        sum = 0;
+        for (size_t i = 0; i < cells.size(); ++i) {
+            const int* f = Elems[cells[i]].form;
+            double *a = point(f[0]), *b = point(f[1]), *c = point(f[2]), *d = point(f[3]);
+            const double q = tetquality(a, b, c, d, nullptr, improve_Metric);
+            if (!std::isfinite(q)) return false;
+            if (validate && (!(GEOM_FUNC::orient3d(a, b, c, d) < 0) ||
+                !(q >= cutoffs[i]) || !(quality_sus(a, b, c, d) >= floor))) return false;
+            qualities[i] = q;
+            sum += q;
+        }
+        return std::isfinite(sum);
+    };
+    Eigen::Vector3d gradient = Eigen::Vector3d::Zero();
+    const double h = scale * 1e-5;
+    for (int axis = 0; axis < 3; ++axis) {
+        double values[2];
+        for (int side = 0; side < 2; ++side) {
+            Eigen::Vector3d delta = Eigen::Vector3d::Zero();
+            delta[axis] = (side ? 1 : -1) * h;
+            place(delta);
+            if (!evaluate(false, values[side])) return 0;
+        }
+        gradient[axis] = (values[1] - values[0]) / (2 * h);
+    }
+    for (const auto& normal : normals) gradient -= normal * gradient.dot(normal);
+    if (!gradient.allFinite() || !(gradient.norm() > 0)) return 0;
+    gradient *= scale * 0.25 / gradient.norm();
+    double alpha = 1;
+    for (int trial = 0; trial < 10; ++trial, alpha *= 0.5) {
+        place(alpha * gradient);
+        double sum;
+        if (!evaluate(true, sum) || !(sum > oldSum + 1e-12 * cells.size())) continue;
+        bool valid = true;
+        // A gain on one periodic side must not hide a loss on another side.
+        for (const auto& w : work) {
+            double sideSum = 0;
+            for (int t : w.star) sideSum += qualities[cellIndex[t]];
+            if (sideSum < w.qualitySum - 1e-12 * w.star.size()) { valid = false; break; }
+        }
+        if (!valid) continue;
+        for (const auto& f : faces) {
+            const Eigen::Vector3d a(Nodes[f[0]].pt), b(Nodes[f[1]].pt), c(Nodes[f[2]].pt);
+            const Eigen::Vector3d nextA(point(f[0])), nextB(point(f[1])), nextC(point(f[2]));
+            if (!((b - a).cross(c - a).dot((nextB - nextA).cross(nextC - nextA)) > 0)) {
+                valid = false; break;
+            }
+        }
+        if (!valid) continue;
+        for (size_t i = 0; i < group.size(); ++i)
+            std::copy(positions[i].begin(), positions[i].end(), Nodes[group[i]].pt);
+        for (size_t i = 0; i < cells.size(); ++i) Elems[cells[i]].q = qualities[i];
         return 1;
     }
     return 0;
@@ -901,7 +1060,12 @@ int DT::SmoothPass(int nloop, double improve_goal) {
     DTParallelScope parallelScope;
     susIdleStates.resize(Nodes.size());
     std::vector<std::vector<int>> colors;
+    const auto periodicGroups = periodicSmoothGroups(*this);
+    std::vector<unsigned char> periodicMembers(periodicGroups.empty() ? 0 : Nodes.size(), 0);
+    for (const auto& group : periodicGroups) for (int n : group)
+        if (n >= 0 && n < static_cast<int>(Nodes.size())) periodicMembers[n] = 1;
     long long success = 0, attempts = 0;
+    long long periodicSuccess = 0, periodicAttempts = 0;
     for (int loop = 0; loop < nloop; ++loop) {
         // Both point algorithms preserve the same immutable global SUS floor.
         double minimumQualityFloor = DBL_MAX;
@@ -912,6 +1076,10 @@ int DT::SmoothPass(int nloop, double improve_goal) {
                 quality_sus(Nodes[f[0]].pt, Nodes[f[1]].pt, Nodes[f[2]].pt, Nodes[f[3]].pt));
         }
         colorBadQualityNodes(colors, improve_goal);
+        // Also exclude value-only links; periodic groups own all their members.
+        if (!periodicGroups.empty()) for (auto& color : colors)
+            color.erase(std::remove_if(color.begin(), color.end(),
+                [&](int n) { return periodicMembers[n] != 0; }), color.end());
         size_t maxGroup = 0;
         for (const auto& group : colors) maxGroup = std::max(maxGroup, group.size());
         const int workers = omp_in_parallel() ? 1 : static_cast<int>(
@@ -932,8 +1100,31 @@ int DT::SmoothPass(int nloop, double improve_goal) {
                 }
             }
         }
+        // Serialize complete periodic orbits after ordinary workers finish:
+        // paired stars may overlap each other or otherwise independent colors.
+        if (!periodicGroups.empty() && modifyBnd &&
+            (improve_Metric == SUS_METRIC || improve_Metric == 2)) {
+            std::vector<unsigned char> candidate(Nodes.size(), 0);
+            for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
+                if (isDelEle(t) || isvirtualtet(t) || ishulltet(t)) continue;
+                if (!(improve_goal >= 1 || Elems[t].q < improve_goal)) continue;
+                for (int n : Elems[t].form) candidate[n] = 1;
+            }
+            for (const auto& group : periodicGroups) {
+                bool selected = false;
+                for (int n : group)
+                    if (n >= 0 && n < static_cast<int>(candidate.size()) && candidate[n]) selected = true;
+                if (!selected) continue;
+                ++periodicAttempts;
+                periodicSuccess += smoothPeriodicBoundaryGroup(group, minimumQualityFloor) == 1;
+            }
+        }
     }
-    if (infolevel > 0) meshLogger->info("Smooth: {}/{}", success, attempts);
+    if (infolevel > 0) {
+        meshLogger->info("Smooth: {}/{}", success, attempts);
+        if (!periodicGroups.empty())
+            meshLogger->info("Smooth periodic groups: {}/{}", periodicSuccess, periodicAttempts);
+    }
     return 1;
 }
 
@@ -1079,31 +1270,31 @@ int DT::tryTopologyRepair(const TopologyCandidate& candidate, double angleDegree
 
     // Collapse is independent of the angle threshold, including when insertion
     // is disabled. Lengths here are physical lengths, not sizing-field lengths.
-    if (improve_step && modifyBnd) {
-        std::array<double, 6> squaredLengths;
-        double longestSquared = 0;
-        for (int e = 0; e < 6; ++e) {
-            squaredLengths[e] = distance2(Nodes[candidate.form[Egid[e][0]]].pt,
-                Nodes[candidate.form[Egid[e][1]]].pt);
-            longestSquared = std::max(longestSquared, squaredLengths[e]);
-        }
-        if (longestSquared > 0 && std::isfinite(longestSquared)) {
-            const double limit = longestSquared * topologyShortEdgeRatio * topologyShortEdgeRatio;
-            for (int e = 0; e < 6; ++e) {
-                if (!(squaredLengths[e] < limit)) continue;
-                const int p1 = candidate.form[Egid[e][0]], p2 = candidate.form[Egid[e][1]];
-                const int* entry = BndEdg.find(p1, p2);
-                if (!entry || isDelSurEdg(*entry) || SurEdgs[*entry].info > 1 || lockE.count(*entry)) continue;
-                // Preserve distinct feature curves, as in contractEdgPass.
-                if (SurEdgs[*entry].constrain == 0 && collapsePointLevel(p1) >= 2 && collapsePointLevel(p2) >= 2)
-                    continue;
-                // The master entry selects face -> segment -> corner, tries
-                // both directions at equal levels, and handles periodic pairs.
-                if (collapseEdg(*entry) == 1) return 1;
-                if (!topologyCandidateCurrent(candidate)) return 0;
-            }
-        }
-    }
+    //if (improve_step && modifyBnd) {
+    //    std::array<double, 6> squaredLengths;
+    //    double longestSquared = 0;
+    //    for (int e = 0; e < 6; ++e) {
+    //        squaredLengths[e] = distance2(Nodes[candidate.form[Egid[e][0]]].pt,
+    //            Nodes[candidate.form[Egid[e][1]]].pt);
+    //        longestSquared = std::max(longestSquared, squaredLengths[e]);
+    //    }
+    //    if (longestSquared > 0 && std::isfinite(longestSquared)) {
+    //        const double limit = longestSquared * topologyShortEdgeRatio * topologyShortEdgeRatio;
+    //        for (int e = 0; e < 6; ++e) {
+    //            if (!(squaredLengths[e] < limit)) continue;
+    //            const int p1 = candidate.form[Egid[e][0]], p2 = candidate.form[Egid[e][1]];
+    //            const int* entry = BndEdg.find(p1, p2);
+    //            if (!entry || isDelSurEdg(*entry) || SurEdgs[*entry].info > 1 || lockE.count(*entry)) continue;
+    //            // Preserve distinct feature curves, as in contractEdgPass.
+    //            if (SurEdgs[*entry].constrain == 0 && collapsePointLevel(p1) >= 2 && collapsePointLevel(p2) >= 2)
+    //                continue;
+    //            // The master entry selects face -> segment -> corner, tries
+    //            // both directions at equal levels, and handles periodic pairs.
+    //            if (collapseEdg(*entry) == 1) return 1;
+    //            if (!topologyCandidateCurrent(candidate)) return 0;
+    //        }
+    //    }
+    //}
     if (!needsTopologyInsertion(candidate.tet, angleDegrees)) return 0;
     return removebadtet_addPnt(candidate.tet);
 }

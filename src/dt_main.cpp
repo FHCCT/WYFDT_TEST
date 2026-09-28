@@ -4,7 +4,7 @@
 using namespace std;
 //--input ../test\20260915_thread\adp/thread2_adpin.vtk --adpin ../test\20260915_thread\adp/thread2_refine_id.txt --adptype 2
 //--input ../test\20260916_dtAdp\pcb2\in.vtk --adpin ../test\20260916_dtAdp\pcb2\in.txt --adptype 2
-//--input ../test\20260916_dtAdp\usb_hw\in.vtk --adpin ../test\20260916_dtAdp\usb_hw\in.txt --adptype 2
+//--input ../test\Periodic\0928\14\in.vtk --adpin ..\test\Periodic\0928\14\in.txt --adptype 2
 #ifdef DT_EXEC
 int main(int argc, char* argv[]) {
 	std::string in_filename;
@@ -83,19 +83,20 @@ int main(int argc, char* argv[]) {
 			if (adptype == 1) {
 				std::vector<std::array<double, 4>> addVertex;
 				readVertex(in_adp_filename, addVertex);
-				ret = d.adaptation_by_pError(mesh, args, addVertex, 1.25);
+				ret = d.adaptation_by_pError(mesh, args, addVertex, 1.243);
 			}
 			else if (adptype == 2) {
 				std::vector<int> refine_tet_id;// = { 1,2,3,4,5,6,7,8,9,10 };
 				std::vector<int> refine_tri_id;// = { 137,35 };
 				dt::readRefineT(in_adp_filename, refine_tet_id);
-				//args.periodic_P = { 73,74,9,7,81,4,1,67,3,6,67,1,68,0,4,81,74,73,71,69,7,9,5,80,69,71,0,68,2,82,82,2,6,3,83,84,84,83,80,5,79,78,78,79,77,75,75,77,87,88,88,87,8,91,91,8,91,90,90,91,93,94,94,93 };
-                // Shared isotropic quality profile; explicit CLI values take precedence.
+				//args.periodic_P = { 115,0,117,201,122,7,123,195,131,9,134,113,140,197,141,196,198,184,200,187,204,223,205,222,206,221,207,224,208,225,209,227,210,226,211,228,212,229,213,231,214,230,215,232,216,235,217,234,218,233,219,237,220,236,558,559,46,175,47,27,49,30,105,146,107,26,136,53,150,22,151,25,155,156,157,50,159,158,161,164,163,147,176,177,182,181,193,194,202,162,203,100,9,7,11,8,46,175,47,27,49,30,105,146,107,26,113,0,114,2,129,128,131,122,133,127,134,115,136,53,150,22,151,25,155,156,157,50,159,158,161,164,163,147,176,177,182,181,189,190,192,191,193,194,202,162,203,100,208,207,209,214,210,213,211,215,212,204,219,218,220,217,225,224,226,231,227,230,228,232,229,223,236,234,237,233 };
+				// Shared isotropic quality profile; explicit CLI values take precedence.
 				args.adpangle = 160;
-				args.optloop = 6;
+				args.optloop =3;
+				args.nthread = 4;
 				args.optTh = 0.3;
 				args.optanglestrict =0.01;
-				ret = d.adaptation_by_Tetid(mesh, args, refine_tri_id, refine_tet_id, 1.3);
+				ret = d.adaptation_by_Tetid(mesh, args, refine_tri_id, refine_tet_id, 1.243);
 			}
 			else if (adptype == 3) {
 				ret = d.adaptation_Coarse(mesh, args);

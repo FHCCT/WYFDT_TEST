@@ -688,8 +688,8 @@ void DT::buildTetInfo(Mesh& mesh, Args& args) {
 		}
 	}
 
-    mergeThinLayers(mesh, Tri, tetVolumes);
-    std::vector<double>().swap(tetVolumes);
+    //mergeThinLayers(mesh, Tri, tetVolumes);
+    //std::vector<double>().swap(tetVolumes);
 
 	//build hull tet, and don't build space
 	args.constrain = 1;

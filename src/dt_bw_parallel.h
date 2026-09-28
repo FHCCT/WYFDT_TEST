@@ -60,7 +60,10 @@ public:
     }
 };
 
-void insertDelaunayPoints(DT& mesh, const std::vector<int>& order);
+// The main meshing flow uses serial insertion for thread-count-independent state.
+void insertDelaunayPointsSerial(DT& mesh, const std::vector<int>& order);
+// Retained spatial-batch implementation for callers explicitly choosing it.
+void insertDelaunayPointsParallel(DT& mesh, const std::vector<int>& order);
 void refineBWParallel(DT& mesh, Args& args);
 // Conservative lower bound used only for early candidate rejection.
 double refineBWSizeLowerBound(DT& mesh, int tet);

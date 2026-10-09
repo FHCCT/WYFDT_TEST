@@ -117,6 +117,8 @@
 #include <stdlib.h>
 #include <math.h>
 #include <mutex>
+#include <limits>
+#include <cmath>
 #include "geom_func.h"
 #include <sys/timeb.h>
 
@@ -2099,6 +2101,50 @@ namespace dt {
 			return finnow[finlength - 1];
 		}
 
+        namespace {
+            const double noStaticFilter = std::numeric_limits<double>::infinity();
+            thread_local double orientStaticBound = noStaticFilter;
+            thread_local double sphereStaticBound = noStaticFilter;
+
+            // Round upward even when the intermediate product is subnormal.
+            double upperProduct(double a, double b) {
+                return std::nextafter(a * b, noStaticFilter);
+            }
+            double upperSum(double a, double b) {
+                return std::nextafter(a + b, noStaticFilter);
+            }
+        }
+
+        PredicateFilterScope::PredicateFilterScope(const double lower[3], const double upper[3])
+            : previousOrient(orientStaticBound), previousSphere(sphereStaticBound) {
+            orientStaticBound = sphereStaticBound = noStaticFilter;
+            exactinit();
+            double span[3];
+            for (int axis = 0; axis < 3; ++axis) {
+                if (!std::isfinite(lower[axis]) || !std::isfinite(upper[axis]) ||
+                    !(upper[axis] > lower[axis])) return;
+                span[axis] = std::nextafter(upper[axis] - lower[axis], noStaticFilter);
+                if (!std::isfinite(span[axis])) return;
+            }
+            const double xyz = upperProduct(upperProduct(span[0], span[1]), span[2]);
+            const double lift = upperSum(upperSum(upperProduct(span[0], span[0]),
+                upperProduct(span[1], span[1])), upperProduct(span[2], span[2]));
+            // The dynamic permanents are <= 6*x*y*z and 24*x*y*z*lift.
+            // Larger factors and upward rounding also bound their FP evaluation.
+            // Thus a static acceptance returns exactly the same determinant as
+            // the existing dynamic filter, not merely the same sign.
+            const double orient = upperProduct(upperProduct(8.0, o3derrboundA), xyz);
+            const double sphere = upperProduct(upperProduct(upperProduct(32.0, isperrboundA), xyz), lift);
+            const double normal = std::numeric_limits<double>::min();
+            if (std::isfinite(orient) && orient >= normal) orientStaticBound = orient;
+            if (std::isfinite(sphere) && sphere >= normal) sphereStaticBound = sphere;
+        }
+
+        PredicateFilterScope::~PredicateFilterScope() {
+            orientStaticBound = previousOrient;
+            sphereStaticBound = previousSphere;
+        }
+
 		REAL orient3d(REAL* pa, REAL* pb, REAL* pc, REAL* pd)
 		{
 			REAL adx, bdx, cdx, ady, bdy, cdy, adz, bdz, cdz;
@@ -2128,7 +2174,7 @@ namespace dt {
 				+ bdz * (cdxady - adxcdy)
 				+ cdz * (adxbdy - bdxady);
 
-			// if (det > 1e-16 || det < -1e-16) return det;
+            if (det > orientStaticBound || -det > orientStaticBound) return det;
 
 			REAL permanent, errbound;
 			permanent = (Absolute(bdxcdy) + Absolute(cdxbdy)) * Absolute(adz)
@@ -3979,6 +4025,7 @@ namespace dt {
 			dlift = dex * dex + dey * dey + dez * dez;
 
 			det = (dlift * abc - clift * dab) + (blift * cda - alift * bcd);
+            if (det > sphereStaticBound || -det > sphereStaticBound) return det;
 
 			aezplus = Absolute(aez);
 			bezplus = Absolute(bez);

@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace dt {
@@ -19,6 +20,8 @@ struct BWRequest {
     bool anisotropic = false;
     bool boundary = false;
     bool trackAccess = true;
+    // The initial serial Delaunay pass has no threaded occupation check.
+    bool collectLockNodes = true;
     // Refinement only: commit writes the new node; finishBW serially updates old-node P2T.
     bool deferP2T = false;
     int info = 0;
@@ -36,7 +39,18 @@ struct BWScratchTable {
     size_t count = 0;
     int64_t& operator[](int key);
     void clear();
+    // Dense entity IDs in the serial input pass avoid repeated hashing.
+    // Resize before planning, while no references to entries are held.
+    void index(size_t size);
+    // Initial serial insertion only: borrow mesh flags during planning and
+    // restore them with clear() before allocating or committing any cells.
+    void borrowInitialFlags(DT& mesh);
 private:
+    DT* initialMesh = nullptr;
+    std::vector<std::pair<int, int64_t>> savedFlags;
+    std::vector<int64_t> indexedValues;
+    std::vector<uint32_t> indexedStamps;
+    uint32_t indexedEpoch = 0;
     void grow();
 };
 
@@ -97,7 +111,7 @@ struct BWSerialWorkspace {
 BWRequest makeBWRequest(DT& mesh, int node, const std::vector<int>& seeds, int info);
 BWStatus findBWCavity(DT& mesh, BWPlan& plan);
 BWStatus adjustBWCavity(DT& mesh, BWPlan& plan);
-BWStatus prepareBWFill(DT& mesh, BWPlan& plan);
+BWStatus prepareBWFill(DT& mesh, BWPlan& plan, bool checkInitialVisibility = false);
 // Internal adjacency builder, also exercised independently by regression tests.
 bool pairBWBoundary(BWPlan& plan);
 BWStatus planBW(DT& mesh, const BWRequest& request, BWPlan& plan);

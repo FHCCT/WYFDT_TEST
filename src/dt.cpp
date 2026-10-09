@@ -67,7 +67,7 @@ int DT::dt_init(Mesh& mesh, Args& args)
 	spdlogoutfile(args.outlogfile);
     meshLogger->set_level(infolevel == 0 ? spdlog::level::err :
         infolevel == 1 ? spdlog::level::info : spdlog::level::debug);
-	if (infolevel > 0) meshLogger->info("Version 2026.09.28");
+	if (infolevel > 0) meshLogger->info("Version 2026.10.09");
     MeshStageLog initLog(*this, "Initialize");
     if (infolevel > 0)
         meshLogger->info("Input mesh: points={} segments={} triangles={} tets={}",
@@ -1116,11 +1116,15 @@ void DT::buildPntInfo(Mesh& mesh) {
 		if (infolevel > 0)
 			meshLogger->debug("Free Memory: {:.3f} GB", 1.0 * freeM / 1024 / 1024 / 1024);
 
-		uint64_t MaxN = freeM / sizeof(Elem) / 10;
-		uint64_t MaxE = freeM / sizeof(Node) * 0.8;
-
-		uint64_t ReserveN = std::min<uint64_t>(nSurNodes * 5, MaxN);
-		uint64_t ReserveE = std::min<uint64_t>(nSurTris * 10, MaxE);
+        // Bound both reserves by their actual record sizes, leaving 20% free
+        // for scratch storage and other stages. Initial tets scale with points
+        // even when the input has very few boundary triangles.
+        const uint64_t MaxN = freeM / sizeof(Node) / 10;
+        const uint64_t MaxE = (freeM - freeM / 5 - freeM / 10) / sizeof(Elem);
+        const uint64_t ReserveN = std::min<uint64_t>(uint64_t(nSurNodes) * 5, MaxN);
+        const uint64_t desiredE = std::max<uint64_t>(uint64_t(nSurNodes) * 8 + 16,
+            uint64_t(nSurTris) * 10);
+        const uint64_t ReserveE = std::min<uint64_t>(desiredE, MaxE);
 
 		Nodes.reserve(static_cast<size_t>(ReserveN));
 		Elems.reserve(static_cast<size_t>(ReserveE));
@@ -3075,9 +3079,14 @@ int DT::splitBndEdge(const int lostE, int info) {
 			}
 		}
 	
-		if (dis1 < 1e-19 || dis1 > 1- 1e-19) {
-			return splitBndEdge(lostE, 0);
-		}
+        // On MSVC long double has double precision: 1 - 1e-19 rounds to 1,
+        // so the former strict '>' test admitted an intersection at p2 itself.
+        // Rounded coordinates can also equal an endpoint despite 0 < t < 1.
+        if (!(dis1 > 0 && dis1 < 1) || dis1 < 1e-19 ||
+            std::equal(pnt, pnt + 3, Nodes[p1].pt) || std::equal(pnt, pnt + 3, Nodes[p2].pt)) {
+            if (infolevel >= 2) meshLogger->debug("Edge Steiner intersection is an endpoint: edge={}; trying midpoint", lostE);
+            return splitBndEdge(lostE, 0);
+        }
 
 		space = Nodes[p1].space * (1 - dis1) + Nodes[p2].space * dis1;
 	}
@@ -3094,23 +3103,34 @@ int DT::splitBndEdge(const int lostE, int info) {
 		newp = addNode(pnt[0], pnt[1], pnt[2], space);
 
 		int ret = BW_insert_vertex(newp, srchtet, 3);
-		if (ret <= 0) {//BW_1,add bnd point
-			DelNod(newp);
-			if (infolevel > 0)
-				meshLogger->warn("Add Edge steiner point failed");
-			for (i = 0; i < SurEdgs[lostE].face.size(); i++) {
-				int Fidx = SurEdgs[lostE].face[i];
-				BndTri.add(SurTris[Fidx].form[0], SurTris[Fidx].form[1], SurTris[Fidx].form[2], Fidx);
-			}
-			BndEdg.add(p1, p2, lostE);
-			if (info == 0) {
-				return ignoreE(lostE);
-			}
-			else {
-				return splitBndEdge(lostE, 0);
-			}
-			return 0;
-		}
+        if (ret <= 0) {
+            DelNod(newp);
+            for (int face : SurEdgs[lostE].face)
+                BndTri.add(SurTris[face].form[0], SurTris[face].form[1], SurTris[face].form[2], face);
+            BndEdg.add(p1, p2, lostE);
+            if (info == 1) {
+                if (infolevel >= 2) {
+                    int duplicate = serialBW.plan.duplicateNode;
+                    for (int node : serialBW.plan.lockNodes) {
+                        if (node == ghost || isDelNod(node)) continue;
+                        if (std::equal(pnt, pnt + 3, Nodes[node].pt)) { duplicate = node; break; }
+                    }
+                    meshLogger->debug("Edge Steiner intersection rejected: edge={} status={} duplicate={} working={} kept={}; trying midpoint",
+                        lostE,static_cast<int>(serialBW.plan.status),duplicate,
+                        serialBW.plan.workingCavity.size(),serialBW.plan.cavity.size());
+                }
+                return splitBndEdge(lostE, 0);
+            }
+            // Preserve explicitly requested ignore-intersection behavior.
+            if (ignoreIntersect) return ignoreE(lostE);
+            // A failed midpoint otherwise remains a retryable recovery failure,
+            // not authority to delete the input edge and its surface triangles.
+            if (infolevel > 0)
+                meshLogger->warn("Add Edge steiner point failed: edge={} nodes=[{},{}] status={} working={} kept={} faces={}; boundary retained",
+                    lostE,p1,p2,static_cast<int>(serialBW.plan.status),serialBW.plan.workingCavity.size(),
+                    serialBW.plan.cavity.size(),serialBW.plan.faces.size());
+            return 0;
+        }
 	}
 	else {
 		newp = -info;

@@ -15,6 +15,27 @@ cmake --build build --config Release --parallel 4
 
 Windows / Visual Studio 构建生成 `build/Release/dt.exe` 和 `build/Release/dt.lib`。
 
+仅测试初始 Delaunay（在 `BndPntInst` 后停止）的随机点基准：
+
+```powershell
+cmake -S . -B build -DBUILD_BNDPNT_BENCHMARK=ON
+cmake --build build --config Release --target bndpnt_benchmark predicate_filter_check --parallel 4
+build/Release/predicate_filter_check.exe
+python tools/benchmark_bndpnt.py --tetgen D:\code\tetgen1.6.0\build\Release\tetgen.exe --counts 10000 100000 1000000 --verify-tetgen
+```
+
+测试使用固定随机种子、单线程及三次计时中位数，并检查邻接、体积和局部 Delaunay 条件。计时包括 `BndPntInst` 内的点数据初始化、Hilbert 排序、插点和包围盒；不包括文件写出及验证。详细结果和优化说明见 [BndPntInst 性能检查](docs/bndpnt-performance.md)，数据结构、空腔规则及坐标平移问题的实测见 [第二轮诊断](docs/bndpnt-diagnosis.md)。
+
+单元容量预留和静态谓词过滤现已接入正式初始插点路径，生成结果一致性及收益见 [主动优化验证](docs/bndpnt-active-optimization.md)。正式代码保留一份谓词实现及精确回退；`predicate_filter_check` 用于检查过滤前后的返回值逐位一致和线程隔离。
+
+对现有 VTK 仅执行四面体化、不恢复边界：
+
+```powershell
+python tools/benchmark_bndpnt.py --input test/gds_all_pre_dt_promoted_steiner.vtk --tetgen D:/code/tetgen1.6.0/build/Release/tetgen.exe --repeats 3 --output build/gds-tet/recheck
+```
+
+该文件的输入顺序会使早期多尺度样本偏向少数几何层，正式排序现先按确定性顺序打乱取样。计时、空腔工作量和结果一致性见 [GDS 文件四面体化对比](docs/gds-delaunay-performance.md)。
+
 仅构建库：
 
 ```powershell
@@ -46,6 +67,10 @@ cmake --build build --config Release --parallel 4
 库调用 `adaptation_by_Tetid` 时设置同一组 `Args` 即可复现该配置：`optloop=18, optTh=0.8, optanglestrict=0, adpangle=160`。库保留调用方的参数，不按模型名称选择策略。提高轮数会增加耗时；以上配置侧重最终质量，具体平均角度与雅可比仍取决于输入网格和边界约束。
 
 ## 日志等级
+
+`--constrain 0` 的优化边界翻边、塌缩和平滑现增加原表面平面检查；优化及内部细化插点在提交前增加新空腔形状质量检查，拒绝数值退化的近共面单元。具体适用范围、质量阈值及 `gds_all_gap_stitched.vtk` 的完整验证见 [优化几何与插点质量检查](docs/gap-optimization-check.md)。
+
+边界恢复的交点候选拒绝后，中点回退详情在 `infolevel=2` 中输出。重复端点不再作为新插点；默认情况下，中点插入也失败时保留原边、原面并交由上层重试，实际失败警告附带定位信息。原 `Add Edge steiner point failed` 的原因和恢复效果对比见 [边界 Steiner 插点检查](docs/edge-steiner-recovery.md)。
 
 `Args::infolevel` / `--infolevel` 默认为 `1`：
 

@@ -45,6 +45,17 @@ namespace dt {
 					/* extern the predicates */
 		extern double macheps;
 		extern double exactinit();
+        // Only enable while every query point remains in this coordinate box.
+        // State is local to the calling thread and restored on every exit.
+        class PredicateFilterScope {
+        public:
+            PredicateFilterScope(const double lower[3], const double upper[3]);
+            ~PredicateFilterScope();
+            PredicateFilterScope(const PredicateFilterScope&) = delete;
+            PredicateFilterScope& operator=(const PredicateFilterScope&) = delete;
+        private:
+            double previousOrient, previousSphere;
+        };
 		double fixedSplitPoint(double s1, double s2, double pnt1, double pnt2);
 		double orient2d(double* pa, double* pb, double* pc);
 		double orient3d(double* pa, double* pb, double* pc, double* pd);

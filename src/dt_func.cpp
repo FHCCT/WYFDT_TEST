@@ -1361,6 +1361,10 @@ void DT::Hilbert(const std::vector<std::array<double, 3>>& V, std::vector<int>& 
 			Varray[i][j] = V[i][j];
 		Varray[i][3] = order[i];
 	}
+    // BRIO prefixes must sample the whole input, not its first geometric layer.
+    // A local deterministic generator preserves IDs and avoids global RNG state.
+    std::mt19937 generator(static_cast<unsigned>(Vsize));
+    std::shuffle(Varray.begin(), Varray.end(), generator);
 	multiscale_sort(Varray, Vsize, ngroup);
 
 	for (int i = 0; i < Vsize; i++) {
@@ -1377,9 +1381,10 @@ void DT::multiscale_sort(std::vector<std::array<double, 4>>& Varray, int Asize, 
 		middle = Asize * 0.125;
 		multiscale_sort(Varray, middle, depth);
 	}
+	// Scale-free bounds keep the spatial order invariant under translation.
+	// Multiplying absolute coordinates can shift the box past the entire cloud.
 	hilbert_sort(Varray, middle, Asize - middle, 0, 0,
-		minW[0] * 1.01, maxW[0] * 1.01, minW[1] * 1.01,
-		maxW[1] * 1.01, minW[2] * 1.01, maxW[2] * 1.01, 0);
+		minW[0], maxW[0], minW[1], maxW[1], minW[2], maxW[2], 0);
 	return;
 }
 

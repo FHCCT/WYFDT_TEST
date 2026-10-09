@@ -1,10 +1,28 @@
 #include "dt.h"
+#include "dt_geometry_guard.h"
 #include "dt_bw.h"
 
 #include <stdexcept>
 
 namespace dt {
 int64_t& BWScratchTable::operator[](int key) {
+    if (initialMesh) {
+        int64_t& value = initialMesh->Elems[key].info;
+        // Bit 28 is unused in the initial triangulation and survives cavity
+        // adjustment's low-bit mask. Every borrowed value is restored exactly.
+        if (!(value & (int64_t(1) << 28))) {
+            savedFlags.push_back({key, value});
+            value = int64_t(1) << 28;
+        }
+        return value;
+    }
+    if (indexedEpoch) {
+        if (indexedStamps[key] != indexedEpoch) {
+            indexedStamps[key] = indexedEpoch;
+            indexedValues[key] = 0;
+        }
+        return indexedValues[key];
+    }
     size_t cap = large.empty() ? small.size() : large.size();
     Slot* slots = large.empty() ? small.data() : large.data();
     auto position = [](int k, size_t mask) { return (uint32_t(k) * 2654435761u) & mask; };
@@ -17,6 +35,20 @@ int64_t& BWScratchTable::operator[](int key) {
     }
     slots[pos].key = key; ++count;
     return slots[pos].value;
+}
+
+void BWScratchTable::borrowInitialFlags(DT& mesh) {
+    // Other algorithms may already own bit 28. Keep the ordinary scratch
+    // table in that case; a freshly initialized Delaunay mesh has zero flags.
+    for (size_t t = 0; t < mesh.Elems.size(); ++t)
+        if (mesh.Elems[t].info >= 0 && (mesh.Elems[t].info & (int64_t(1) << 28))) return;
+    initialMesh = &mesh;
+}
+
+void BWScratchTable::index(size_t size) {
+    indexedValues.resize(size);
+    indexedStamps.resize(size, 0);
+    if (!indexedEpoch) indexedEpoch = 1;
 }
 
 void BWScratchTable::grow() {
@@ -32,6 +64,18 @@ void BWScratchTable::grow() {
 }
 
 void BWScratchTable::clear() {
+    if (initialMesh) {
+        for (const auto& saved : savedFlags) initialMesh->Elems[saved.first].info = saved.second;
+        savedFlags.clear();
+        return;
+    }
+    if (indexedEpoch) {
+        if (++indexedEpoch == 0) {
+            std::fill(indexedStamps.begin(), indexedStamps.end(), 0);
+            indexedEpoch = 1;
+        }
+        return;
+    }
     // Retain common capacities; only shrink exceptional cavities. This avoids
     // allocating again when successive ordinary cavities straddle a size limit.
     if (!large.empty() && large.size() > std::max(size_t(512), count * 4)) {
@@ -164,6 +208,10 @@ int locateRequest(DT& m, BWPlan& p, int& tet) {
             const int b = m.Elems[tet].form[ib], c = m.Elems[tet].form[ic], d = m.Elems[tet].form[id];
             const double ori = GEOM_FUNC::orient3d(m.Nodes[b].pt, m.Nodes[c].pt, m.Nodes[d].pt, p.request.point.data());
             if (ori < 0) {
+                // Initial cells form a Delaunay triangulation: walk through a
+                // separating face immediately. Constrained/refinement requests
+                // keep the area-normalized choice on their general mesh.
+                if (p.request.info == 0) { nextFace = f; break; }
                 const double value = ori / std::max(m.calArea(m.Nodes[b].pt, m.Nodes[c].pt, m.Nodes[d].pt), 1e-30);
                 if (value < smallest) { smallest = value; nextFace = f; }
             } else if (ori == 0) {
@@ -281,9 +329,11 @@ BWStatus findBWCavity(DT& m, BWPlan& p) {
         // The mesh stays frozen until all plans in this batch are complete.
         for (int f = 0; f < 4; ++f) {
             const int node = m.Elems[tet].form[f];
-            int64_t& nodeFlags = p.nodeInfo[node];
-            if (!(nodeFlags & 2)) { nodeFlags |= 2; p.lockNodes.push_back(node); }
-            if (checkSpacing && !matchSize(m, p, node, nodeFlags)) return p.status = BWStatus::Rejected;
+            if (r.collectLockNodes || checkSpacing) {
+                int64_t& nodeFlags = p.nodeInfo[node];
+                if (r.collectLockNodes && !(nodeFlags & 2)) { nodeFlags |= 2; p.lockNodes.push_back(node); }
+                if (checkSpacing && !matchSize(m, p, node, nodeFlags)) return p.status = BWStatus::Rejected;
+            }
             const int next = m.getNeig(tet, f);
             int64_t* nextInfo = checkedTetInfo(m, p, next);
             if (!nextInfo) return p.status;
@@ -514,7 +564,10 @@ bool pairBWBoundary(BWPlan& p) {
     // must still reach the same nonmanifold and unpaired-edge checks.
     bool dense = p.faces.size() <= 60;
     if (dense) {
-        BWScratchTable localIds;
+        // All access/occupation lists are complete. Reuse this scratch table
+        // for local vertex IDs instead of constructing another hash per point.
+        BWScratchTable& localIds = p.nodeInfo;
+        localIds.clear();
         int vertexCount = 0;
         p.denseVertices.resize(p.faces.size());
         for (size_t i = 0; i < p.faces.size() && dense; ++i) {
@@ -578,7 +631,7 @@ bool pairBWBoundary(BWPlan& p) {
     return true;
 }
 
-BWStatus prepareBWFill(DT& m, BWPlan& p) {
+BWStatus prepareBWFill(DT& m, BWPlan& p, bool checkInitialVisibility) {
     if (p.status != BWStatus::Ready) return p.status;
     if (p.request.info == 3) {
         if (p.request.initShell > static_cast<int>(p.workingCavity.size())) return p.status = BWStatus::Rejected;
@@ -603,6 +656,15 @@ BWStatus prepareBWFill(DT& m, BWPlan& p) {
             int ia, ib, ic, id;
             DNC(face, ia, ib, ic, id);
             int b = m.Elems[tet].form[ib], c = m.Elems[tet].form[ic], d = m.Elems[tet].form[id];
+            if (checkInitialVisibility) {
+                // Ordinary Delaunay cavities are already star-shaped. Check
+                // while copying each boundary face; degeneracies fall back to
+                // the existing adjustment, including its volume threshold.
+                if (f.outside >= 0 && (p.tetInfo[f.outside] & cavityFlag)) return p.status = BWStatus::Rejected;
+                if (b != m.ghost && c != m.ghost && d != m.ghost &&
+                    GEOM_FUNC::orient3d(p.request.point.data(), m.Nodes[b].pt, m.Nodes[d].pt, m.Nodes[c].pt) <= m.minVolume_bw)
+                    return p.status = BWStatus::Rejected;
+            }
             if (b == m.ghost) { std::swap(b, d); std::swap(b, c); }
             else if (c == m.ghost) { std::swap(c, d); std::swap(c, b); }
             f.vertices = {{b, c, d}}; f.geo = m.Elems[tet].geo;
@@ -612,6 +674,28 @@ BWStatus prepareBWFill(DT& m, BWPlan& p) {
         }
     }
     if (p.faces.empty()) return p.status = BWStatus::Rejected;
+    // Check every replacement before allocating or committing anything. Cavity
+    // adjustment and volume retries must not bypass this shape-quality guard.
+    const bool optimizing = m.improve_step && p.request.info != 0;
+    if (optimizing || p.request.info == 2) {
+        double oldMinimum = DBL_MAX, newMinimum = DBL_MAX;
+        if (optimizing) for (int t : p.cavity) {
+            if (m.isvirtualtet(t) || m.ishulltet(t)) continue;
+            const int* v = m.Elems[t].form;
+            oldMinimum = std::min(oldMinimum, m.quality_sus(m.Nodes[v[0]].pt,
+                m.Nodes[v[1]].pt, m.Nodes[v[2]].pt, m.Nodes[v[3]].pt));
+        }
+        for (const BWFace& f : p.faces) {
+            if (f.geo == DT::virtualID ||
+                std::find(f.vertices.begin(), f.vertices.end(), m.ghost) != f.vertices.end()) continue;
+            const double q = m.quality_sus(p.request.point.data(), m.Nodes[f.vertices[0]].pt,
+                m.Nodes[f.vertices[1]].pt, m.Nodes[f.vertices[2]].pt);
+            if (!std::isfinite(q) || !(q > 0)) return p.status = BWStatus::Rejected;
+            newMinimum = std::min(newMinimum, q);
+        }
+        if (newMinimum != DBL_MAX && !acceptableInsertionQuality(oldMinimum, newMinimum, optimizing))
+            return p.status = BWStatus::Rejected;
+    }
     if (p.request.trackAccess && p.request.node >= 0 && p.request.node != m.ghost)
         appendWriteNode(p, p.request.node);
 

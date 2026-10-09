@@ -1,4 +1,5 @@
 #include "dt.h"
+#include "dt_geometry_guard.h"
 #include <exception>
 #include "spdlog/sinks/null_sink.h"
 
@@ -407,6 +408,9 @@ int DT::smoothPlanarBoundaryPoint(int n, double floor, BoundarySmoothWorkspace& 
         for (auto f : faces) {
             Eigen::Vector3d a(Nodes[f[0]].pt), b(Nodes[f[1]].pt), c(Nodes[f[2]].pt);
             Eigen::Vector3d before = (b - a).cross(c - a);
+            if (!pointOnBoundaryPlane(a.data(), b.data(), c.data(), position)) {
+                valid = false; break;
+            }
             if (f[0] == n) a = Eigen::Map<Eigen::Vector3d>(position);
             if (f[1] == n) b = Eigen::Map<Eigen::Vector3d>(position);
             if (f[2] == n) c = Eigen::Map<Eigen::Vector3d>(position);
@@ -558,6 +562,11 @@ int DT::smoothPeriodicBoundaryGroup(const std::vector<int>& group, double floor)
         for (const auto& f : faces) {
             const Eigen::Vector3d a(Nodes[f[0]].pt), b(Nodes[f[1]].pt), c(Nodes[f[2]].pt);
             const Eigen::Vector3d nextA(point(f[0])), nextB(point(f[1])), nextC(point(f[2]));
+            if (!pointOnBoundaryPlane(a.data(), b.data(), c.data(), nextA.data()) ||
+                !pointOnBoundaryPlane(a.data(), b.data(), c.data(), nextB.data()) ||
+                !pointOnBoundaryPlane(a.data(), b.data(), c.data(), nextC.data())) {
+                valid = false; break;
+            }
             if (!((b - a).cross(c - a).dot((nextB - nextA).cross(nextC - nextA)) > 0)) {
                 valid = false; break;
             }
@@ -2950,6 +2959,8 @@ int DT::canDestroyShortEdge(int iElm, int ia, int ib, double Threshold) {
 				else
 					p4 = point;
 			}
+			if (improve_step && !pointOnBoundaryPlane(Nodes[SurTris[tri].form[0]].pt,
+                Nodes[SurTris[tri].form[1]].pt, Nodes[SurTris[tri].form[2]].pt, target)) return 0;
 			if (containsPb)
 				continue;
 			if (p3 == -1 || p4 == -1)
@@ -3180,6 +3191,8 @@ int DT::destroyShortEdge(int iElm, int ia, int ib, double Threshold) {
 				else
 					p4 = point;
 			}
+			if (improve_step && !pointOnBoundaryPlane(Nodes[SurTris[tri].form[0]].pt,
+                Nodes[SurTris[tri].form[1]].pt, Nodes[SurTris[tri].form[2]].pt, target)) return 0;
 			if (containsPb)
 				continue;
 			if (p3 == -1 || p4 == -1)
@@ -4380,6 +4393,7 @@ int DT::checkFlipNormal(int p1, int p2, int p3, int p4) {
     const int ids[4] = {p1, p2, p3, p4};
     for (int id : ids)
         if (id < 0 || id >= static_cast<int>(Nodes.size())) return 0;
+    if (!pointOnBoundaryPlane(Nodes[p1].pt, Nodes[p2].pt, Nodes[p3].pt, Nodes[p4].pt)) return 0;
     const Vec origin(Nodes[p1].pt[0], Nodes[p1].pt[1], Nodes[p1].pt[2]);
     std::array<Vec, 4> points;
     double scale = 0;
@@ -4463,6 +4477,7 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
 
 	// An existing diagonal would merge distinct surface patches.
 	if (p3 < 0 || p4 < 0 || p3 == p4 || BndEdg.find(p3, p4)) return 0;
+    if (!checkFlipNormal(p1, p2, p3, p4)) return 0;
 
 	int ia = -1, ib = -1, ic = -1, id = -1;
 	int tet = -1, i1 = -1, i2 = -1;

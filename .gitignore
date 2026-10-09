@@ -33,8 +33,9 @@ CLAUDE.md
 SKILL.md
 copilot-instructions.md
 
-# Local analysis reports
-/docs/state-cleanup.md
+# Local analysis reports and tools
+/docs/
+/tools/
 
 # Ship dependency headers and licenses only
 /extern/eigen/*

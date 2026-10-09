@@ -390,18 +390,51 @@ struct SerialDelaunayInserter {
     BWPlan plan;
     std::vector<int> slots;
 
-    explicit SerialDelaunayInserter(DT& mesh) : mesh(mesh) {}
+    explicit SerialDelaunayInserter(DT& mesh) : mesh(mesh) {
+        plan.request.trackAccess = false;
+        plan.request.collectLockNodes = false;
+        plan.request.seeds.resize(1);
+        plan.tetInfo.borrowInitialFlags(mesh);
+    }
+
+    ~SerialDelaunayInserter() { plan.tetInfo.clear(); }
 
     void operator()(int node, int& hint) {
-        BWRequest request = makeBWRequest(mesh, node, {liveHint(mesh, hint)}, 0);
-        request.trackAccess = false;
-        planBW(mesh, request, plan);
+        // Reuse request storage: the initial pass only needs coordinates, the
+        // original node ID (symbolic perturbation), and one location hint.
+        plan.request.node = node;
+        plan.request.seeds[0] = liveHint(mesh, hint);
+        for (int axis = 0; axis < 3; ++axis) plan.request.point[axis] = mesh.Nodes[node].pt[axis];
+        plan.nodeInfo.index(mesh.Nodes.size());
+        if (findBWCavity(mesh, plan) == BWStatus::Ready &&
+            prepareBWFill(mesh, plan, true) != BWStatus::Ready) {
+            // A coplanar or constrained cavity needs the full correction path.
+            plan.status = BWStatus::Ready;
+            plan.cavity.clear(); plan.faces.clear(); plan.newElements.clear();
+            if (adjustBWCavity(mesh, plan) == BWStatus::Ready) prepareBWFill(mesh, plan);
+        }
         if (plan.status == BWStatus::Ready) {
             slots.clear();
-            for (size_t f = 0; f < plan.faces.size(); ++f) slots.push_back(mesh.addElem());
+            // Planning is complete and no reader is active. Reuse cavity cells
+            // directly; their vertices, geometry and boundary adjacency have
+            // already been copied into faces. Only the excess needs allocation
+            // or recycling. A constrained internal face must keep its old cell.
+            bool reuse = true;
+            for (const BWFace& face : plan.faces)
+                if (face.outside >= 0 && (plan.tetInfo[face.outside] & (int64_t(1) << 29))) { reuse = false; break; }
+            // Borrowed flags belong to live old cells. Restore before any of
+            // those slots can be overwritten or returned to the vacancy queue.
+            plan.tetInfo.clear();
+            const size_t reused = reuse ? std::min(plan.cavity.size(), plan.faces.size()) : 0;
+            slots.insert(slots.end(), plan.cavity.begin(), plan.cavity.begin() + reused);
+            for (size_t f = reused; f < plan.faces.size(); ++f) slots.push_back(mesh.addElem());
+            if (mesh.QuantityControl)
+                for (size_t i = 0; i < reused; ++i) --mesh.GeoNum[mesh.Elems[slots[i]].geo];
+            plan.cavity.erase(plan.cavity.begin(), plan.cavity.begin() + reused);
             commitBW(mesh, plan, node, slots);
             finishBW(mesh, plan);
         }
+        else plan.tetInfo.clear();
         recordInitialResult(mesh, plan, hint);
     }
 };
@@ -411,6 +444,9 @@ void insertDelaunayPointsSerial(DT& mesh, const std::vector<int>& order) {
     MeshStageLog stageLog(mesh, "Delaunay insertion", 2);
     if (order.size() <= 4) return;
     if (mesh.infolevel > 0) mesh.meshLogger->debug("Incremental insert points.");
+    // This batch uses only original input coordinates. Restore before AddBox,
+    // which inserts points outside minW/maxW, and before later mesh stages.
+    dt::GEOM_FUNC::PredicateFilterScope predicateFilter(mesh.minW, mesh.maxW);
     SerialDelaunayInserter insertSerial(mesh);
     int anchor = order[0];
     for (int i = 4; i < static_cast<int>(order.size()); ++i) insertSerial(order[i], anchor);

@@ -124,6 +124,7 @@ namespace dt {
 		int maxfliptime;
 		int optflipdeep = 3;
 		bool improve_step;
+        BWAcceptance bwAcceptance = BWAcceptance::Default;
 		bool ignoreIntersect = false;
 		bool modifyBnd = false;
 		bool addBoxFlag = false;
@@ -286,6 +287,10 @@ namespace dt {
         int tryTopologyRepair(const TopologyCandidate& candidate, double angleDegrees);
         int removebadtet(int& iElm, int thread_n = -1);
         int removebadtet_addPnt(int iElm);
+        // Extra interior repairs share a fixed budget across all optimization rounds.
+        size_t topologyInteriorPointBudget = 0, topologyInteriorCellBudget = 0;
+        double topologyInteriorQualityGoal = 0.2;
+        int insertInteriorRepair(int tet);
 		int findtet(int p[], std::vector<int> sph);
 		int matchtet(int p[], int t);
 

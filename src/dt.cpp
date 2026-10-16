@@ -53,9 +53,12 @@ void DT::resetMeshState() {
     for (auto& history : parallelFlipHistory) history.clear();
     parallelFlipCount.fill(0); parallelTopologyBatch = false;
     susIdleStates.clear(); serialBW.slots.clear();
+    topologyInteriorPointBudget = 0; topologyInteriorCellBudget = 0;
+    topologyInteriorQualityGoal = 0.2;
     ignoreIntersect = false; modifyBnd = false; addBoxFlag = false;
     tempfliptime = 0; initBWshell = 0; addst = 0; addstbnd = 0; AvgEdgLen = 0;
     minVolume_bw = 0; // Derived from the mesh/algorithm run.
+    bwAcceptance = BWAcceptance::Default;
 }
 
 int DT::dt_init(Mesh& mesh, Args& args)
@@ -67,7 +70,7 @@ int DT::dt_init(Mesh& mesh, Args& args)
 	spdlogoutfile(args.outlogfile);
     meshLogger->set_level(infolevel == 0 ? spdlog::level::err :
         infolevel == 1 ? spdlog::level::info : spdlog::level::debug);
-	if (infolevel > 0) meshLogger->info("Version 2026.10.09");
+	if (infolevel > 0) meshLogger->info("Version 2026.10.16");
     MeshStageLog initLog(*this, "Initialize");
     if (infolevel > 0)
         meshLogger->info("Input mesh: points={} segments={} triangles={} tets={}",
@@ -2761,27 +2764,41 @@ int DT::DealIntersect(int pa, int pb, int p1, int p2) {
 		Nodes[p2].space
 		);
 
+	// Resolve both edges before temporarily removing any constraints.
 	int e1 = BndEdg.get(pa, pb);
-	if (e1 == -1)
-		return -1;
-	BndEdg.erase(pa, pb);
-	for (int i = 0; i < SurEdgs[e1].face.size(); i++) {
-		int Fidx = SurEdgs[e1].face[i];
-		BndTri.erase(SurTris[Fidx].form[0], SurTris[Fidx].form[1], SurTris[Fidx].form[2]);
-	}
-
 	int e2 = BndEdg.get(p1, p2);
-	if (e2 == -1)
-		return -1;
-	BndEdg.erase(p1, p2);
-	for (int i = 0; i < SurEdgs[e2].face.size(); i++) {
-		int Fidx = SurEdgs[e2].face[i];
-		BndTri.erase(SurTris[Fidx].form[0], SurTris[Fidx].form[1], SurTris[Fidx].form[2]);
+	if (e1 < 0 || e2 < 0) return -1;
+	struct RestoreConstraints {
+		DT& mesh;
+		int first, second;
+		bool active = true;
+		RestoreConstraints(DT& m, int a, int b) : mesh(m), first(a), second(b) {}
+		void restore() {
+			if (!active) return;
+			for (int edge : {first, second}) {
+				mesh.BndEdg.add(mesh.SurEdgs[edge].iStart, mesh.SurEdgs[edge].iEnd, edge);
+				for (int face : mesh.SurEdgs[edge].face) {
+					const int* v = mesh.SurTris[face].form;
+					mesh.BndTri.add(v[0], v[1], v[2], face);
+				}
+			}
+			active = false;
+		}
+		~RestoreConstraints() { restore(); }
+	} constraints(*this, e1, e2);
+	for (int edge : {e1, e2}) {
+		BndEdg.erase(SurEdgs[edge].iStart, SurEdgs[edge].iEnd);
+		for (int face : SurEdgs[edge].face) {
+			const int* v = SurTris[face].form;
+			BndTri.erase(v[0], v[1], v[2]);
+		}
 	}
 
 	int newp = addNode(pnt[0], pnt[1], pnt[2], space);
 	std::vector<int> srchtet = { Nodes[pa].tet };
 	int addbw = BW_insert_vertex(newp, srchtet, 3);
+	// Attachment needs the complete boundary lookup, also on insertion failure.
+	constraints.restore();
 	if (addbw <= 0) {//BW_1,add bnd point
 		DelNod(newp);
 		return -1;
@@ -5963,6 +5980,8 @@ int DT::AttachPnt2Seg(int iNod,int targetE) {
 				SurTris[f[i]].parent = SurTris[f[(i - manifold) / 2]].parent;
 				for (int j = 0; j < 3; j++) {
 					int tempE = BndEdg.get(SurTris[f[i]].form[(j + 1) % 3], SurTris[f[i]].form[(j + 2) % 3]);
+					if (tempE < 0 || tempE >= static_cast<int>(SurEdgs.size()))
+						throw std::logic_error("Boundary attachment requires an existing edge");
 					//SurTris[f[i]].edgs[j] = tempE;
 					if (SurTris[f[i]].form[(j + 1) % 3] != iNod && SurTris[f[i]].form[(j + 2) % 3] != iNod) {
 						for (int k = 0; k < SurEdgs[tempE].face.size(); k++) {
@@ -5989,6 +6008,8 @@ int DT::AttachPnt2Seg(int iNod,int targetE) {
 				SurTris[f[i]].parent = SurTris[f[(i - manifold - 1) / 2]].parent;
 				for (int j = 0; j < 3; j++) {
 					int tempE = BndEdg.get(SurTris[f[i]].form[(j + 1) % 3], SurTris[f[i]].form[(j + 2) % 3]);
+					if (tempE < 0 || tempE >= static_cast<int>(SurEdgs.size()))
+						throw std::logic_error("Boundary attachment requires an existing edge");
 					//SurTris[f[i]].edgs[j] = tempE;
 					if (SurTris[f[i]].form[(j + 1) % 3] != iNod && SurTris[f[i]].form[(j + 2) % 3] != iNod) {
 						for (int k = 0; k < SurEdgs[tempE].face.size(); k++) {

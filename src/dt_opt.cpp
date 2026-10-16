@@ -1,4 +1,6 @@
 #include "dt.h"
+#include "dt_smoothing_guard.h"
+#include "dt_refinement_guard.h"
 #include "dt_geometry_guard.h"
 #include <exception>
 #include "spdlog/sinks/null_sink.h"
@@ -89,6 +91,16 @@ int DT::MeshImprove(Args& args) {
 int DT::improve_init(Args& args) {
 	//"Initialize Quality Field,3 times should be sufficient.
 	improve_step = 1;//tell dt it is improving now;
+    size_t physicalCells = 0, livePoints = 0;
+    for (int t = 0; t < static_cast<int>(Elems.size()); ++t)
+        if (!isDelEle(t) && !isvirtualtet(t) && !ishulltet(t)) ++physicalCells;
+    for (int n = 0; n < static_cast<int>(Nodes.size()); ++n)
+        if (!isDelNod(n) && n != ghost) ++livePoints;
+    // These limits apply only to the newly enabled mixed/interior repairs,
+    // and are initialized once, never replenished at the start of a round.
+    topologyInteriorPointBudget = livePoints / 400;
+    topologyInteriorCellBudget = physicalCells / 200;
+
 
 	for (int i = 0; i < EdgSteiner.size(); i++)
 		setbndpnt(EdgSteiner[i].first);
@@ -624,6 +636,7 @@ int DT::OptSizeControl_yunbo(double lamasize,
         int EdgeID;
         int geoID;
         double len;
+        bool feature;
     };
     // Reuse capacity between rounds; contents describe only the frozen scan below.
     std::vector<splitSort> waitsplit;
@@ -643,10 +656,11 @@ int DT::OptSizeControl_yunbo(double lamasize,
 
 	for (int loop = 0; loop < nLoop; loop++) {
         // 1. Optimize before evaluating any size/count targets.
+        improve_step = true;
 
 		updateminVolume();
 
-		flipEdgPass(1);
+		flipEdgPass(2);
 
 		improve_Metric = SUS_METRIC;
 		prepareQuality();
@@ -656,10 +670,17 @@ int DT::OptSizeControl_yunbo(double lamasize,
         // Evaluate before refinement can replace this cell or invalidate its ID.
         const bool worstNeedsOptimization = needsTopologyInsertion(worstTet, args.optanglestrict);
 
-        // 2. Snapshot counts, then collect boundary splits without changing the mesh.
-		improve_step = false;
+        // 2. Refinement changes acceptance, not quality-cache maintenance.
+        struct RestoreAcceptance {
+            BWAcceptance& value;
+            BWAcceptance saved;
+            ~RestoreAcceptance() { value = saved; }
+        } restoreAcceptance{bwAcceptance, bwAcceptance};
+        bwAcceptance = BWAcceptance::VolumeOnly;
+        improve_step = true;
 		GeoNum.clear();
-		for (int i = 0; i < Elems.size(); i++) {
+		int n = Elems.size();
+		for (int i = 0; i < n; i++) {
 			if (isDelEle(i) || ishulltet(i) || isvirtualtet(i))
 				continue;
 			GeoNum[Elems[i].geo]++;
@@ -677,14 +698,15 @@ int DT::OptSizeControl_yunbo(double lamasize,
         boundarySelected.assign(SurEdgs.size(), 0);
         boundaryLength.assign(SurEdgs.size(), -1.0);
 
-		for (int i = 0; i < Elems.size(); i++) {
+		n = Elems.size();
+		for (int i = 0; i < n; i++) {
 			if (isDelEle(i) || ishulltet(i) || isvirtualtet(i))
 				continue;
 
 			int geoID = Elems[i].geo;
 
-			double maxEdgLen = 0;
-            int maxBoundaryEdge = -1;
+            double maxBoundaryLength[2] = {0, 0};
+            int maxBoundaryEdge[2] = {-1, -1};
 			for (int j = 0; j < 6; j++) {
 				int p1 = Elems[i].form[Egid[j][0]];
 				int p2 = Elems[i].form[Egid[j][1]];
@@ -693,21 +715,22 @@ int DT::OptSizeControl_yunbo(double lamasize,
                 const int* entry = BndEdg.find(p1, p2);
                 if (!entry) continue;
                 const int edge = *entry;
+                if (isDelSurEdg(edge) || lockE.count(edge)) continue;
                 double& dis = boundaryLength[edge];
                 if (dis < 0) dis = distance(Nodes[p1].pt, Nodes[p2].pt);
-                if (dis > maxEdgLen) {
-                    maxEdgLen = dis;
-                    maxBoundaryEdge = edge;
+                const int kind = SurEdgs[edge].constrain > 0 ? 1 : 0;
+                if (dis > maxBoundaryLength[kind]) {
+                    maxBoundaryLength[kind] = dis;
+                    maxBoundaryEdge[kind] = edge;
                 }
 			}
 
-            const bool ifsplit = needsSplit(geoID, maxEdgLen);
-
-            if (ifsplit && maxBoundaryEdge != -1) {
-                if (isDelSurEdg(maxBoundaryEdge)) continue;
-                // Preserve duplicate tet-origin candidates and their sorting order.
-                waitsplit.push_back({ maxBoundaryEdge, geoID, maxEdgLen });
-                boundarySelected[maxBoundaryEdge] = 1;
+            // A longer ordinary edge must not hide a feature-edge candidate.
+            for (int kind = 1; kind >= 0; --kind) {
+                const int edge = maxBoundaryEdge[kind];
+                if (edge < 0 || !needsSplit(geoID, maxBoundaryLength[kind])) continue;
+                waitsplit.push_back({ edge, geoID, maxBoundaryLength[kind], kind == 1 });
+                boundarySelected[edge] = 1;
             }
 		}
 		
@@ -729,7 +752,7 @@ int DT::OptSizeControl_yunbo(double lamasize,
                     if (count == facetNum.end() || count->second <= 0 || FacetNum[fid] >= count->second)
                         continue;
                 }
-                waitsplit.push_back({ i, -fid, dis });
+                waitsplit.push_back({ i, -fid, dis, SurEdgs[i].constrain > 0 });
                 break;
 			}
 		}
@@ -737,6 +760,7 @@ int DT::OptSizeControl_yunbo(double lamasize,
 		// °´ len µÝÔöÅÅÐò
 		std::sort(waitsplit.begin(), waitsplit.end(),
 			[](const splitSort& a, const splitSort& b) {
+                if (a.feature != b.feature) return a.feature > b.feature;
 				return a.len > b.len;
 			});
 
@@ -744,6 +768,7 @@ int DT::OptSizeControl_yunbo(double lamasize,
 		int stop = 0;
 
 		for (auto it : waitsplit) {
+            if (isDelSurEdg(it.EdgeID) || lockE.count(it.EdgeID)) continue;
 			if (it.geoID>0 && elementNum[it.geoID]>0 && GeoNum[it.geoID] > elementNum[it.geoID])
 				continue;
 			if (it.geoID < 0) {
@@ -751,22 +776,24 @@ int DT::OptSizeControl_yunbo(double lamasize,
 				if (facetNum[fid]>0 && FacetNum[fid] > facetNum[fid])
 					continue;
 			}
-			splitEdg(it.EdgeID);
-			stop++;
+            if (splitEdg(it.EdgeID) > 0) ++stop;
 		}
 
-        // 4. Recount after boundary attempts; a failed split can still touch state.
-        // With no calls, the first count is still valid.
+        // 4. Recount after successful boundary splits.
         if (stop != 0) {
             GeoNum.clear();
-            for (int i = 0; i < Elems.size(); i++) {
+			n = Elems.size();
+			for (int i = 0; i < n; i++) {
                 if (isDelEle(i) || ishulltet(i) || isvirtualtet(i)) continue;
                 GeoNum[Elems[i].geo]++;
             }
         }
-        // 5. Visit live tet IDs in order, including new IDs appended by BW insertion.
-
-		for (int i = 0; i < Elems.size(); i++) {
+        // 5. Protect nearby boundary edges only for size-driven interior candidates.
+        RefinementBoundaryEdges refinementBoundary(*this);
+        int redirected = 0, boundarySplits = 0;
+        // Freeze the scan limit after boundary refinement; appended IDs wait.
+		n = Elems.size();
+		for (int i = 0; i < n; i++) {
 			if (isDelEle(i) || ishulltet(i) || isvirtualtet(i))
 				continue;
 
@@ -788,11 +815,22 @@ int DT::OptSizeControl_yunbo(double lamasize,
 
             const bool ifsplit = needsSplit(geoID, maxEdgLen);
 
-			if (ifsplit) {
+			if (ifsplit && maxEdgIdx >= 0) {
 				int p1 = Elems[i].form[Egid[maxEdgIdx][0]];
 				int p2 = Elems[i].form[Egid[maxEdgIdx][1]];
 
 				double addV[3] = { 0.5 * (Nodes[p1].pt[0] + Nodes[p2].pt[0]), 0.5 * (Nodes[p1].pt[1] + Nodes[p2].pt[1]), 0.5 * (Nodes[p1].pt[2] + Nodes[p2].pt[2]) };
+                const int boundaryEdge = refinementBoundary.nearby(addV, maxEdgLen, geoID);
+                if (boundaryEdge >= 0) {
+                    ++redirected;
+                    if (!refinementBoundary.protectedEdge(boundaryEdge) && splitEdg(boundaryEdge) > 0) {
+                        ++boundarySplits;
+                        ++stop;
+                    }
+                    // Never fall back to this near-edge interior point after a failed split.
+                    // A successful split can invalidate i, so continue without accessing it.
+                    continue;
+                }
 
 				int iNod = addNode(addV[0], addV[1], addV[2], Nodes[p1].space * 0.5 + Nodes[p2].space * 0.5);
 
@@ -817,11 +855,18 @@ int DT::OptSizeControl_yunbo(double lamasize,
 			}
 		}
 
+        if (infolevel > 0) meshLogger->info("Refine near boundary edges: redirected={} split={} deferred={}",
+            redirected, boundarySplits, redirected - boundarySplits);
 		if (stop < 10 && !worstNeedsOptimization)
 			break;
 		improve_step = true;
 	}
 
+    improve_step = true;
+    improve_Metric = SUS_METRIC;
+    prepareQuality();
+    // Include moderately good cells in the final sweep; the transaction guards both means.
+    SmoothPass(std::min(3, std::max(1, args.optloop / 3)), std::max(0.5, improve_goal));
 	return 1;
 }
 
@@ -1051,7 +1096,7 @@ void DT::updateminVolume(void) {
     std::vector<double> minima(workers, 1e-10);
 #pragma omp parallel num_threads(workers) if(workers > 1)
     {
-        double localMin = 1e-10;
+        double localMin = 1e-14;
 #pragma omp for schedule(static)
         for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
             if (isDelEle(t) || ishulltet(t) || isvirtualtet(t)) continue;
@@ -1075,7 +1120,29 @@ int DT::SmoothPass(int nloop, double improve_goal) {
         if (n >= 0 && n < static_cast<int>(Nodes.size())) periodicMembers[n] = 1;
     long long success = 0, attempts = 0;
     long long periodicSuccess = 0, periodicAttempts = 0;
+    int rolledBack = 0;
+    const bool checkQuality = improve_Metric == SUS_METRIC || improve_Metric == 2;
+    std::vector<int> physicalCells, liveNodes;
+    if (checkQuality) {
+        for (int t = 0; t < static_cast<int>(Elems.size()); ++t)
+            if (!isDelEle(t) && !ishulltet(t) && !isvirtualtet(t)) physicalCells.push_back(t);
+        for (int n = 0; n < static_cast<int>(Nodes.size()); ++n)
+            if (n != ghost && !isDelNod(n)) liveNodes.push_back(n);
+    }
+    std::vector<std::array<double, 3>> savedPositions;
+    std::vector<double> savedQualities;
     for (int loop = 0; loop < nloop; ++loop) {
+        const auto beforeQuality = measureSmoothingQuality(*this, physicalCells);
+        const bool transactional = checkQuality && beforeQuality.valid;
+        const long long savedSuccess = success, savedPeriodicSuccess = periodicSuccess;
+        if (transactional) {
+            savedPositions.resize(liveNodes.size());
+            savedQualities.resize(physicalCells.size());
+            for (size_t i = 0; i < liveNodes.size(); ++i)
+                std::copy(Nodes[liveNodes[i]].pt, Nodes[liveNodes[i]].pt + 3, savedPositions[i].begin());
+            for (size_t i = 0; i < physicalCells.size(); ++i) savedQualities[i] = Elems[physicalCells[i]].q;
+        }
+
         // Both point algorithms preserve the same immutable global SUS floor.
         double minimumQualityFloor = DBL_MAX;
         for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
@@ -1128,9 +1195,26 @@ int DT::SmoothPass(int nloop, double improve_goal) {
                 periodicSuccess += smoothPeriodicBoundaryGroup(group, minimumQualityFloor) == 1;
             }
         }
+        if (transactional) {
+            const auto afterQuality = measureSmoothingQuality(*this, physicalCells);
+            if (!smoothingImprovesQuality(beforeQuality, afterQuality)) {
+                for (size_t i = 0; i < liveNodes.size(); ++i)
+                    std::copy(savedPositions[i].begin(), savedPositions[i].end(), Nodes[liveNodes[i]].pt);
+                for (size_t i = 0; i < physicalCells.size(); ++i) Elems[physicalCells[i]].q = savedQualities[i];
+                // Idle neighborhoods observed in a discarded sweep must not suppress retries.
+                for (auto& state : susIdleStates) state = SusIdleState{};
+                success = savedSuccess; periodicSuccess = savedPeriodicSuccess;
+                ++rolledBack;
+                if (infolevel > 0) meshLogger->info(
+                    "Smooth rollback: meanShape={:.9g}->{:.9g} meanMinAngleDeg={:.9g}->{:.9g}",
+                    beforeQuality.meanShape(), afterQuality.meanShape(),
+                    RADIO2ANGLE(beforeQuality.meanAngle()), RADIO2ANGLE(afterQuality.meanAngle()));
+                break;
+            }
+        }
     }
     if (infolevel > 0) {
-        meshLogger->info("Smooth: {}/{}", success, attempts);
+        meshLogger->info("Smooth: {}/{} rolledBack={}", success, attempts, rolledBack);
         if (!periodicGroups.empty())
             meshLogger->info("Smooth periodic groups: {}/{}", periodicSuccess, periodicAttempts);
     }
@@ -1312,6 +1396,7 @@ int DT::TopologicalPass(double improve_goal, double insert_angle_degrees, int nl
     MeshStageLog stageLog(*this, "Topology", 2);
     if (!std::isfinite(insert_angle_degrees) || insert_angle_degrees < 0 || insert_angle_degrees > 180)
         throw std::invalid_argument("Topology insertion angle must be in [0, 180] degrees");
+    topologyInteriorQualityGoal = improve_goal;
     size_t totalSuccess = 0, totalCandidates = 0;
     for (int loop = 0; loop < nloop; ++loop) {
         std::vector<TopologyCandidate> candidates;
@@ -1858,14 +1943,88 @@ int DT::removebadtet_addPnt(int iElm) {
 #endif
 	}
     else {
-        // The current insertion strategy handles cells with four boundary vertices.
-        return 0;
+        return insertInteriorRepair(iElm);
     }
 
 	if (isDelEle(iElm) || Elems[iElm].form[0] != p0 || Elems[iElm].form[1] != p1 || Elems[iElm].form[2] != p2 || Elems[iElm].form[3] != p3)
 		return 1;
 
 	return 0;
+}
+
+// Preview a constrained BW cavity before allocating a node or committing cells.
+// This path never splits boundary edges or moves existing boundary vertices.
+int DT::insertInteriorRepair(int tet) {
+    if (parallelTopologyBatch || omp_in_parallel())
+        throw std::logic_error("Interior repair must run outside a parallel region");
+    if (!improve_step || improve_Metric != SUS_METRIC || !AniSol.empty() ||
+        topologyInteriorPointBudget == 0 || topologyInteriorCellBudget == 0 ||
+        !std::isfinite(topologyInteriorQualityGoal) || !(topologyInteriorQualityGoal > 0) || tet < 0 || tet >= static_cast<int>(Elems.size()) ||
+        isDelEle(tet) || isvirtualtet(tet) || ishulltet(tet)) return 0;
+    const auto target = topologyCandidate(tet);
+    std::array<int, 6> order = {{0,1,2,3,4,5}};
+    std::array<double, 6> lengths;
+    for (int e = 0; e < 6; ++e)
+        lengths[e] = distance2(Nodes[target.form[Egid[e][0]]].pt, Nodes[target.form[Egid[e][1]]].pt);
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        return lengths[a] == lengths[b] ? a < b : lengths[a] > lengths[b];
+    });
+    BWPlan& plan = serialBW.plan;
+    for (int edge : order) {
+        const int a = target.form[Egid[edge][0]], b = target.form[Egid[edge][1]];
+        if (isBndEdg(a,b) || !(lengths[edge] > 0)) continue;
+        BWRequest request;
+        request.info = 1; request.trackAccess = false;
+        request.seeds.push_back(tet); request.initShell = initBWshell;
+        request.space = (Nodes[a].space + Nodes[b].space) * 0.5;
+        for (int k = 0; k < 3; ++k)
+            request.point[k] = Nodes[a].pt[k] + (Nodes[b].pt[k] - Nodes[a].pt[k]) * 0.5;
+        if (planBW(*this, request, plan) != BWStatus::Ready) continue;
+        if (std::find(plan.cavity.begin(), plan.cavity.end(), tet) == plan.cavity.end()) continue;
+        // Reject cross-region cavities and enforce the remaining growth budget.
+        const int region = Elems[tet].geo;
+        bool valid = true;
+        for (int t : plan.cavity)
+            if (isvirtualtet(t) || ishulltet(t) || Elems[t].geo != region) { valid = false; break; }
+        for (const BWFace& face : plan.faces)
+            if (face.geo != region) { valid = false; break; }
+        if (!valid) continue;
+        const size_t growth = plan.faces.size() > plan.cavity.size()
+            ? plan.faces.size() - plan.cavity.size() : 0;
+        if (growth > topologyInteriorCellBudget) continue;
+        double oldMin = DBL_MAX, newMin = DBL_MAX, oldPenalty = 0, newPenalty = 0;
+        size_t oldBad = 0, newBad = 0;
+        const double goal = topologyInteriorQualityGoal;
+        auto measure = [&](double q, double& minimum, double& penalty, size_t& bad) {
+            minimum = std::min(minimum,q);
+            if (q < goal) { ++bad; const double deficit = 1 - q / goal; penalty += deficit * deficit; }
+        };
+        for (int t : plan.cavity) {
+            const int* v = Elems[t].form;
+            measure(quality_sus(Nodes[v[0]].pt,Nodes[v[1]].pt,Nodes[v[2]].pt,Nodes[v[3]].pt),
+                oldMin,oldPenalty,oldBad);
+        }
+        for (const BWFace& face : plan.faces)
+            measure(quality_sus(request.point.data(),Nodes[face.vertices[0]].pt,
+                Nodes[face.vertices[1]].pt,Nodes[face.vertices[2]].pt),newMin,newPenalty,newBad);
+        // A point must improve the entire cavity, not just replace the target.
+        if (!(newMin > oldMin + std::max(1e-12,oldMin * 0.01)) || newBad > oldBad ||
+            !(newPenalty < oldPenalty * 0.95)) continue;
+        std::vector<int>& slots = serialBW.slots;
+        slots.clear(); slots.reserve(plan.faces.size());
+        const int node = addNode(request.point[0],request.point[1],request.point[2],request.space);
+        try {
+            for (size_t i = 0; i < plan.faces.size(); ++i) slots.push_back(addElem());
+        } catch (...) {
+            for (int slot : slots) DelEle(slot);
+            DelNod(node); throw;
+        }
+        commitBW(*this,plan,node,slots); finishBW(*this,plan);
+        --topologyInteriorPointBudget; topologyInteriorCellBudget -= growth;
+        smoothInteriorPoint(node);
+        return 1;
+    }
+    return 0;
 }
 
 //find tet have p0,p1,p2,p3

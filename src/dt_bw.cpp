@@ -282,6 +282,7 @@ bool matchSize(DT& m, BWPlan& p, int node, int64_t& flags) {
 BWRequest makeBWRequest(DT& m, int node, const std::vector<int>& seeds, int info) {
     BWRequest r;
     r.node = node; r.seeds = seeds; r.info = info; r.initShell = m.initBWshell;
+    r.acceptance = m.bwAcceptance;
     for (int i = 0; i < 3; ++i) r.point[i] = m.Nodes[node].pt[i];
     r.space = m.Nodes[node].space; r.boundary = m.isbndpnt(node);
     r.anisotropic = !m.AniSol.empty();
@@ -674,10 +675,21 @@ BWStatus prepareBWFill(DT& m, BWPlan& p, bool checkInitialVisibility) {
         }
     }
     if (p.faces.empty()) return p.status = BWStatus::Rejected;
-    // Check every replacement before allocating or committing anything. Cavity
-    // adjustment and volume retries must not bypass this shape-quality guard.
-    const bool optimizing = m.improve_step && p.request.info != 0;
-    if (optimizing || p.request.info == 2) {
+    // Refinement checks signed volume only; optimization retains its shape guard.
+    // Keep this independent of improve_step, which also updates quality caches.
+    const bool volumeOnly = p.request.acceptance == BWAcceptance::VolumeOnly;
+    if (volumeOnly) {
+        for (const BWFace& f : p.faces) {
+            if (f.geo == DT::virtualID ||
+                std::find(f.vertices.begin(), f.vertices.end(), m.ghost) != f.vertices.end()) continue;
+            const double volume = GEOM_FUNC::orient3d(p.request.point.data(),
+                m.Nodes[f.vertices[0]].pt, m.Nodes[f.vertices[2]].pt, m.Nodes[f.vertices[1]].pt);
+            if (!std::isfinite(volume) || !(volume > std::max(0.0, m.minVolume_bw)))
+                return p.status = BWStatus::Rejected;
+        }
+    }
+    const bool optimizing = !volumeOnly && m.improve_step && p.request.info != 0;
+    if (!volumeOnly && (optimizing || p.request.info == 2)) {
         double oldMinimum = DBL_MAX, newMinimum = DBL_MAX;
         if (optimizing) for (int t : p.cavity) {
             if (m.isvirtualtet(t) || m.ishulltet(t)) continue;

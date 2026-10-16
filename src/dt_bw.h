@@ -11,6 +11,9 @@ class DT;
 
 enum class BWStatus { Ready, Inserted, Duplicate, Rejected, RetryConflict, Stale };
 
+// Size refinement must not inherit the optimization shape-quality threshold.
+enum class BWAcceptance { Default, VolumeOnly };
+
 // A request owns candidate data; node == -1 denotes an unallocated point.
 struct BWRequest {
     int node = -1;
@@ -25,6 +28,7 @@ struct BWRequest {
     // Refinement only: commit writes the new node; finishBW serially updates old-node P2T.
     bool deferP2T = false;
     int info = 0;
+    BWAcceptance acceptance = BWAcceptance::Default;
     int initShell = 0;
     std::vector<int> seeds;
     // Optional borrowed membership from a frozen BndTri table, for info == 2.

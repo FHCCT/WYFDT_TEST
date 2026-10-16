@@ -883,21 +883,21 @@ namespace dt {
 			eindex = findex = 0;
 			if ((fnow > enow) == (fnow > -enow)) {
 				Q = enow;
-				enow = e[++eindex];
+				if (++eindex < elen) enow = e[eindex];
 			}
 			else {
 				Q = fnow;
-				fnow = f[++findex];
+				if (++findex < flen) fnow = f[findex];
 			}
 			hindex = 0;
 			if ((eindex < elen) && (findex < flen)) {
 				if ((fnow > enow) == (fnow > -enow)) {
 					Fast_Two_Sum(enow, Q, Qnew, hh);
-					enow = e[++eindex];
+					if (++eindex < elen) enow = e[eindex];
 				}
 				else {
 					Fast_Two_Sum(fnow, Q, Qnew, hh);
-					fnow = f[++findex];
+					if (++findex < flen) fnow = f[findex];
 				}
 				Q = Qnew;
 				if (hh != 0.0) {
@@ -906,11 +906,11 @@ namespace dt {
 				while ((eindex < elen) && (findex < flen)) {
 					if ((fnow > enow) == (fnow > -enow)) {
 						Two_Sum(Q, enow, Qnew, hh);
-						enow = e[++eindex];
+						if (++eindex < elen) enow = e[eindex];
 					}
 					else {
 						Two_Sum(Q, fnow, Qnew, hh);
-						fnow = f[++findex];
+						if (++findex < flen) fnow = f[findex];
 					}
 					Q = Qnew;
 					if (hh != 0.0) {
@@ -920,7 +920,7 @@ namespace dt {
 			}
 			while (eindex < elen) {
 				Two_Sum(Q, enow, Qnew, hh);
-				enow = e[++eindex];
+				if (++eindex < elen) enow = e[eindex];
 				Q = Qnew;
 				if (hh != 0.0) {
 					h[hindex++] = hh;
@@ -928,7 +928,7 @@ namespace dt {
 			}
 			while (findex < flen) {
 				Two_Sum(Q, fnow, Qnew, hh);
-				fnow = f[++findex];
+				if (++findex < flen) fnow = f[findex];
 				Q = Qnew;
 				if (hh != 0.0) {
 					h[hindex++] = hh;

@@ -7,15 +7,18 @@ namespace dt {
 // Measure the exported geometric qualities, never the SUS objective or a cache.
 struct SmoothingQuality {
     size_t count = 0;
-    long double shapeSum = 0, angleSum = 0;
-    double minShape = DBL_MAX, minAngle = DBL_MAX;
+    long double shapeSum = 0, angleSum = 0, jacobianSum = 0;
+    double minShape = DBL_MAX, minAngle = DBL_MAX, minJacobian = DBL_MAX;
     bool valid = true;
+    bool angleJacobian = false;
+    double meanJacobian() const { return count ? static_cast<double>(jacobianSum / count) : 0; }
     double meanShape() const { return count ? static_cast<double>(shapeSum / count) : 0; }
     double meanAngle() const { return count ? static_cast<double>(angleSum / count) : 0; }
 };
 
 inline SmoothingQuality measureSmoothingQuality(DT& mesh, const std::vector<int>& cells) {
     SmoothingQuality result;
+    result.angleJacobian = mesh.optimizationPolicy.enabled;
     std::vector<double> angles;
     for (int t : cells) {
         if (mesh.isDelEle(t) || mesh.ishulltet(t) || mesh.isvirtualtet(t)) continue;
@@ -29,6 +32,12 @@ inline SmoothingQuality measureSmoothingQuality(DT& mesh, const std::vector<int>
             result.valid = false;
             return result;
         }
+        const double jacobian = mesh.ScaledJacobian(a, b, c, d);
+        if (result.angleJacobian && (!(jacobian > 0) || !std::isfinite(jacobian))) {
+            result.valid = false; return result;
+        }
+        result.jacobianSum += jacobian;
+        result.minJacobian = std::min(result.minJacobian, jacobian);
         ++result.count;
         result.shapeSum += shape;
         result.angleSum += lo;
@@ -44,6 +53,13 @@ inline double smoothingTolerance(double value) {
 }
 
 inline bool smoothingPreservesQuality(const SmoothingQuality& before, const SmoothingQuality& after) {
+    if (before.angleJacobian && after.angleJacobian)
+        return before.valid && after.valid && before.count == after.count &&
+            after.meanAngle() + ANGLE2RADIO(1e-10) >= before.meanAngle() &&
+            after.meanJacobian() + 1e-12 >= before.meanJacobian() &&
+            after.minAngle + ANGLE2RADIO(1e-10) >= before.minAngle &&
+            after.minJacobian + 1e-12 >= before.minJacobian;
+
     return before.valid && after.valid && before.count == after.count &&
         after.meanShape() >= before.meanShape() - smoothingTolerance(before.meanShape()) &&
         after.meanAngle() >= before.meanAngle() - smoothingTolerance(before.meanAngle()) &&
@@ -52,6 +68,11 @@ inline bool smoothingPreservesQuality(const SmoothingQuality& before, const Smoo
 }
 
 inline bool smoothingImprovesQuality(const SmoothingQuality& before, const SmoothingQuality& after) {
+    if (before.angleJacobian && after.angleJacobian)
+        return smoothingPreservesQuality(before, after) &&
+            (after.meanAngle() > before.meanAngle() + ANGLE2RADIO(1e-10) ||
+             after.meanJacobian() > before.meanJacobian() + 1e-12);
+
     return smoothingPreservesQuality(before, after) &&
         (after.meanShape() > before.meanShape() + smoothingTolerance(before.meanShape()) ||
          after.meanAngle() > before.meanAngle() + smoothingTolerance(before.meanAngle()));

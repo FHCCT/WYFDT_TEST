@@ -31,6 +31,15 @@ struct BWRequest {
     BWAcceptance acceptance = BWAcceptance::Default;
     int initShell = 0;
     std::vector<int> seeds;
+    // Source segment identity belongs to this insertion, including frozen workers.
+    // Initially a midpoint; bounded searches may move it inside the same segment.
+    // A face containing both endpoints contains every such point exactly.
+    std::array<int, 2> midpointEdge{{-1, -1}};
+    bool midpointOnFace(int a, int b, int c) const {
+        if (midpointEdge[0] < 0 || midpointEdge[1] < 0 || midpointEdge[0] == midpointEdge[1]) return false;
+        return (a == midpointEdge[0] || b == midpointEdge[0] || c == midpointEdge[0]) &&
+            (a == midpointEdge[1] || b == midpointEdge[1] || c == midpointEdge[1]);
+    }
     // Optional borrowed membership from a frozen BndTri table, for info == 2.
     // The owner must outlive all plans; never retain it in asynchronous work.
     const std::vector<uint8_t>* boundaryNodes = nullptr;
@@ -119,6 +128,9 @@ BWStatus prepareBWFill(DT& mesh, BWPlan& plan, bool checkInitialVisibility = fal
 // Internal adjacency builder, also exercised independently by regression tests.
 bool pairBWBoundary(BWPlan& plan);
 BWStatus planBW(DT& mesh, const BWRequest& request, BWPlan& plan);
+// Isotropic edge points only: retry poor/failed candidates at bounded positions.
+// Planning stays read-only; commitBW installs the chosen position and size.
+BWStatus planBWOnEdge(DT& mesh, const BWRequest& request, BWPlan& plan);
 
 // Caller freezes topology throughout planning, selects independent plans, and
 // allocates every node/element slot before any worker enters commitBW.

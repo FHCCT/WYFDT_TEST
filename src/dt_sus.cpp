@@ -513,6 +513,25 @@ int dt::DT::smooth_sus(int iNod, double minimumQualityFloor) {
 // Quality-driven interior smoothing must enter here, including topology repair.
 // Other legacy metrics retain their previous SUS fallback.
 int dt::DT::smoothInteriorPoint(int iNod, double minimumQualityFloor) {
+    if (optimizationPolicy.enabled) {
+        if (iNod < 0 || iNod >= static_cast<int>(Nodes.size()) || iNod == ghost ||
+            isDelNod(iNod) || isbndpnt(iNod)) return 0;
+        std::vector<int> star; findSphere(iNod, star);
+        const auto before = measureOptimizationQuality(*this, &star);
+        if (!before.valid) return 0;
+        std::array<double, 3> origin; std::copy(Nodes[iNod].pt, Nodes[iNod].pt + 3, origin.begin());
+        std::vector<double> qualities; qualities.reserve(star.size());
+        for (int t : star) qualities.push_back(Elems[t].q);
+        const int result = smooth_sus(iNod, 1e-12);
+        if (result != 1) return result;
+        const auto after = measureOptimizationQuality(*this, &star);
+        if (optimizationPointAccept(optimizationPolicy, before, after) &&
+            optimizationPolicy.moveAllowed(*this, iNod, Nodes[iNod].pt)) return 1;
+        std::copy(origin.begin(), origin.end(), Nodes[iNod].pt);
+        for (size_t i = 0; i < star.size(); ++i) Elems[star[i]].q = qualities[i];
+        susIdleStates[iNod] = SusIdleState{};
+        return 0;
+    }
     if (improve_Metric == 2) return smooth_angle(iNod, minimumQualityFloor);
     return smooth_sus(iNod, minimumQualityFloor);
 }

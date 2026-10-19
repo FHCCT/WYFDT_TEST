@@ -786,6 +786,18 @@ void DT::getMeshEdgebyGeo(Mesh& mesh) {
 }
 //--------------------- Mesh Quality ---------------------
 double DT::tetquality(double v1[3], double v2[3], double v3[3], double v4[3], double* AniMetric, int qualmeasure) {
+    if (optimizationPolicy.enabled && optimizationPolicy.inTopology) {
+        if (!optimizationPolicy.tetAllowed(v1, v2, v3, v4)) return 0;
+        double low = 0, high = 0; std::vector<double> angles;
+        if (!CalDihedral(v1, v2, v4, v3, low, high, angles) ||
+            RADIO2ANGLE(low) + 1e-10 < optimizationPolicy.angleFloor ||
+            ScaledJacobian(v1, v2, v3, v4) + 1e-12 < optimizationPolicy.jacobianFloor) return 0;
+    }
+    if (qualmeasure == ANGLE_JACOBIAN_METRIC) {
+        double low = 0, high = 0; std::vector<double> angles;
+        if (!CalDihedral(v1, v2, v4, v3, low, high, angles)) return 0;
+        return angleJacobianQuality(low / std::acos(1.0 / 3.0), ScaledJacobian(v1, v2, v3, v4));
+    }
 	if (qualmeasure == SUS_METRIC) return quality_sus(v1, v2, v3, v4);
 
 	double quality = 0;

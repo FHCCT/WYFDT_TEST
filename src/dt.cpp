@@ -59,6 +59,8 @@ void DT::resetMeshState() {
     tempfliptime = 0; initBWshell = 0; addst = 0; addstbnd = 0; AvgEdgLen = 0;
     minVolume_bw = 0; // Derived from the mesh/algorithm run.
     bwAcceptance = BWAcceptance::Default;
+    optimizationPolicy = OptimizationPolicy{};
+    improve_Metric = SUS_METRIC;
 }
 
 int DT::dt_init(Mesh& mesh, Args& args)
@@ -1159,7 +1161,8 @@ void DT::buildPntInfo(Mesh& mesh) {
 
 // Compatibility entry point for serial callers. Parallel insertion uses frozen
 // planning and conflict-free batch commits in dt_bw_parallel.cpp.
-int DT::BW_insert_vertex(int iNod, std::vector<int>& srchtet, int info, int thread_n) {
+int DT::BW_insert_vertex(int iNod, std::vector<int>& srchtet, int info, int thread_n,
+    std::array<int, 2> midpointEdge) {
     if (srchtet.empty()) return 0;
     // Node occupation alone cannot protect concurrent location or container growth.
     if (omp_in_parallel()) return -1;
@@ -1167,8 +1170,9 @@ int DT::BW_insert_vertex(int iNod, std::vector<int>& srchtet, int info, int thre
     // mesh-owned workspace without retaining another mesh's state on the thread.
     BWPlan& plan = serialBW.plan;
     BWRequest request = makeBWRequest(*this, iNod, srchtet, info);
+    request.midpointEdge = midpointEdge;
     request.trackAccess = false;
-    const BWStatus status = planBW(*this, request, plan);
+    const BWStatus status = planBWOnEdge(*this, request, plan);
     if (status == BWStatus::Duplicate) return -plan.duplicateNode;
     if (status != BWStatus::Ready) return -1;
 
@@ -3119,7 +3123,8 @@ int DT::splitBndEdge(const int lostE, int info) {
 	if (info >= 0) {
 		newp = addNode(pnt[0], pnt[1], pnt[2], space);
 
-		int ret = BW_insert_vertex(newp, srchtet, 3);
+		int ret = BW_insert_vertex(newp, srchtet, 3, -1,
+            info == 0 ? std::array<int, 2>{{p1, p2}} : std::array<int, 2>{{-1, -1}});
         if (ret <= 0) {
             DelNod(newp);
             for (int face : SurEdgs[lostE].face)

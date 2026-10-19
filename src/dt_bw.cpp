@@ -206,7 +206,8 @@ int locateRequest(DT& m, BWPlan& p, int& tet) {
             int ia, ib, ic, id;
             DNC(f, ia, ib, ic, id);
             const int b = m.Elems[tet].form[ib], c = m.Elems[tet].form[ic], d = m.Elems[tet].form[id];
-            const double ori = GEOM_FUNC::orient3d(m.Nodes[b].pt, m.Nodes[c].pt, m.Nodes[d].pt, p.request.point.data());
+            const double ori = p.request.midpointOnFace(b, c, d) ? 0.0 :
+                GEOM_FUNC::orient3d(m.Nodes[b].pt, m.Nodes[c].pt, m.Nodes[d].pt, p.request.point.data());
             if (ori < 0) {
                 // Initial cells form a Delaunay triangulation: walk through a
                 // separating face immediately. Constrained/refinement requests
@@ -366,7 +367,8 @@ BWStatus findBWCavity(DT& m, BWPlan& p) {
                         : GEOM_FUNC::insphere(m.Nodes[a].pt, m.Nodes[b].pt, m.Nodes[c].pt, m.Nodes[d].pt, p.request.point.data());
                     include = value <= 0;
                 } else {
-                    const double value = GEOM_FUNC::orient3d(m.Nodes[a].pt, m.Nodes[b].pt, m.Nodes[c].pt, p.request.point.data());
+                    const double value = r.midpointOnFace(a, b, c) ? 0.0 :
+                        GEOM_FUNC::orient3d(m.Nodes[a].pt, m.Nodes[b].pt, m.Nodes[c].pt, p.request.point.data());
                     include = value < 0;
                     if (value == 0) {
                         const int inner = m.getNeig(next, 3);
@@ -435,7 +437,8 @@ BWStatus adjustBWCavity(DT& m, BWPlan& p) {
 				if (b == m.ghost || c == m.ghost || d == m.ghost)
 					continue;
 
-				double ori = dt::GEOM_FUNC::orient3d(p.request.point.data(), m.Nodes[b].pt, m.Nodes[d].pt, m.Nodes[c].pt);
+				double ori = p.request.midpointOnFace(b, d, c) ? 0.0 :
+                    dt::GEOM_FUNC::orient3d(p.request.point.data(), m.Nodes[b].pt, m.Nodes[d].pt, m.Nodes[c].pt);
 				if (ori <= m.minVolume_bw) {
 					for (int k = 0; k < 4; ++k) {
 						outtet = m.getNeig(oldtet, k);
@@ -663,7 +666,8 @@ BWStatus prepareBWFill(DT& m, BWPlan& p, bool checkInitialVisibility) {
                 // the existing adjustment, including its volume threshold.
                 if (f.outside >= 0 && (p.tetInfo[f.outside] & cavityFlag)) return p.status = BWStatus::Rejected;
                 if (b != m.ghost && c != m.ghost && d != m.ghost &&
-                    GEOM_FUNC::orient3d(p.request.point.data(), m.Nodes[b].pt, m.Nodes[d].pt, m.Nodes[c].pt) <= m.minVolume_bw)
+                    (p.request.midpointOnFace(b, d, c) ||
+                    GEOM_FUNC::orient3d(p.request.point.data(), m.Nodes[b].pt, m.Nodes[d].pt, m.Nodes[c].pt) <= m.minVolume_bw))
                     return p.status = BWStatus::Rejected;
             }
             if (b == m.ghost) { std::swap(b, d); std::swap(b, c); }
@@ -675,6 +679,13 @@ BWStatus prepareBWFill(DT& m, BWPlan& p, bool checkInitialVisibility) {
         }
     }
     if (p.faces.empty()) return p.status = BWStatus::Rejected;
+    // Check construction identity before any fill-volume or shape calculation.
+    for (const BWFace& f : p.faces) {
+        if (f.geo != DT::virtualID &&
+            std::find(f.vertices.begin(), f.vertices.end(), m.ghost) == f.vertices.end() &&
+            p.request.midpointOnFace(f.vertices[0], f.vertices[1], f.vertices[2]))
+            return p.status = BWStatus::Rejected;
+    }
     // Refinement checks signed volume only; optimization retains its shape guard.
     // Keep this independent of improve_step, which also updates quality caches.
     const bool volumeOnly = p.request.acceptance == BWAcceptance::VolumeOnly;
@@ -726,6 +737,13 @@ BWStatus planBW(DT& m, const BWRequest& request, BWPlan& p) {
 void commitBW(DT& m, BWPlan& p, int node, const std::vector<int>& slots) {
     if (p.status != BWStatus::Ready || slots.size() != p.faces.size() || p.newElements.size() != slots.size())
         throw std::logic_error("BW commit requires a prepared plan and preallocated slots");
+    // The node may have been allocated before the segment search selected a
+    // different position. Update only the private new node, after allocation.
+    if (!std::equal(p.request.point.begin(), p.request.point.end(), m.Nodes[node].pt)) {
+        std::copy(p.request.point.begin(), p.request.point.end(), m.Nodes[node].pt);
+        m.Nodes[node].space = p.request.space;
+        if (p.request.anisotropic) m.AniSol[node] = p.request.metric;
+    }
     p.request.node = node;
     std::copy(slots.begin(), slots.end(), p.newElements.begin());
     for (size_t i = 0; i < p.faces.size(); ++i) {

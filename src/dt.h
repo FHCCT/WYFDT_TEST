@@ -37,6 +37,7 @@
 #include "dt_bw_parallel.h"
 #include "dt_parallel.h"
 #include "dt_projection.h"
+#include "dt_optimization_policy.h"
 #include "dt_logger.h"
 
 #ifdef _WIN32
@@ -98,7 +99,7 @@ namespace dt {
         bool parallelTopologyBatch = false; // No container growth inside a topology batch.
 
 		std::unordered_map<int, std::vector<int>> periodic_P;
-		enum { SUS_METRIC = 9 }; // Signed Knupp mean-ratio quality; SUS regularized smoothing.
+		enum { SUS_METRIC = 9, ANGLE_JACOBIAN_METRIC = 10 }; // Signed Knupp mean-ratio quality; SUS regularized smoothing.
 		
 		int ghost;
 		int nSurNodes;
@@ -125,6 +126,7 @@ namespace dt {
 		int optflipdeep = 3;
 		bool improve_step;
         BWAcceptance bwAcceptance = BWAcceptance::Default;
+        OptimizationPolicy optimizationPolicy;
 		bool ignoreIntersect = false;
 		bool modifyBnd = false;
 		bool addBoxFlag = false;
@@ -172,7 +174,8 @@ namespace dt {
 		/************************** algorithm ************************/
 		void buildPntInfo(Mesh& mesh);
 		void buildTetInfo(Mesh& mesh, Args& args);
-		int BW_insert_vertex(int iNod, std::vector<int>& srchtet, int info, int thread_n = -1);
+		int BW_insert_vertex(int iNod, std::vector<int>& srchtet, int info, int thread_n = -1,
+            std::array<int, 2> midpointEdge = {{-1, -1}});
 		int locate_pnt(int iNod, int& searchtet);
 		void AddBox(double scaled);
 		int findShell(const int t, const  int p2, const int p3, std::vector<int>& Shell, std::vector<int>& shell_point, int thread_n = -1);
@@ -236,6 +239,8 @@ namespace dt {
 		/****************** Mesh Improvement **************/
 		int improve_init(Args& args);
 		int TraditionalOptPass(Args& args);
+        int qualityOptimizationPass(int rounds, const std::unordered_map<int, double>& regionSize = {},
+            double globalMaxEdge = 1e100, bool smooth = true);
 		int OrthogonalityOptPass(Args& args);
 		int QuicklyOptPass(Args& args);
 		int QuicklyOptCoarsePass(Args& args);

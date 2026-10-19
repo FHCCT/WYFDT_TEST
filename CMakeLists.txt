@@ -39,8 +39,8 @@ if(NOT TIGER_MANAGED_BUILD)
     find_package(OpenMP REQUIRED COMPONENTS CXX)
 endif()
 set(DT_SOURCES
-    src/dt.cpp src/dt_adp.cpp src/dt_bw.cpp src/dt_bw_parallel.cpp
-    src/dt_func.cpp src/dt_omp.cpp src/dt_opt.cpp src/dt_ort.cpp
+    src/dt.cpp src/dt_adp.cpp src/dt_bw.cpp src/dt_bw_edge.cpp src/dt_bw_parallel.cpp
+    src/dt_func.cpp src/dt_omp.cpp src/dt_opt.cpp src/dt_optimization_policy.cpp src/dt_ort.cpp
     src/dt_parallel.cpp src/dt_sus.cpp src/dt_surface.cpp src/mesh_io.cpp
     extern/geom/intersection_func.cpp extern/geom/predicates.cpp extern/geom/ttotr.c)
 
@@ -127,12 +127,14 @@ if(BUILD_BNDPNT_BENCHMARK)
     target_link_libraries(predicate_filter_check PRIVATE dt)
     add_executable(optimization_guard_check tools/optimization_guard_check.cpp)
     target_link_libraries(optimization_guard_check PRIVATE dt)
-    add_executable(refinement_policy_check checks/refinement_policy_check.cpp)
-    target_link_libraries(refinement_policy_check PRIVATE dt)
-    add_executable(refinement_boundary_check checks/refinement_boundary_check.cpp)
-    target_link_libraries(refinement_boundary_check PRIVATE dt)
-    add_executable(smoothing_acceptance_check checks/smoothing_acceptance_check.cpp)
-    target_link_libraries(smoothing_acceptance_check PRIVATE dt)
+    # Local checks are optional and are not distributed with the library.
+    foreach(_dt_check refinement_policy_check edge_insertion_check quality_policy_check
+            refinement_boundary_check smoothing_acceptance_check)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/checks/${_dt_check}.cpp")
+            add_executable(${_dt_check} checks/${_dt_check}.cpp)
+            target_link_libraries(${_dt_check} PRIVATE dt)
+        endif()
+    endforeach()
     add_executable(smoothing_priority_check tools/smoothing_priority_check.cpp)
     target_link_libraries(smoothing_priority_check PRIVATE dt)
     add_executable(mesh_optimization_check tools/mesh_optimization_check.cpp)

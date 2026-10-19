@@ -108,7 +108,7 @@ int DT::adaptation_by_pError(Mesh& mesh, Args& args, std::vector<std::array<doub
 
 			//add inner point
 			std::vector<int> nearTets = { getP2T(p1) };
-			int BW_recall = BW_insert_vertex(iNod, nearTets, 1);
+			int BW_recall = BW_insert_vertex(iNod, nearTets, 1, -1, {{p1, p2}});
 			if (BW_recall == 1) {//success
 				continue;
 			}
@@ -275,7 +275,7 @@ int DT::adaptation_by_Tetid (Mesh& mesh, Args& args, std::vector<int> refine_tri
 
 			//add inner point
 			std::vector<int> nearTets = { searchtet };
-			int BW_recall = BW_insert_vertex(iNod, nearTets, 1);
+			int BW_recall = BW_insert_vertex(iNod, nearTets, 1, -1, {{p1, p2}});
 			if (BW_recall == 1) {//success
 				continue;
 			}

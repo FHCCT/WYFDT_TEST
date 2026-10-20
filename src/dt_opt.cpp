@@ -1,5 +1,5 @@
 #include "dt.h"
-#include "dt_smoothing_guard.h"
+#include "dt_joint_smoothing.h"
 #include "dt_refinement_guard.h"
 #include "dt_geometry_guard.h"
 #include <exception>
@@ -98,6 +98,10 @@ int DT::improve_init(Args& args) {
         if (!isDelNod(n) && n != ghost) ++livePoints;
     // These limits apply only to the newly enabled mixed/interior repairs,
     // and are initialized once, never replenished at the start of a round.
+    // Level-one boundary trial meshes must retain their original pure-flip path.
+    // In particular they must not recursively enable a new repair algorithm.
+    topologyRepairEnabled = args.optlevel > 1; topologyRepairDeferred = false;
+    topologyRemeshTrialBudget = topologyRepairEnabled ? std::max<size_t>(8, livePoints / 1000) : 0;
     topologyInteriorPointBudget = livePoints / 400;
     topologyInteriorCellBudget = physicalCells / 200;
 
@@ -131,7 +135,6 @@ int DT::improve_init(Args& args) {
 }
 
 int DT::TraditionalOptPass(Args& args) {
-    if (args.optlevel > 1) return qualityOptimizationPass(std::max(2, args.optloop));
 	int nLoop = 3, nbad = 0;
 	double improve_goal = 1, minD = 0, minAvgD = 0, maxD = 0, maxAvgD = 0, minq;
 	nLoop = std::max(args.optloop, nLoop);
@@ -155,7 +158,7 @@ int DT::TraditionalOptPass(Args& args) {
         else if (infolevel > 0) meshLogger->info("Flip bndEdg: {}/{}", 0, 0);
 
 		prepareQuality();
-		TopologicalPass(improve_goal, args.optlevel > 2 ? args.optanglestrict : 0.0, 1);
+		TopologicalPass(improve_goal, args.optanglestrict, 1);
 		if (args.optlevel > 1) SmoothPass(1, improve_goal);
 		printQuality(improve_goal, nbad, minq, false);
 
@@ -187,7 +190,7 @@ int DT::OptbyAnisotropicPass(Args& args) {
 		improve_goal = 0.0288675;
 		prepareQuality();
 
-		TopologicalPass(improve_goal, 0.0, 1);
+		TopologicalPass(improve_goal, args.optanglestrict, 1);
 
 		SmoothPass(1, 1);
 
@@ -237,7 +240,7 @@ int DT::OrthogonalityOptPass(Args& args) {
 	printQuality(0.01, nbad, minq, false);
 
 	for (int loop = 0; loop < nLoop; loop++) {
-		TopologicalPass(improve_goal, 0.0, 1);
+		TopologicalPass(improve_goal, args.optanglestrict, 1);
 		SmoothPass(1, improve_goal);
 		printQuality(0.01, nbad, minq, false);
 	}
@@ -347,8 +350,11 @@ int DT::prepareBoundarySmoothPoint(int n, BoundarySmoothWorkspace& workspace) {
     return 1;
 }
 
-int DT::smoothPlanarBoundaryPoint(int n, double floor, BoundarySmoothWorkspace& workspace) {
+int DT::smoothPlanarBoundaryPoint(int n, double floor, BoundarySmoothWorkspace& workspace,
+    bool preserveAngleJacobian) {
     if (periodic_P.count(n) || !prepareBoundarySmoothPoint(n, workspace)) return 0;
+    const auto jointBefore = preserveAngleJacobian
+        ? detail::jointSmoothingQuality(*this,workspace.star,n) : detail::JointSmoothingQuality{};
     auto& star = workspace.star;
     auto& neighbors = workspace.neighbors;
     auto& faces = workspace.faces;
@@ -402,7 +408,6 @@ int DT::smoothPlanarBoundaryPoint(int n, double floor, BoundarySmoothWorkspace& 
         double position[3];
         for (int k = 0; k < 3; ++k)
             position[k] = Nodes[n].pt[k] + alpha * direction[k];
-        if (!optimizationPolicy.moveAllowed(*this, n, position)) continue;
         bool valid = true;
         OptimizationQuality candidateQuality;
         double sum = 0;
@@ -421,6 +426,8 @@ int DT::smoothPlanarBoundaryPoint(int n, double floor, BoundarySmoothWorkspace& 
             sum += q;
         }
         if (!valid || !(sum > oldSum + 1e-12 * count)) continue;
+        if (preserveAngleJacobian && !detail::jointSmoothingAccept(jointBefore,
+            detail::jointSmoothingQuality(*this,star,n,position))) continue;
         if (optimizationPolicy.enabled && !optimizationPointAccept(optimizationPolicy, originalQuality, candidateQuality)) continue;
         // Positive volume alone does not exclude a folded boundary triangle.
         for (auto f : faces) {
@@ -588,11 +595,6 @@ int DT::smoothPeriodicBoundaryGroup(const std::vector<int>& group, double floor)
                     addOptimizationQuality(*this, candidate, point(v[0]), point(v[1]), point(v[2]), point(v[3]));
                 }
                 valid = optimizationPointAccept(optimizationPolicy, originalSides[side], candidate);
-                for (int t : work[side].star) for (int a = 0; a < 4 && valid; ++a) for (int b = 0; b < a; ++b) {
-                    const auto& v = Elems[t].form;
-                    valid = optimizationPolicy.edgeAllowed(Elems[t].geo, v[a], v[b], point(v[a]), point(v[b]));
-                    if (!valid) break;
-                }
             }
             if (!valid) continue;
         }
@@ -618,7 +620,36 @@ int DT::smoothPeriodicBoundaryGroup(const std::vector<int>& group, double floor)
 }
 
 int DT::QuicklyOptPass(Args& args) {
-    return qualityOptimizationPass(std::max(2, args.optloop));
+	if (infolevel > 0)
+		 meshLogger->info("QuicklyOptPass");
+	// Keep at least one round per metric; integer remainder goes to SUS.
+	const int rounds = std::max(2, args.optloop);
+	const int angleRounds = std::max(1, rounds / 3);
+	const int polishStart = rounds - angleRounds;
+	optflipdeep = 0;
+	for (int loop = 0; loop < rounds; ++loop) {
+		updateminVolume();
+		improve_step = false;
+		flipEdgPass(1);
+		improve_step = true;
+
+		// Start with SUS shape quality, then polish the poor-angle tail.
+		// Both phases use the same fixed candidate ordering for all thread counts.
+		improve_Metric = loop < polishStart ? SUS_METRIC : 2;
+		prepareQuality();
+		TopologicalPass(args.optTh, args.optanglestrict, 1);
+		SmoothPass(1, args.optTh);
+		int nbad = 0;
+		double minq;
+		printQuality(args.optTh, nbad, minq, false);
+		// An insertion threshold is not a convergence test for mean/tail quality.
+		if (nbad == 0) {
+			if (loop >= polishStart) break;
+			// SUS convergence must not skip the mandatory angle phase.
+			loop = polishStart - 1;
+		}
+	}
+	return 1;
 }
 
 int DT::OptSizeControl_yunbo(double lamasize, 
@@ -626,6 +657,16 @@ int DT::OptSizeControl_yunbo(double lamasize,
 	std::unordered_map<int, int>& facetNum,
 	std::unordered_map<int, double>& elementSize,
 	std::unordered_map<int, int>& elementNum, Args& args) {
+    // Refinement can undo a repair and create a different sliver. Keep the
+    // established size trajectory, then enable the unified repair chain for
+    // the protected final optimization and the remaining geometric failures.
+    struct DeferredTopologyRepair {
+        bool& deferred; bool saved;
+        explicit DeferredTopologyRepair(bool& flag) : deferred(flag), saved(flag) { deferred = true; }
+        void resume() { deferred = saved; }
+        ~DeferredTopologyRepair() { deferred = saved; }
+    } deferredRepair(topologyRepairDeferred);
+
     const int nLoop = std::max(args.optloop, 3);
     int nbad = 0;
     double minq;
@@ -664,8 +705,7 @@ int DT::OptSizeControl_yunbo(double lamasize,
         bwAcceptance = BWAcceptance::VolumeOnly;
         improve_step = true;
 		GeoNum.clear();
-		int n = Elems.size();
-		for (int i = 0; i < n; i++) {
+		for (int i = 0; i < Elems.size(); i++) {
 			if (isDelEle(i) || ishulltet(i) || isvirtualtet(i))
 				continue;
 			GeoNum[Elems[i].geo]++;
@@ -683,8 +723,7 @@ int DT::OptSizeControl_yunbo(double lamasize,
         boundarySelected.assign(SurEdgs.size(), 0);
         boundaryLength.assign(SurEdgs.size(), -1.0);
 
-		n = Elems.size();
-		for (int i = 0; i < n; i++) {
+		for (int i = 0; i < Elems.size(); i++) {
 			if (isDelEle(i) || ishulltet(i) || isvirtualtet(i))
 				continue;
 
@@ -767,8 +806,7 @@ int DT::OptSizeControl_yunbo(double lamasize,
         // 4. Recount after successful boundary splits.
         if (stop != 0) {
             GeoNum.clear();
-			n = Elems.size();
-			for (int i = 0; i < n; i++) {
+			for (int i = 0; i < Elems.size(); i++) {
                 if (isDelEle(i) || ishulltet(i) || isvirtualtet(i)) continue;
                 GeoNum[Elems[i].geo]++;
             }
@@ -776,9 +814,10 @@ int DT::OptSizeControl_yunbo(double lamasize,
         // 5. Protect nearby boundary edges only for size-driven interior candidates.
         RefinementBoundaryEdges refinementBoundary(*this);
         int redirected = 0, boundarySplits = 0;
-        // Freeze the scan limit after boundary refinement; appended IDs wait.
-		n = Elems.size();
-		for (int i = 0; i < n; i++) {
+        // Continue through cells appended by successful insertions, as in the
+        // original size-control pass. Freezing this limit defers size work and
+        // leaves too few new cells available to the following optimization.
+		for (int i = 0; i < static_cast<int>(Elems.size()); i++) {
 			if (isDelEle(i) || ishulltet(i) || isvirtualtet(i))
 				continue;
 
@@ -840,7 +879,7 @@ int DT::OptSizeControl_yunbo(double lamasize,
 			}
 		}
 
-        if (infolevel > 0) meshLogger->info("Refine near boundary edges: redirected={} split={} deferred={}",
+        if (infolevel > 1) meshLogger->info("Refine near boundary edges: redirected={} split={} deferred={}",
             redirected, boundarySplits, redirected - boundarySplits);
         }
         return stop;
@@ -855,33 +894,23 @@ int DT::OptSizeControl_yunbo(double lamasize,
         TopologicalPass(improve_goal, args.optanglestrict, 1);
         SmoothPass(1, improve_goal);
         const int worstTet = printQuality(improve_goal, nbad, minq, false);
-        return needsTopologyInsertion(worstTet, args.optanglestrict);
+        return needsTopologyRepair(worstTet, args.optanglestrict, !topologyRepairDeferred);
     };
 
     // Bounded segment search performed best with optimization before refinement.
     for (int loop = 0; loop < nLoop; ++loop) {
         improve_step = true;
-        updateminVolume();
         const bool worstNeedsOptimization = runOptimization();
         const int stop = runRefinement();
         // Finish small remaining size tasks locally instead of another global sweep.
         if (stop < 20 && !worstNeedsOptimization) break;
     }
 
-    improve_step = true;
-    improve_Metric = SUS_METRIC;
-    prepareQuality();
-    // Include moderately good cells in the final sweep; the transaction guards both means.
-    SmoothPass(1, std::max(0.5, improve_goal));
-    // Final smoothing can make a few edges oversized again. Finish size tasks
-    // without another smoothing pass that would undo their completion.
-    for (int pass = 0; pass < 3; ++pass) {
-        updateminVolume();
-        if (runRefinement() == 0) break;
-    }
-    // Size refinement is complete. Run the measured ten-round quality schedule
-    // under a separate scope; no later refinement may recreate poor cells.
-    return qualityOptimizationPass(10, elementSize, lamasize > 0 ? lamasize * 4.0 / 3.0 : 1e100);
+
+    deferredRepair.resume();
+    Args optimizationArgs = args;
+    optimizationArgs.optloop = 4;
+    return QuicklyOptPass(optimizationArgs);
 }
 
 int DT::QuicklyOptCoarsePass(Args& args) {
@@ -904,7 +933,7 @@ int DT::QuicklyOptCoarsePass(Args& args) {
 		improve_step = true;
 
 		prepareQuality();
-		TopologicalPass(improve_goal, 0.0, 1);
+		TopologicalPass(improve_goal, args.optanglestrict, 1);
 		SmoothPass(1, improve_goal);
 
 		if (contract1 + contract2 < 100)
@@ -945,7 +974,7 @@ int DT::VolumeImprovePass(Args& args) {
 		improve_goal = 0.4;
 		//improve_goal = std::sin(ANGLE2RADIO(40));
 		prepareQuality();
-		TopologicalPass(improve_goal, 0.0, 10);
+		TopologicalPass(improve_goal, args.optanglestrict, 10);
 		//printQuality(improve_goal, nbad, minq, false);
 		//flipEdgPass(3);
 		improve_Metric = 3;
@@ -973,7 +1002,7 @@ int DT::VolumeImprovePass(Args& args) {
 			//improve_goal = std::sin(ANGLE2RADIO(40));
 			improve_goal = 0.4;
 			prepareQuality();
-			TopologicalPass(improve_goal, 0.0, 10);
+			TopologicalPass(improve_goal, args.optanglestrict, 10);
 			//flipEdgPass(3);
 			improve_Metric = 3;
 			prepareQuality();
@@ -1015,11 +1044,11 @@ int DT::prepareQuality() {
 			if (improve_Metric == 5) {
 				getmm(a, b, c, d, AniMetric);
 			}
-			q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt, AniMetric, improve_Metric);
+            // A rejection witness is not the actual objective stored in q.
+            q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt,
+                AniMetric, improve_Metric, false);
 			if (q < 0) {
-				double ori = calVolume(i);
-				meshLogger->warn("Warning:Inverted tet: {} {}", i, ori);
-				q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt, AniMetric, improve_Metric);
+                meshLogger->warn("Warning:Inverted tet: {} {}", i, calVolume(i));
 			}
 		}
 		else {
@@ -1086,11 +1115,11 @@ void DT::updateQuality(int i) {
 		if (improve_Metric == 5) {
 			getmm(a, b, c, d, AniMetric);
 		}
-		q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt, AniMetric, improve_Metric);
+		q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt, AniMetric, improve_Metric, false);
 		//if (q < 0) {
 		//	double ori = calVolume(i);
 		//	meshLogger->warn("Warning:Inverted tet: {} {}", i, ori);
-		//	q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt, AniMetric, improve_Metric);
+		//	q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt, AniMetric, improve_Metric, false);
 		//}
 	}
 	else {
@@ -1121,8 +1150,7 @@ void DT::updateminVolume(void) {
     minVolume_bw = *std::min_element(minima.begin(), minima.end());
 }
 
-//Smooth loop_parallel
-//if checkQ open ,keep every smooth is improvement
+// Smooth independent colors; retain every locally accepted point.
 int DT::SmoothPass(int nloop, double improve_goal) {
     MeshStageLog stageLog(*this, "Smooth", 2);
     DTParallelScope parallelScope;
@@ -1134,42 +1162,24 @@ int DT::SmoothPass(int nloop, double improve_goal) {
         if (n >= 0 && n < static_cast<int>(Nodes.size())) periodicMembers[n] = 1;
     long long success = 0, attempts = 0;
     long long periodicSuccess = 0, periodicAttempts = 0;
-    int rolledBack = 0;
-    const bool checkQuality = improve_Metric == SUS_METRIC || improve_Metric == 2;
-    std::vector<int> physicalCells, liveNodes;
-    if (checkQuality) {
-        for (int t = 0; t < static_cast<int>(Elems.size()); ++t)
-            if (!isDelEle(t) && !ishulltet(t) && !isvirtualtet(t)) physicalCells.push_back(t);
-        for (int n = 0; n < static_cast<int>(Nodes.size()); ++n)
-            if (n != ghost && !isDelNod(n)) liveNodes.push_back(n);
-    }
-    std::vector<std::array<double, 3>> savedPositions;
-    std::vector<double> savedQualities;
     for (int loop = 0; loop < nloop; ++loop) {
-        const auto beforeQuality = measureSmoothingQuality(*this, physicalCells);
-        const bool transactional = checkQuality && beforeQuality.valid;
+        // Accepted point moves are final. Only compute the floors needed by
+        // their local guards; do not snapshot or re-evaluate the whole sweep.
+        double minimumQualityFloor = 1e-12;
         if (optimizationPolicy.enabled) {
-            optimizationPolicy.angleFloor = RADIO2ANGLE(beforeQuality.minAngle);
-            optimizationPolicy.jacobianFloor = beforeQuality.minJacobian;
+            const auto quality = measureOptimizationQuality(*this);
+            if (!quality.valid) return 0;
+            optimizationPolicy.angleFloor = quality.minAngle;
+            optimizationPolicy.jacobianFloor = quality.minJacobian;
+        } else {
+            minimumQualityFloor = DBL_MAX;
+            for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
+                if (isDelEle(t) || isvirtualtet(t) || ishulltet(t)) continue;
+                const auto& f = Elems[t].form;
+                minimumQualityFloor = std::min(minimumQualityFloor,
+                    quality_sus(Nodes[f[0]].pt, Nodes[f[1]].pt, Nodes[f[2]].pt, Nodes[f[3]].pt));
+            }
         }
-        const long long savedSuccess = success, savedPeriodicSuccess = periodicSuccess;
-        if (transactional) {
-            savedPositions.resize(liveNodes.size());
-            savedQualities.resize(physicalCells.size());
-            for (size_t i = 0; i < liveNodes.size(); ++i)
-                std::copy(Nodes[liveNodes[i]].pt, Nodes[liveNodes[i]].pt + 3, savedPositions[i].begin());
-            for (size_t i = 0; i < physicalCells.size(); ++i) savedQualities[i] = Elems[physicalCells[i]].q;
-        }
-
-        // Both point algorithms preserve the same immutable global SUS floor.
-        double minimumQualityFloor = DBL_MAX;
-        for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
-            if (isDelEle(t) || isvirtualtet(t) || ishulltet(t)) continue;
-            const auto& f = Elems[t].form;
-            minimumQualityFloor = std::min(minimumQualityFloor,
-                quality_sus(Nodes[f[0]].pt, Nodes[f[1]].pt, Nodes[f[2]].pt, Nodes[f[3]].pt));
-        }
-        if (optimizationPolicy.enabled) minimumQualityFloor = 1e-12;
         colorBadQualityNodes(colors, improve_goal);
         // Also exclude value-only links; periodic groups own all their members.
         if (!periodicGroups.empty()) for (auto& color : colors)
@@ -1189,9 +1199,11 @@ int DT::SmoothPass(int nloop, double improve_goal) {
                 for (int i = 0; i < static_cast<int>(group.size()); ++i) {
                     const int node = group[i];
                     ++attempts;
+                    const bool joint = improve_Metric == 2 && !optimizationPolicy.enabled;
                     success += (isbndpnt(node)
-                        ? smoothPlanarBoundaryPoint(node, minimumQualityFloor, boundaryWorkspace)
-                        : smoothInteriorPoint(node, minimumQualityFloor)) == 1;
+                        ? smoothPlanarBoundaryPoint(node, minimumQualityFloor, boundaryWorkspace, joint)
+                        : (joint ? smoothAngleJacobian(node, minimumQualityFloor)
+                                 : smoothInteriorPoint(node, minimumQualityFloor))) == 1;
                 }
             }
         }
@@ -1214,28 +1226,11 @@ int DT::SmoothPass(int nloop, double improve_goal) {
                 periodicSuccess += smoothPeriodicBoundaryGroup(group, minimumQualityFloor) == 1;
             }
         }
-        if (transactional) {
-            const auto afterQuality = measureSmoothingQuality(*this, physicalCells);
-            if (!smoothingImprovesQuality(beforeQuality, afterQuality)) {
-                for (size_t i = 0; i < liveNodes.size(); ++i)
-                    std::copy(savedPositions[i].begin(), savedPositions[i].end(), Nodes[liveNodes[i]].pt);
-                for (size_t i = 0; i < physicalCells.size(); ++i) Elems[physicalCells[i]].q = savedQualities[i];
-                // Idle neighborhoods observed in a discarded sweep must not suppress retries.
-                for (auto& state : susIdleStates) state = SusIdleState{};
-                success = savedSuccess; periodicSuccess = savedPeriodicSuccess;
-                ++rolledBack;
-                if (infolevel > 0) meshLogger->info(
-                    "Smooth rollback: meanShape={:.9g}->{:.9g} meanMinAngleDeg={:.9g}->{:.9g}",
-                    beforeQuality.meanShape(), afterQuality.meanShape(),
-                    RADIO2ANGLE(beforeQuality.meanAngle()), RADIO2ANGLE(afterQuality.meanAngle()));
-                break;
-            }
-        }
     }
     if (infolevel > 0) {
-        meshLogger->info("Smooth: {}/{} rolledBack={}", success, attempts, rolledBack);
-        if (!periodicGroups.empty())
-            meshLogger->info("Smooth periodic groups: {}/{}", periodicSuccess, periodicAttempts);
+        meshLogger->info("Smooth: {}/{}", success, attempts);
+        if (infolevel > 1 && !periodicGroups.empty())
+            meshLogger->debug("Smooth periodic groups: {}/{}", periodicSuccess, periodicAttempts);
     }
     return 1;
 }
@@ -1356,74 +1351,115 @@ bool DT::topologyCandidateCurrent(const TopologyCandidate& candidate) {
         std::equal(candidate.form.begin(), candidate.form.end(), Elems[t].form);
 }
 
-bool DT::needsTopologyInsertion(int t, double angleDegrees) {
-    if (!(angleDegrees > 0) || t < 0 || t >= static_cast<int>(Elems.size()) ||
+bool DT::needsTopologyRepair(int t, double angleDegrees, bool includeJacobian) {
+    if (t < 0 || t >= static_cast<int>(Elems.size()) ||
         isDelEle(t) || isvirtualtet(t) || ishulltet(t)) return false;
+    const auto& p = Elems[t].form;
+    if (includeJacobian) {
+        const double jacobian = ScaledJacobian(Nodes[p[0]].pt, Nodes[p[1]].pt,
+            Nodes[p[2]].pt, Nodes[p[3]].pt);
+        if (!std::isfinite(jacobian) || jacobian < 1e-5) return true;
+    }
+    if (!(angleDegrees > 0)) return false;
     double minAngle = 0, maxAngle = 0;
     std::vector<double> angles;
-    const auto& p = Elems[t].form;
     // CalDihedral expects the opposite orientation to DT's stored ordering.
     if (!CalDihedral(Nodes[p[0]].pt, Nodes[p[1]].pt, Nodes[p[3]].pt, Nodes[p[2]].pt,
-        minAngle, maxAngle, angles)) return true;
+        minAngle, maxAngle, angles, true)) return true;
     return !std::isfinite(minAngle) || RADIO2ANGLE(minAngle) < angleDegrees;
 }
 
-bool DT::hasBadDihedral(double angleDegrees) {
-    if (!(angleDegrees > 0)) return false;
-    for (int t = 0; t < static_cast<int>(Elems.size()); ++t)
-        if (needsTopologyInsertion(t, angleDegrees)) return true;
-    return false;
-}
-
-int DT::tryTopologyRepair(const TopologyCandidate& candidate, double angleDegrees) {
+int DT::tryTopologyRepair(const TopologyCandidate& candidate, double angleDegrees,
+    OptimizationQuality* globalQuality) {
     if (parallelTopologyBatch || omp_in_parallel())
         throw std::logic_error("Topology repair must run outside a parallel region");
-    if (optimizationPolicy.enabled || !topologyCandidateCurrent(candidate)) return 0;
-
-    // Collapse is independent of the angle threshold, including when insertion
-    // is disabled. Lengths here are physical lengths, not sizing-field lengths.
-    //if (improve_step && modifyBnd) {
-    //    std::array<double, 6> squaredLengths;
-    //    double longestSquared = 0;
-    //    for (int e = 0; e < 6; ++e) {
-    //        squaredLengths[e] = distance2(Nodes[candidate.form[Egid[e][0]]].pt,
-    //            Nodes[candidate.form[Egid[e][1]]].pt);
-    //        longestSquared = std::max(longestSquared, squaredLengths[e]);
-    //    }
-    //    if (longestSquared > 0 && std::isfinite(longestSquared)) {
-    //        const double limit = longestSquared * topologyShortEdgeRatio * topologyShortEdgeRatio;
-    //        for (int e = 0; e < 6; ++e) {
-    //            if (!(squaredLengths[e] < limit)) continue;
-    //            const int p1 = candidate.form[Egid[e][0]], p2 = candidate.form[Egid[e][1]];
-    //            const int* entry = BndEdg.find(p1, p2);
-    //            if (!entry || isDelSurEdg(*entry) || SurEdgs[*entry].info > 1 || lockE.count(*entry)) continue;
-    //            // Preserve distinct feature curves, as in contractEdgPass.
-    //            if (SurEdgs[*entry].constrain == 0 && collapsePointLevel(p1) >= 2 && collapsePointLevel(p2) >= 2)
-    //                continue;
-    //            // The master entry selects face -> segment -> corner, tries
-    //            // both directions at equal levels, and handles periodic pairs.
-    //            if (collapseEdg(*entry) == 1) return 1;
-    //            if (!topologyCandidateCurrent(candidate)) return 0;
-    //        }
-    //    }
-    //}
-    if (!needsTopologyInsertion(candidate.tet, angleDegrees)) return 0;
-    return removebadtet_addPnt(candidate.tet);
+    if (!topologyRepairEnabled || !topologyCandidateCurrent(candidate)) return 0;
+    // Preserve existing angle-triggered repairs inside size refinement. The
+    // added SJ trigger and deeper/remesh stages run after the size trajectory
+    // is finished, so they cannot make refinement recreate different slivers.
+    if (topologyRepairDeferred)
+        return needsTopologyRepair(candidate.tet,angleDegrees,false)
+            ? removebadtet_addPnt(candidate.tet) : 0;
+    if (!needsTopologyRepair(candidate.tet, angleDegrees)) return 0;
+    OptimizationQuality measured;
+    if (!globalQuality) {
+        measured = measureOptimizationQuality(*this);
+        if (!measured.valid) return 0;
+    }
+    const auto& baseline = globalQuality ? *globalQuality : measured;
+    // A metric-specific deep flip must not exchange one geometric failure for
+    // another. Scope A/J guards to this rare repair, leaving ordinary passes
+    // and the caller's selected objective unchanged.
+    struct RestoreRepairPolicy {
+        OptimizationPolicy& policy; OptimizationPolicy saved;
+        explicit RestoreRepairPolicy(OptimizationPolicy& value) : policy(value), saved(value) {}
+        ~RestoreRepairPolicy() { policy = saved; }
+    } restorePolicy(optimizationPolicy);
+    optimizationPolicy.enabled = optimizationPolicy.inTopology = true;
+    optimizationPolicy.angleFloor = std::max(optimizationPolicy.angleFloor,
+        std::max(baseline.minAngle,angleDegrees));
+    optimizationPolicy.jacobianFloor = std::max(optimizationPolicy.jacobianFloor,
+        std::max(baseline.minJacobian,1e-4));
+    optimizationPolicy.meanAngle = baseline.meanAngle();
+    optimizationPolicy.meanJacobian = baseline.meanJacobian();
+    int t = candidate.tet;
+    // Bound the extra search to the rare geometric failures, not every SUS
+    // candidate. Preserve callers that already used a deeper search.
+    if (optflipdeep < 4) {
+        struct RestoreDepth {
+            int& value; int saved;
+            explicit RestoreDepth(int& depth) : value(depth), saved(depth) {
+                value = std::min(4, std::max(2, saved + 2));
+            }
+            ~RestoreDepth() { value = saved; }
+        } restore(optflipdeep);
+        if (removebadtet(t, -1) == 1) {
+            // Existing flip primitives do not maintain region counters. A
+            // successful deep repair must leave them current for remeshing.
+            if (QuantityControl) {
+                GeoNum.clear();
+                for (int cell = 0; cell < static_cast<int>(Elems.size()); ++cell)
+                    if (!isDelEle(cell) && !ishulltet(cell) && !isvirtualtet(cell))
+                        ++GeoNum[Elems[cell].geo];
+            }
+            if (globalQuality) *globalQuality = measureOptimizationQuality(*this);
+            if (infolevel > 1) meshLogger->debug("Topology repair: deeper flips succeeded");
+            return 1;
+        }
+    }
+    // Failed trial flips may have relocated the original tetrahedron.
+    if (t < 0 || t >= static_cast<int>(Elems.size()) || isDelEle(t)) return 0;
+    auto current = topologyCandidate(t);
+    auto expected = candidate.form, actual = current.form;
+    std::sort(expected.begin(),expected.end()); std::sort(actual.begin(),actual.end());
+    if (actual != expected || !needsTopologyRepair(t, angleDegrees)) return 0;
+    if (remeshTopologyPatch(t,globalQuality ? globalQuality : &measured)) {
+        if (infolevel > 1) meshLogger->debug("Topology repair: remesh succeeded");
+        return 1;
+    }
+    const int result = removebadtet_addPnt(t);
+    // The legacy boundary path can alter neighboring cells even if the seed
+    // survives; any caller-owned summary must describe the resulting mesh.
+    if (globalQuality && (result == 1 || !AniSol.empty()))
+        *globalQuality = measureOptimizationQuality(*this);
+    if (result == 1 && infolevel > 1) meshLogger->debug("Topology repair: insertion succeeded");
+    return result;
 }
 
-int DT::TopologicalPass(double improve_goal, double insert_angle_degrees, int nloop) {
+int DT::TopologicalPass(double improve_goal, double repair_angle_degrees, int nloop) {
     MeshStageLog stageLog(*this, "Topology", 2);
-    if (!std::isfinite(insert_angle_degrees) || insert_angle_degrees < 0 || insert_angle_degrees > 180)
-        throw std::invalid_argument("Topology insertion angle must be in [0, 180] degrees");
+    if (!std::isfinite(repair_angle_degrees) || repair_angle_degrees < 0 || repair_angle_degrees > 180)
+        throw std::invalid_argument("Topology repair angle must be in [0, 180] degrees");
     topologyInteriorQualityGoal = improve_goal;
     size_t totalSuccess = 0, totalCandidates = 0;
     for (int loop = 0; loop < nloop; ++loop) {
         std::vector<TopologyCandidate> candidates;
         for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
             if (isDelEle(t) || isvirtualtet(t) || ishulltet(t) || Elems[t].q < 0) continue;
-            // Only the quality threshold selects candidates. Check the angle
-            // of an individual candidate only after its flip attempt fails.
-            if (Elems[t].q <= improve_goal)
+            // Geometrically poor cells must not be hidden by a different
+            // active objective or its cached threshold.
+            if (Elems[t].q <= improve_goal || (topologyRepairEnabled && !topologyRepairDeferred &&
+                needsTopologyRepair(t, repair_angle_degrees)))
                 candidates.push_back(topologyCandidate(t));
         }
         std::stable_sort(candidates.begin(), candidates.end(),
@@ -1432,7 +1468,7 @@ int DT::TopologicalPass(double improve_goal, double insert_angle_degrees, int nl
             });
         // Flips and immediate failure repairs follow the same candidate order
         // for every thread count. Smoothing and quality evaluation stay parallel.
-        const int success = TopologicalPass_serial(candidates, improve_goal, insert_angle_degrees);
+        const int success = TopologicalPass_serial(candidates, improve_goal, repair_angle_degrees);
         totalSuccess += success;
         totalCandidates += candidates.size();
         if (success < 10) break;
@@ -1442,16 +1478,18 @@ int DT::TopologicalPass(double improve_goal, double insert_angle_degrees, int nl
 }
 
 int DT::TopologicalPass_serial(const std::vector<TopologyCandidate>& candidates,
-    double improve_goal, double insert_angle_degrees) {
+    double improve_goal, double repair_angle_degrees) {
     MeshStageLog stageLog(*this, "Serial topology", 2);
     int success = 0;
     for (const auto& candidate : candidates) {
-        if (!topologyCandidateCurrent(candidate) || Elems[candidate.tet].q < 0 || Elems[candidate.tet].q > improve_goal) continue;
+        if (!topologyCandidateCurrent(candidate) || Elems[candidate.tet].q < 0 ||
+            (Elems[candidate.tet].q > improve_goal &&
+             (topologyRepairDeferred || !needsTopologyRepair(candidate.tet, repair_angle_degrees)))) continue;
         int t = candidate.tet;
         const int result = removebadtet(t, -1);
         if (result == 1) ++success;
         else if (result == 0 && t >= 0 && !isDelEle(t))
-            success += tryTopologyRepair(topologyCandidate(t), insert_angle_degrees) == 1;
+            success += tryTopologyRepair(topologyCandidate(t), repair_angle_degrees) == 1;
     }
     return success;
 }
@@ -1496,11 +1534,11 @@ public:
 }
 
 int DT::TopologicalPass_parallel(const std::vector<TopologyCandidate>& candidates,
-    double improve_goal, double insert_angle_degrees, int workers) {
+    double improve_goal, double repair_angle_degrees, int workers) {
     MeshStageLog stageLog(*this, "Parallel topology", 2);
     DTParallelScope parallelScope;
     workers = std::min(workers, activeDTThreads(*this, 0, candidates.size()));
-    if (workers <= 1) return TopologicalPass_serial(candidates, improve_goal, insert_angle_degrees);
+    if (workers <= 1) return TopologicalPass_serial(candidates, improve_goal, repair_angle_degrees);
     std::queue<TopologyCandidate> pending;
     for (const auto& candidate : candidates) pending.push(candidate);
     int success = 0;
@@ -1561,7 +1599,9 @@ int DT::TopologicalPass_parallel(const std::vector<TopologyCandidate>& candidate
         const size_t lookahead = std::min(pending.size(), static_cast<size_t>(workers) * 8);
         for (size_t attempt = 0; attempt < lookahead && batch.size() < workers; ++attempt) {
             TopologyCandidate c = pending.front(); pending.pop();
-            if (!topologyCandidateCurrent(c) || Elems[c.tet].q < 0 || Elems[c.tet].q > improve_goal) continue;
+            if (!topologyCandidateCurrent(c) || Elems[c.tet].q < 0 ||
+                (Elems[c.tet].q > improve_goal && (topologyRepairDeferred ||
+                 !needsTopologyRepair(c.tet, repair_angle_degrees)))) continue;
             // Depth zero changes only seed-edge shells. Rollback searches the
             // full stars of their vertices; findSphere also reads face neighbors.
             shellVertices.clear(); seedTets.clear(); readTets.clear(); writeTets.clear();
@@ -1640,16 +1680,13 @@ int DT::TopologicalPass_parallel(const std::vector<TopologyCandidate>& candidate
                 failed.push_back(topologyCandidate(batch[j]));
         }
         for (const auto& candidate : failed)
-            success += tryTopologyRepair(candidate, insert_angle_degrees) == 1;
+            success += tryTopologyRepair(candidate, repair_angle_degrees) == 1;
     }
     return success;
 }
 
 // Pure flips: parallel calls use depth zero; serial calls retain optflipdeep.
 int DT::removebadtet(int& iElm, int thread_n) {
-    if (optimizationPolicy.enabled && optimizationPolicy.inTopology &&
-        iElm >= 0 && iElm < static_cast<int>(Elems.size()))
-        optimizationPolicy.activeRegion = Elems[iElm].geo;
 	if (iElm < 0 || iElm >= static_cast<int>(Elems.size())) return 0;
 	if (isDelEle(iElm))
 		return 1;//remove success
@@ -1725,6 +1762,8 @@ int DT::removebadtet_addPnt(int iElm) {
         throw std::logic_error("Topology insertion must run outside a parallel region");
     if (iElm < 0 || iElm >= static_cast<int>(Elems.size()) || isDelEle(iElm) ||
         isvirtualtet(iElm) || ishulltet(iElm)) return 0;
+    if (topologyRepairEnabled && !topologyRepairDeferred && AniSol.empty())
+        return insertInteriorRepair(iElm);
 	int p0 = Elems[iElm].form[0];
 	int p1 = Elems[iElm].form[1];
 	int p2 = Elems[iElm].form[2];
@@ -1980,7 +2019,7 @@ int DT::removebadtet_addPnt(int iElm) {
 int DT::insertInteriorRepair(int tet) {
     if (parallelTopologyBatch || omp_in_parallel())
         throw std::logic_error("Interior repair must run outside a parallel region");
-    if (!improve_step || improve_Metric != SUS_METRIC || !AniSol.empty() ||
+    if (!improve_step || !AniSol.empty() ||
         topologyInteriorPointBudget == 0 || topologyInteriorCellBudget == 0 ||
         !std::isfinite(topologyInteriorQualityGoal) || !(topologyInteriorQualityGoal > 0) || tet < 0 || tet >= static_cast<int>(Elems.size()) ||
         isDelEle(tet) || isvirtualtet(tet) || ishulltet(tet)) return 0;
@@ -2034,6 +2073,25 @@ int DT::insertInteriorRepair(int tet) {
         // A point must improve the entire cavity, not just replace the target.
         if (!(newMin > oldMin + std::max(1e-12,oldMin * 0.01)) || newBad > oldBad ||
             !(newPenalty < oldPenalty * 0.95)) continue;
+        if (!topologyRepairDeferred) {
+            const auto before = measureOptimizationQuality(*this,&plan.cavity);
+            OptimizationQuality after;
+            for (const BWFace& face : plan.faces)
+                addOptimizationQuality(*this,after,plan.request.point.data(),
+                    Nodes[face.vertices[0]].pt,Nodes[face.vertices[1]].pt,
+                    Nodes[face.vertices[2]].pt);
+            OptimizationPolicy acceptance = optimizationPolicy;
+            if (!acceptance.enabled) {
+                acceptance.meanAngle = before.meanAngle();
+                acceptance.meanJacobian = before.meanJacobian();
+            }
+            if (!optimizationBoundaryAccept(acceptance,before,after) ||
+                (optimizationPolicy.enabled &&
+                 (after.minAngle + 1e-10 < optimizationPolicy.angleFloor ||
+                  after.minJacobian + 1e-12 < optimizationPolicy.jacobianFloor)) ||
+                after.minAngle + 1e-10 < before.minAngle ||
+                after.minJacobian + 1e-12 < before.minJacobian) continue;
+        }
         std::vector<int>& slots = serialBW.slots;
         slots.clear(); slots.reserve(plan.faces.size());
         const int node = addNode(plan.request.point[0],plan.request.point[1],plan.request.point[2],plan.request.space);
@@ -2045,7 +2103,9 @@ int DT::insertInteriorRepair(int tet) {
         }
         commitBW(*this,plan,node,slots); finishBW(*this,plan);
         --topologyInteriorPointBudget; topologyInteriorCellBudget -= growth;
-        smoothInteriorPoint(node);
+        // SUS smoothing updates SUS caches. Hybrid/other metric callers keep
+        // the freshly computed cache produced by finishBW instead.
+        if (improve_Metric == SUS_METRIC) smoothInteriorPoint(node);
         return 1;
     }
     return 0;
@@ -4898,16 +4958,12 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
     if (optimizationPolicy.enabled) {
         const auto oldQuality = measureOptimizationQuality(*this, &shell);
         OptimizationQuality newQuality;
-        std::set<int> physicalRegions;
-        for (int t : shell) if (!ishulltet(t) && !isvirtualtet(t)) physicalRegions.insert(Elems[t].geo);
         for (const auto& cell : mesh.T) {
             bool physical = true;
             for (int j = 0; j < 4; ++j) physical = physical && mpn[cell[j]] != ghost;
             if (!physical) continue;
             double p[4][3];
             for (int j = 0; j < 4; ++j) for (int k = 0; k < 3; ++k) p[j][k] = mesh.V[cell[j]][k];
-            for (int region : physicalRegions) for (int a = 0; a < 4; ++a) for (int b = 0; b < a; ++b)
-                if (!optimizationPolicy.edgeAllowed(region, mpn[cell[a]], mpn[cell[b]], p[a], p[b])) return 0;
             addOptimizationQuality(*this, newQuality, p[0], p[1], p[2], p[3]);
         }
         if (!optimizationBoundaryAccept(optimizationPolicy, oldQuality, newQuality)) return 0;

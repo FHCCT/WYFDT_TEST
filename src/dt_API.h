@@ -44,7 +44,7 @@ namespace dt {
 		double minEdge = -1;		//最小网格边长，默认不启动（-1），可以主动设置
 		double maxEdge = -1;		//最大网格边长，默认不启动（-1），可以主动设置
 		double growsize = 1.01;     //边界增长率，默认1.01，大于1
-		double optanglestrict = 1; // Minimum dihedral angle in degrees for insertion; 0 disables insertion.
+		double optanglestrict = 1; // Minimum dihedral repair threshold in degrees; 0 disables only the angle trigger (SJ < 1e-5 still triggers).
 		double optTh = 0.2;		    //通用优化目标
 		double adpangle = 170;
 		std::string filename;

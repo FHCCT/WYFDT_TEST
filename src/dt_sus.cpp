@@ -1,4 +1,5 @@
 #include "dt.h"
+#include "dt_joint_smoothing.h"
 
 // Escobar et al., CMAME 192 (2003), 2775-2787; SUS code (2010),
 // Calcula_Delta / K_Knupp_Modif_directa and TechNote.pdf.
@@ -285,15 +286,19 @@ int dt::DT::smooth_sus(int iNod, double minimumQualityFloor) {
         susIdleStates.resize(Nodes.size());
     SusIdleState* const idleState = iNod < susIdleStates.size() ? &susIdleStates[iNod] : nullptr;
     std::vector<double> neighborhood;
+    std::vector<int> neighborhoodNodes;
     if (idleState) {
-        neighborhood.reserve(sph.size() * 17 + 1);
+        // Connectivity is exact; each distinct vertex's coordinates occur once.
+        neighborhoodNodes.assign(neighbors.begin(), neighbors.end());
+        neighborhoodNodes.push_back(iNod);
+        std::sort(neighborhoodNodes.begin(), neighborhoodNodes.end());
+        neighborhood.reserve(sph.size() * 5 + neighborhoodNodes.size() * 3 + 1);
         for (int t : sph) {
             neighborhood.push_back(t);
-            for (int n : Elems[t].form) {
-                neighborhood.push_back(n);
-                for (int j = 0; j < 3; ++j) neighborhood.push_back(Nodes[n].pt[j]);
-            }
+            for (int n : Elems[t].form) neighborhood.push_back(n);
         }
+        for (int n : neighborhoodNodes)
+            for (int j = 0; j < 3; ++j) neighborhood.push_back(Nodes[n].pt[j]);
         // A changed pass floor must invalidate the unchanged-neighborhood cache.
         neighborhood.push_back(minimumQualityFloor);
         if (!idleState->neighborhood.empty() && idleState->neighborhood == neighborhood && idleState->skips < 3) {
@@ -304,15 +309,11 @@ int dt::DT::smooth_sus(int iNod, double minimumQualityFloor) {
     }
     auto rememberIdle = [&]() {
         if (!idleState) return;
-        size_t k = 0;
-        for (int t : sph) {
-            ++k;
-            for (int n : Elems[t].form) {
-                ++k;
-                for (int j = 0; j < 3; ++j) neighborhood[k++] = Nodes[n].pt[j];
-            }
-        }
-        *idleState = SusIdleState{neighborhood, 0};
+        size_t k = sph.size() * 5;
+        for (int n : neighborhoodNodes)
+            for (int j = 0; j < 3; ++j) neighborhood[k++] = Nodes[n].pt[j];
+        idleState->neighborhood.swap(neighborhood);
+        idleState->skips = 0;
     };
     const Vec origin = Eigen::Map<Vec>(Nodes[iNod].pt);
     double scale = 0;
@@ -517,16 +518,25 @@ int dt::DT::smoothInteriorPoint(int iNod, double minimumQualityFloor) {
         if (iNod < 0 || iNod >= static_cast<int>(Nodes.size()) || iNod == ghost ||
             isDelNod(iNod) || isbndpnt(iNod)) return 0;
         std::vector<int> star; findSphere(iNod, star);
-        const auto before = measureOptimizationQuality(*this, &star);
-        if (!before.valid) return 0;
         std::array<double, 3> origin; std::copy(Nodes[iNod].pt, Nodes[iNod].pt + 3, origin.begin());
         std::vector<double> qualities; qualities.reserve(star.size());
         for (int t : star) qualities.push_back(Elems[t].q);
         const int result = smooth_sus(iNod, 1e-12);
         if (result != 1) return result;
+        // An idle/rejected SUS trial needs no A/J measurement. Reconstruct the
+        // old star without writing shared coordinates after a successful trial.
+        OptimizationQuality before;
+        for (int t : star) {
+            const double* p[4];
+            for (int k = 0; k < 4; ++k) {
+                const int n = Elems[t].form[k];
+                p[k] = n == iNod ? origin.data() : Nodes[n].pt;
+            }
+            addOptimizationQuality(*this, before, p[0], p[1], p[2], p[3]);
+        }
+        before.valid = before.valid && before.count > 0;
         const auto after = measureOptimizationQuality(*this, &star);
-        if (optimizationPointAccept(optimizationPolicy, before, after) &&
-            optimizationPolicy.moveAllowed(*this, iNod, Nodes[iNod].pt)) return 1;
+        if (optimizationPointAccept(optimizationPolicy, before, after)) return 1;
         std::copy(origin.begin(), origin.end(), Nodes[iNod].pt);
         for (size_t i = 0; i < star.size(); ++i) Elems[star[i]].q = qualities[i];
         susIdleStates[iNod] = SusIdleState{};
@@ -642,5 +652,185 @@ int dt::DT::smooth_angle(int iNod, double minimumQualityFloor) {
     if (!result.allFinite() || !(evaluate(result,initialAngle+1e-12)>initialAngle+1e-12)) return 0;
     for (int j=0; j<3; ++j) Nodes[iNod].pt[j]=result[j];
     for (int t:star) updateQuality(t);
+    return 1;
+}
+
+namespace {
+struct JointTet {
+    double a=0,j=0,q=0;
+    Vec ga=Vec::Zero(),gj=Vec::Zero();
+    std::array<double,6> angles;
+    std::array<Vec,6> angleGradients;
+    std::array<double,4> corners;
+    std::array<Vec,4> cornerGradients;
+};
+bool jointMinimumAngleGradients(const SusTet& tet,const Vec& x,std::array<double,6>& angles,std::array<Vec,6>& gradients) {
+    auto p=tet.points;p[tet.freeIndex]=x;
+    const double det=sigma(p)/std::sqrt(2.0);
+    if(!(det>0))return false;
+    const Vec a=p[1]-p[0],b=p[2]-p[0],c=p[3]-p[0];
+    std::array<Vec,4> gd;gd[1]=b.cross(c);gd[2]=c.cross(a);gd[3]=a.cross(b);gd[0]=-gd[1]-gd[2]-gd[3];
+    const int faces[4][3]={{1,2,3},{0,3,2},{0,1,3},{0,2,1}};
+    std::array<Vec,4> normals;std::array<Mat,4> dn;bool ready[4]={false,false,false,false};
+    for(int f=0;f<4;++f)normals[f]=(p[faces[f][1]]-p[faces[f][0]]).cross(p[faces[f][2]]-p[faces[f][0]]);
+    int edge=0;double lo=DBL_MAX;
+    for(int i=0;i<3;++i)for(int j=i+1;j<4;++j,++edge) {
+        const int k=i>0?0:(j>1?1:2),l=6-i-j-k;
+        angles[edge]=std::atan2(det*(p[j]-p[i]).norm(),-normals[k].dot(normals[l]));
+        lo=std::min(lo,angles[edge]);gradients[edge].setZero();
+    }
+    auto derivative=[&](int f) {
+        if(ready[f])return;
+        const int i=faces[f][0],j=faces[f][1],k=faces[f][2];const Vec u=p[j]-p[i],v=p[k]-p[i];
+        for(int axis=0;axis<3;++axis) {
+            const Vec e=Vec::Unit(axis);
+            dn[f].col(axis)=((j==tet.freeIndex)-(i==tet.freeIndex))*e.cross(v)
+                +((k==tet.freeIndex)-(i==tet.freeIndex))*u.cross(e);
+        }
+        ready[f]=true;
+    };
+    edge=0;
+    for(int i=0;i<3;++i)for(int j=i+1;j<4;++j,++edge) {
+        if(angles[edge]>lo+1e-10)continue;
+        const int k=i>0?0:(j>1?1:2),l=6-i-j-k;derivative(k);derivative(l);
+        const Vec d=p[j]-p[i];const double length=d.norm();
+        const double y=det*length,z=-normals[k].dot(normals[l]);
+        const Vec gy=length*gd[tet.freeIndex]+det*((j==tet.freeIndex)-(i==tet.freeIndex))*d/length;
+        const Vec gz=-dn[k].transpose()*normals[l]-dn[l].transpose()*normals[k];
+        gradients[edge]=(z*gy-y*gz)/(y*y+z*z);
+        if(!gradients[edge].allFinite())return false;
+    }
+    return true;
+}
+bool jointTet(const SusTet& tet,const Vec& x,JointTet& out,bool gradients) {
+    auto p=tet.points;p[tet.freeIndex]=x;
+    const double det=sigma(p)/std::sqrt(2.0);
+    if (!(det>0) || !std::isfinite(det)) return false;
+    out.q=signedQuality(p);if (!(out.q>0))return false;
+    if (gradients) {
+        if (!jointMinimumAngleGradients(tet,x,out.angles,out.angleGradients))return false;
+    } else {
+        const int faces[4][3]={{1,2,3},{0,3,2},{0,1,3},{0,2,1}};
+        std::array<Vec,4> normal;
+        for(int k=0;k<4;++k)normal[k]=(p[faces[k][1]]-p[faces[k][0]]).cross(p[faces[k][2]]-p[faces[k][0]]);
+        int edge=0;
+        for(int i=0;i<3;++i)for(int j=i+1;j<4;++j,++edge) {
+            const int k=i>0?0:(j>1?1:2),l=6-i-j-k;
+            out.angles[edge]=std::atan2(det*(p[j]-p[i]).norm(),-normal[k].dot(normal[l]));
+        }
+    }
+    const double ideal=std::acos(1.0/3.0);
+    out.a=*std::min_element(out.angles.begin(),out.angles.end())/ideal;
+    if (gradients) {
+        int active=0;out.ga.setZero();
+        for(int k=0;k<6;++k)if(out.angles[k]<=out.a*ideal+1e-10) {
+            out.ga+=out.angleGradients[k]/ideal;++active;
+        }
+        out.ga/=std::max(1,active);
+    }
+    const Vec u=p[1]-p[0],v=p[2]-p[0],w=p[3]-p[0];
+    std::array<Vec,4> gd;gd[1]=v.cross(w);gd[2]=w.cross(u);gd[3]=u.cross(v);gd[0]=-gd[1]-gd[2]-gd[3];
+    for(int corner=0;corner<4;++corner) {
+        double product=1;Vec logDerivative=Vec::Zero();
+        for(int k=0;k<4;++k)if(k!=corner) {
+            const Vec edge=p[k]-p[corner];const double length2=edge.squaredNorm();
+            if (!(length2>0))return false;
+            product*=std::sqrt(length2);
+            if(gradients) {
+                if(tet.freeIndex==k)logDerivative+=edge/length2;
+                if(tet.freeIndex==corner)logDerivative-=edge/length2;
+            }
+        }
+        out.corners[corner]=std::sqrt(2.0)*det/product;
+        if(gradients)out.cornerGradients[corner]=out.corners[corner]*(gd[tet.freeIndex]/det-logDerivative);
+    }
+    out.j=*std::min_element(out.corners.begin(),out.corners.end());
+    if(gradients) {
+        out.gj.setZero();int active=0;
+        for(int k=0;k<4;++k)if(out.corners[k]<=out.j+1e-10) {out.gj+=out.cornerGradients[k];++active;}
+        out.gj/=std::max(1,active);
+    }
+    return std::isfinite(out.a)&&std::isfinite(out.j)&&out.a>0&&out.j>0;
+}
+struct JointEvaluation {
+    double objective=0;
+    Vec gradient=Vec::Zero();
+    dt::detail::JointSmoothingQuality quality;
+    bool valid=false;
+};
+JointEvaluation evaluateJoint(const std::vector<SusTet>& tets,const Vec& x,bool gradients) {
+    JointEvaluation out;
+    Vec angleGradient=Vec::Zero(),jacobianGradient=Vec::Zero();
+    for (const auto& tet:tets) {
+        JointTet q;if (!jointTet(tet,x,q,gradients))return out;
+        const double angle=q.a*std::acos(1.0/3.0)*180/std::acos(-1.0);
+        out.quality.angle+=angle;out.quality.jacobian+=q.j;
+        out.quality.minAngle=std::min(out.quality.minAngle,angle);
+        out.quality.minJacobian=std::min(out.quality.minJacobian,q.j);
+        out.quality.minSus=std::min(out.quality.minSus,q.q);
+        out.quality.badAngle+=angle<.1;out.quality.badJacobian+=q.j<1e-5;
+        ++out.quality.count;
+        out.objective+=.5*(q.a+q.j);
+        angleGradient+=q.ga;jacobianGradient+=q.gj;
+    }
+    out.quality.angle/=tets.size();out.quality.jacobian/=tets.size();
+    angleGradient/=tets.size();jacobianGradient/=tets.size();out.objective/=tets.size();
+    if (gradients) {
+        // A direction must ascend both normalized mean-quality gradients.
+        std::vector<Vec> active;
+        if (angleGradient.norm()>1e-14)active.push_back(angleGradient.normalized());
+        if (jacobianGradient.norm()>1e-14)active.push_back(jacobianGradient.normalized());
+        out.gradient=commonAscentDirection(active,1);
+    }
+    out.valid=out.quality.valid=true;
+    return out;
+}
+}
+
+int dt::DT::smoothAngleJacobian(int node,double floor) {
+    if (node<0 || node>=static_cast<int>(Nodes.size()) || node==ghost || isDelNod(node) ||
+        isCornerpnt(node) || lockV.count(node) || periodic_P.count(node) || isbndpnt(node))return 0;
+    std::vector<int> star;findSphere(node,star);
+    if (star.empty())return 0;
+    const auto before=detail::jointSmoothingQuality(*this,star,node);
+    if (!before.valid)return 0;
+    floor=std::min(before.minSus,floor);
+    const Vec origin(Nodes[node].pt);double scale=0;
+    for (int t:star)for (int n:Elems[t].form)scale=std::max(scale,(Vec(Nodes[n].pt)-origin).norm());
+    if (!(scale>0))return 0;
+    std::vector<SusTet> tets(star.size());
+    for (size_t i=0;i<star.size();++i)for (int k=0;k<4;++k) {
+        const int n=Elems[star[i]].form[k];tets[i].points[k]=(Vec(Nodes[n].pt)-origin)/scale;
+        if (n==node)tets[i].freeIndex=k;
+    }
+    Vec x=Vec::Zero();auto current=evaluateJoint(tets,x,true);
+    if (!current.valid)return 0;
+    double previousStep=.25;
+    for (int iteration=0;iteration<4;++iteration) {
+        Vec direction=current.gradient;
+        if (!direction.allFinite() || direction.norm()<1e-12)break;
+        direction*=.25/direction.norm();
+        double step=std::min(1.0,previousStep*2);bool accepted=false;JointEvaluation next;
+        for (int trial=0;trial<12;++trial,step*=.5) {
+            next=evaluateJoint(tets,x+step*direction,false);
+            if (next.valid && next.quality.minSus+1e-14>=floor &&
+                detail::jointSmoothingAccept(before,next.quality) &&
+                next.objective>current.objective+1e-12*std::max(1.0,std::abs(current.objective))) {
+                accepted=true;break;
+            }
+        }
+        if (!accepted)break;
+        const double gain=next.objective-current.objective;
+        x+=step*direction;previousStep=step;
+        if (step*direction.norm()<1e-8 || gain<1e-7*std::max(1.0,std::abs(current.objective)))break;
+        current=evaluateJoint(tets,x,true);if (!current.valid)break;
+    }
+    if (x.norm()<1e-12)return 0;
+    const Vec position=origin+scale*x;
+    const auto after=detail::jointSmoothingQuality(*this,star,node,position.data());
+    if (!after.valid || after.minSus+1e-14<floor || !detail::jointSmoothingAccept(before,after))return 0;
+    for (int k=0;k<3;++k)Nodes[node].pt[k]=position[k];
+    // Keep the caller's cached metric; topology and node selection are unchanged.
+    for (int t:star)updateQuality(t);
     return 1;
 }

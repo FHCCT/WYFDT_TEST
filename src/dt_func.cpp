@@ -785,18 +785,16 @@ void DT::getMeshEdgebyGeo(Mesh& mesh) {
 	return;
 }
 //--------------------- Mesh Quality ---------------------
-double DT::tetquality(double v1[3], double v2[3], double v3[3], double v4[3], double* AniMetric, int qualmeasure) {
-    if (optimizationPolicy.enabled && optimizationPolicy.inTopology) {
-        if (!optimizationPolicy.tetAllowed(v1, v2, v3, v4)) return 0;
+double DT::tetquality(double v1[3], double v2[3], double v3[3], double v4[3], double* AniMetric, int qualmeasure, bool applyTopologyGuard) {
+    const bool guarded = applyTopologyGuard && optimizationPolicy.enabled && optimizationPolicy.inTopology;
+    if (guarded || qualmeasure == ANGLE_JACOBIAN_METRIC) {
         double low = 0, high = 0; std::vector<double> angles;
-        if (!CalDihedral(v1, v2, v4, v3, low, high, angles) ||
-            RADIO2ANGLE(low) + 1e-10 < optimizationPolicy.angleFloor ||
-            ScaledJacobian(v1, v2, v3, v4) + 1e-12 < optimizationPolicy.jacobianFloor) return 0;
-    }
-    if (qualmeasure == ANGLE_JACOBIAN_METRIC) {
-        double low = 0, high = 0; std::vector<double> angles;
-        if (!CalDihedral(v1, v2, v4, v3, low, high, angles)) return 0;
-        return angleJacobianQuality(low / std::acos(1.0 / 3.0), ScaledJacobian(v1, v2, v3, v4));
+        if (!CalDihedral(v1, v2, v4, v3, low, high, angles, true)) return 0;
+        const double jacobian = ScaledJacobian(v1, v2, v3, v4);
+        if (guarded && (RADIO2ANGLE(low) + 1e-10 < optimizationPolicy.angleFloor ||
+            jacobian + 1e-12 < optimizationPolicy.jacobianFloor)) return 0;
+        if (qualmeasure == ANGLE_JACOBIAN_METRIC)
+            return angleJacobianQuality(low / std::acos(1.0 / 3.0), jacobian);
     }
 	if (qualmeasure == SUS_METRIC) return quality_sus(v1, v2, v3, v4);
 
@@ -809,7 +807,7 @@ double DT::tetquality(double v1[3], double v2[3], double v3[3], double v4[3], do
 		//use minimum dihedral angle is available.
 		double minangle, maxangle;
 		std::vector<double> Dihedral;
-		if (CalDihedral(v1, v2, v4, v3, minangle, maxangle, Dihedral)) {
+		if (CalDihedral(v1, v2, v4, v3, minangle, maxangle, Dihedral, true)) {
 			quality = std::sin(minangle);
 		}
 		else {
@@ -839,7 +837,7 @@ double DT::tetquality(double v1[3], double v2[3], double v3[3], double v4[3], do
 	because this formula is accurate in the entire range.
 */
 int  DT::CalDihedral(double v1[3], double v2[3], double v3[3], double v4[3],
-	double& minangle, double& maxangle, std::vector<double>& Dihedral) {
+	double& minangle, double& maxangle, std::vector<double>& Dihedral, bool minimumOnly) {
 	double point[4][3];      /* tet vertices */
 	double edgelength[3][4]; /* the lengths of each of the edges of the tet */
 	double facenormal[4][3]; /* the normals of each face of the tet */
@@ -852,7 +850,8 @@ int  DT::CalDihedral(double v1[3], double v2[3], double v3[3], double v4[3],
 
 	minangle = DBL_MAX;
 	maxangle = 0.0;
-	Dihedral.resize(6);
+    if (!minimumOnly) Dihedral.resize(6);
+    double minimumTangent = DBL_MAX;
 
 	for (i = 0; i < 3; i++) {
 		point[0][i] = v1[i];
@@ -908,6 +907,15 @@ int  DT::CalDihedral(double v1[3], double v2[3], double v3[3], double v4[3],
 
 			dotproduct = facenormal[k][0] * facenormal[l][0] + facenormal[k][1] * facenormal[l][1] + facenormal[k][2] * facenormal[l][2];
 
+            if (minimumOnly) {
+                // Every positive tetrahedron has an acute dihedral. On that
+                // interval atan is monotone: select its smallest tangent,
+                // then evaluate atan once using the original arithmetic.
+                if (dotproduct < 0.0)
+                    minimumTangent = std::min(minimumTangent,
+                        (-pyrvolume * sqrt(edgelength[i][j])) / dotproduct);
+                continue;
+            }
 			if (dotproduct != 0.0) {
 				tantheta = (-pyrvolume * sqrt(edgelength[i][j])) / dotproduct;
 				/* now compute the actual angle */
@@ -942,6 +950,7 @@ int  DT::CalDihedral(double v1[3], double v2[3], double v3[3], double v4[3],
 			if (angle > maxangle) maxangle = angle;
 		}
 	}
+    if (minimumOnly) minangle = atan(minimumTangent);
 	return 1;
 }
 

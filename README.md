@@ -1,99 +1,50 @@
-# WYFDT_TEST
+# DT
 
-DT 三维四面体网格生成与优化库，提供 C++ 库和命令行程序。
+三维四面体网格生成、优化与自适应库。需要 CMake 3.13+、C++11 和 OpenMP。
 
-## 构建
+## 集成到其他项目
 
-需要 CMake 3.15 或更高版本、支持 C++11 的编译器及 OpenMP。所需 Eigen、spdlog、CLI11 头文件随源码提供。
+将 `CMakeLists.txt`、`src/`、`extern/` 一起放入宿主项目，例如 `third_party/dt/`：
 
-```powershell
+```cmake
+add_subdirectory(third_party/dt)
+target_link_libraries(your_target PRIVATE dt::dt)
+```
+
+默认只构建静态库 `dt`。头文件路径、接口编译宏和 OpenMP 链接依赖会自动传递，无需宿主手动配置。不读取宿主特定的 CMake 脚本，也不修改宿主的全局编译选项或运行库设置。
+
+对外接口见 `src/dt_API.h`，通过 `#include <dt_API.h>` 使用；需要内部网格对象时可以包含 `dt.h`。API 实现在 `src/dt_api.cpp`，命令行入口独立放在 `src/dt_main.cpp`。
+
+## 单独构建静态库
+
+```sh
 cmake -S . -B build
 cmake --build build --config Release --parallel 4
 ```
 
-构建目标使用 C++11，并禁用编译器语言扩展；链接 `dt` 的 CMake 项目会继承 C++11 的最低语言要求。MSVC 没有严格的 `/std:c++11` 开关，其最低选项是 `/std:c++14`；严格兼容性使用 GCC 的 `-std=c++11 -pedantic-errors` 编译验证。
+Windows / Visual Studio 输出 `build/Release/dt.lib`；其他生成器的输出位置遵循 CMake 配置。
 
-Windows / Visual Studio 构建生成 `build/Release/dt.exe` 和 `build/Release/dt.lib`。
+## 可选命令行程序
 
-仅测试初始 Delaunay（在 `BndPntInst` 后停止）的随机点基准：
+唯一的项目开关为 `DT_BUILD_EXECUTABLE`，默认 `OFF`：
 
-```powershell
-cmake -S . -B build -DBUILD_BNDPNT_BENCHMARK=ON
-cmake --build build --config Release --target bndpnt_benchmark predicate_filter_check --parallel 4
-build/Release/predicate_filter_check.exe
-python tools/benchmark_bndpnt.py --tetgen D:\code\tetgen1.6.0\build\Release\tetgen.exe --counts 10000 100000 1000000 --verify-tetgen
+```sh
+cmake -S . -B build -DDT_BUILD_EXECUTABLE=ON
+cmake --build build --config Release --target dt_exec --parallel 4
 ```
 
-测试使用固定随机种子、单线程及三次计时中位数，并检查邻接、体积和局部 Delaunay 条件。计时包括 `BndPntInst` 内的点数据初始化、Hilbert 排序、插点和包围盒；不包括文件写出及验证。详细结果和优化说明见 [BndPntInst 性能检查](docs/bndpnt-performance.md)，数据结构、空腔规则及坐标平移问题的实测见 [第二轮诊断](docs/bndpnt-diagnosis.md)。
+命令行目标名为 `dt_exec`，输出程序名为 `dt`。Windows 下可运行：
 
-单元容量预留和静态谓词过滤现已接入正式初始插点路径，生成结果一致性及收益见 [主动优化验证](docs/bndpnt-active-optimization.md)。正式代码保留一份谓词实现及精确回退；`predicate_filter_check` 用于检查过滤前后的返回值逐位一致和线程隔离。
-
-对现有 VTK 仅执行四面体化、不恢复边界：
-
-```powershell
-python tools/benchmark_bndpnt.py --input test/gds_all_pre_dt_promoted_steiner.vtk --tetgen D:/code/tetgen1.6.0/build/Release/tetgen.exe --repeats 3 --output build/gds-tet/recheck
+```sh
+build/Release/dt.exe --help
+build/Release/dt.exe --input mesh.vtk --output result.vtk
 ```
 
-该文件的输入顺序会使早期多尺度样本偏向少数几何层，正式排序现先按确定性顺序打乱取样。计时、空腔工作量和结果一致性见 [GDS 文件四面体化对比](docs/gds-delaunay-performance.md)。
+## 随附依赖
 
-仅构建库：
+- Eigen：`extern/eigen`，许可见其中的 `COPYING*`。
+- spdlog / fmt：`extern/spdlog`，许可见 `LICENSE` 和 `include/spdlog/fmt/bundled/fmt.license.rst`。
+- 几何谓词与空间树：`extern/geom`、`extern/tree`。
+- CLI11：仅命令行程序使用，许可见 `extern/cli11/CLI11.hpp` 文件头。
 
-```powershell
-cmake -S . -B build -DBUILD_EXECUTABLE=OFF -DBUILD_LIBRARY=ON
-cmake --build build --config Release --parallel 4
-```
-
-## 运行
-
-```powershell
-./build/Release/dt.exe --help
-./build/Release/dt.exe --input mesh.vtk --constrain 0 --nthread 4
-```
-
-对外 C++ 接口见 `src/dt_API.h`。CMake 库目标为 `dt`，命令行目标为 `dt_exec`。
-
-## 各向同性自适应质量优化
-
-`--adptype 2` 使用统一默认参数：`--optloop 18 --optjacob 0.8 --optanglestrict 0 --adpangle 160`。显式传入的这四个选项优先，不再被入口覆盖。这里 `optjacob` 是当前阶段质量度量的候选阈值，不是最终平均雅可比的保证值；`optanglestrict=0` 仅关闭优化阶段的插点，按输入单元 ID 进行的自适应加密仍照常执行。
-
-所有常规优化入口统一使用 `flipEdgPass → TopologicalPass → SmoothPass`，按各流程原有约束决定是否执行边界翻转。`TopologicalPass` 直接收集并稳定排序候选，再执行翻转及失败修复；不再设置中间转发 Pass。`QuicklyOptPass` 在默认 18 轮预算下，前 12 轮使用 SUS 质量、最后 6 轮使用最小二面角质量；内部点在 SUS 阶段优先下降原 SUS 能量，质量守卫阻塞后才切换最低质量活跃集；角度阶段使用最小二面角活跃集。SUS 和角度阶段各至少一轮：总预算最低为 2，角度轮数为 max(1, floor(总轮数 / 3))，余下分配给 SUS，不再限制角度阶段最多 6 轮。SUS 阶段无差单元时直接进入角度阶段，角度阶段无差单元时才整体退出。不再使用雅可比组合度量。退出使用轮数预算或无候选差单元，插点角度阈值不作为整体质量的收敛判据。
-
-`SmoothPass` 每轮选择并染色普通边界点、内部点；染色覆盖所有相邻物理四面体（包括好单元），同色点并行、不同颜色依次执行。边界点调用切向光滑，内部点调用 `smoothInteriorPoint`，其中 `improve_Metric == 2` 分派到 `smooth_angle`，其余度量保留原来的 `smooth_sus` 路径，临时边界缓冲区按线程复用。普通点完成后，已登记的周期边界点按周期映射的完整连通组串行光滑，支持两个以上的对应点；全组使用同一平移位移，联合检查各侧质量下限、平均质量和边界三角形方向，通过后一起更新坐标及质量缓存。该过程保持已有周期偏移，不校正输入坐标偏差，也不推断漏记的周期点对。`modifyBnd == false` 时禁止所有边界移动；边界只在允许修改边界的 SUS/角度流程中参与；平面/直线特征移动必须位于全部相邻边界三角形的平面内，跳过角点、曲面点及锁定点/边/面。周期组中任一成员不允许移动时，全组保持不动。
-
-平滑使用原 SUS 能量/角度方法产生候选，但有效网格的每轮 `SmoothPass` 都做事务验收：从真实坐标重算平均 Shape、平均最小二面角及两项全局最差值；四项均不得下降（允许浮点舍入误差），且至少一项平均值必须改善。未通过时恢复本轮全部节点坐标和物理单元质量缓存，清除与废弃坐标有关的空闲缓存，撤销成功计数并停止本次平滑；日志输出 `Smooth rollback`。周期组与普通点一起接受或回退，平面、周期偏移和锁定约束继续生效。整轮内部允许局部取舍，最终必须通过整轮验收。无效输入的 SUS 解缠保留原路径。尺寸细化结束后补做最多 3 轮纯平滑，候选阈值取 `max(0.5, optTh)` 以覆盖中等质量单元，同样经过验收，不追加拓扑翻转或尺寸分裂。该保证只覆盖平滑阶段，不保证其他拓扑和细化操作也单调改善质量。
-
-角度活跃集以各相邻四面体的六个二面角为独立约束，收集接近最小角的解析梯度，通过梯度凸包的最小范数点寻找共同上升方向，并回溯步长。每次接受必须提高邻域最小二面角，同时保持正体积、SUS 质量下限，以及移动前的平均最小二面角和平均 SUS 质量；不承诺整个拓扑流程的最终平均质量。优化插点后的光滑也经过 `smoothInteriorPoint`，随当前度量分派。边界恢复/Steiner 移除和体积均匀化所用的专门光滑算法保留原有层级。
-
-库调用 `adaptation_by_Tetid` 时设置同一组 `Args` 即可复现该配置：`optloop=18, optTh=0.8, optanglestrict=0, adpangle=160`。库保留调用方的参数，不按模型名称选择策略。提高轮数会增加耗时；以上配置侧重最终质量，具体平均角度与雅可比仍取决于输入网格和边界约束。
-
-## 日志等级
-
-`--constrain 0` 的优化边界翻边、塌缩和平滑现增加原表面平面检查；默认优化及内部细化插点在提交前增加新空腔形状质量检查，拒绝数值退化的近共面单元。具体适用范围、质量阈值及 `gds_all_gap_stitched.vtk` 的完整验证见 [优化几何与插点质量检查](docs/gap-optimization-check.md)。
-
-`--adptype 6` 的尺寸细化独立使用 `BWAcceptance::VolumeOnly`：每轮先优化，再分裂特征边、普通表面边，最后插入内部非表面边的中点；同类边界候选按边长降序执行，每个单元分别选取最长特征边与最长普通表面边。细化保持 `improve_step=true`，继续更新新单元质量缓存，但不以 SUS 质量或质量下降拒绝插点，仅检查物理候选单元的有向体积超过当前 `minVolume_bw`；空腔、边界约束和拓扑合法性检查仍保留。边界分裂沿用局部空腔最小体积的十分之一与全局下限的较大值。细化阶段结束或提前退出时自动恢复默认接受规则，优化插点仍采用原质量门槛。候选表与内部扫描上限在各阶段开始时固定；新追加的边及单元通常留到下一轮，不要求在处理普通边前递归细分完全部特征子边。进展计数只统计成功操作。
-
-该流程的内部尺寸候选在分配顶点前检查附近边界边（包括普通表面边及特征边）：当候选到线段的垂直距离不超过 `0.001 × min(父边长度, 边界边长度)`（较短相关边长的 0.1%）、投影在线段内部、边关联同一体区域时，取消原内部候选，改为在该边界边中点分裂。命中锁定边/面或分裂失败时跳过原候选，不回退到贴边内部插点。空间索引在本轮边界加密后建立，后续分裂的子边动态加入，已删除边不参与判断；下一轮光滑后重新建立索引。端点外侧的纯顶点接近不触发此规则。该判断只位于 `OptSizeControl_yunbo` 的内部尺寸细化分支，优化修复插点、边界恢复及其他 BW 插点流程不使用它。
-
-边界恢复的交点候选拒绝后，中点回退详情在 `infolevel=2` 中输出。重复端点不再作为新插点；默认情况下，中点插入也失败时保留原边、原面并交由上层重试，实际失败警告附带定位信息。原 `Add Edge steiner point failed` 的原因和恢复效果对比见 [边界 Steiner 插点检查](docs/edge-steiner-recovery.md)。
-
-各向同性 SUS 优化现允许少于四个边界顶点的差角度单元尝试内部插点，提交前检查整个空腔的质量收益，并对新增路径设置所有轮次共用的点数和单元数预算。`optTh` 是候选阈值；固定边界形状和局部操作的可行性仍会限制最终质量。`--constrain 0 --optloop 10` 的原因分析及同网格对照见 [质量尾部与有限插点优化](docs/optloop10-quality-tail.md)。
-
-`Args::infolevel` / `--infolevel` 默认为 `1`：
-
-| 等级 | 输出 |
-| --- | --- |
-| 0 | 静默运行，仅输出 error；不输出 warning、步骤或统计信息。 |
-| 1 | 主要阶段及耗时；每轮边界边翻转成功数/尝试数、拓扑成功数/候选数、光滑成功数/调用数、Quality 汇总，以及二面角信息。 |
-| 2 | 包含 1 级内容，并输出子步骤耗时、迭代、边界恢复、线程配置和质量明细。 |
-
-大于 2 的旧参数按 2 处理。Quality 汇总使用当前优化度量，不再输出步骤前后的 SUS 质量快照。infolevel 为 0 时跳过二面角打印函数及其统计；体积优化停止判据需要的二面角仍独立计算。日志等级不改变迭代停止条件或网格结果，也不修改宿主程序的全局日志等级。计时按阶段汇总，不输出逐点性能日志；默认不生成 CSV 或临时网格文件。
-
-`dt_init` 在 `infolevel > 0` 时汇总 `constrain`、`refine`、线程数及优化参数；`refine == 1` 时另列 `size`、`minEdge`、`maxEdge`、`growsize`。线程数区分配置上限、用户请求值和按输入规模选出的初始线程数，后续阶段仍会动态调整。
-
-初始化同时输出输入点、线段、三角面和四面体数量。生成阶段在细化结束后汇总网格量与速度，计时涵盖边界点插入、边界恢复、区域分类及细化；优化阶段输出四面体数 `A->B` 和速度；`adaptation_by_YunBoSzieControl` 在导出网格后汇总最终四面体数、总耗时和速度。速度统一为 `W/s`（万个四面体每秒），按阶段结束四面体数除以耗时再除以 10000 计算。内部计数排除删除、虚拟和包围单元；自适应结束计数使用实际导出网格。文件写出只显示路径，不再计时。
-
-## 依赖
-
-第三方代码保留原版权说明。Eigen 的许可见 `extern/eigen/COPYING*`，spdlog 的许可见 `extern/spdlog/LICENSE`，CLI11 的许可位于 `extern/cli11/CLI11.hpp` 文件头。
-
-日志依赖使用 [spdlog 1.17.0](https://github.com/gabime/spdlog/releases/tag/v1.17.0) 及该版本配套的 fmt 12.1.0，位于 `extern/spdlog`。仅保留官方完整头文件和许可证，不引入示例、测试、源码构建目录或额外库目标。fmt 许可证位于 `include/spdlog/fmt/bundled/fmt.license.rst`。MSVC 构建使用 `FMT_UNICODE=0` 兼容现有 Windows 源码编码；通过 CMake 链接 `dt` 时自动继承该配置。
+保留第三方版权和许可文件。测试、基准、实验数据和历史报告不参与库构建，也无需复制到宿主项目。

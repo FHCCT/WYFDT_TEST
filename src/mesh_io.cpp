@@ -530,25 +530,34 @@ int dt::readVertex(std::string& filename, std::vector<std::array<double, 4>>& ad
 	return 1;
 }
 
-int dt::readRefineT(std::string& filename, std::vector<int>& refine_tet_id) {
-	std::ifstream file(filename);
-	if (!file.is_open()) {
-		spdlog::error("无法打开文件: {}", filename);
-		return 0;
-	}
+int dt::readRefineT(std::string& filename, std::vector<int>& refine_tri_id,
+    std::vector<int>& refine_tet_id) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        spdlog::error("Cannot open refinement file: {}", filename);
+        return 0;
+    }
 
-	size_t pointCount;
-	file >> pointCount; // 读取点的个数
-
-	refine_tet_id.resize(pointCount); // 调整 vector 大小
-
-	for (size_t i = 0; i < pointCount; ++i) {
-		file >> refine_tet_id[i];
-	}
-
-	file.close(); // 关闭文件
-
-	return 1;
+    // File order: triangle count, triangle IDs, tetrahedron count, tetrahedron IDs.
+    // Parse into temporaries so a malformed file cannot leave a partial selection.
+    std::vector<int> triangles, tetrahedra;
+    auto readIds = [&](std::vector<int>& ids) {
+        int count;
+        if (!(file >> count) || count < 0) return false;
+        for (int i = 0; i < count; ++i) {
+            int id;
+            if (!(file >> id) || id < 0) return false;
+            ids.push_back(id);
+        }
+        return true;
+    };
+    if (!readIds(triangles) || !readIds(tetrahedra) || !(file >> std::ws).eof()) {
+        spdlog::error("Invalid refinement file (expected triangle IDs followed by tetrahedron IDs): {}", filename);
+        return 0;
+    }
+    refine_tri_id.swap(triangles);
+    refine_tet_id.swap(tetrahedra);
+    return 1;
 }
 int dt::readNodesSize(std::string& filename, std::vector<double>& NodeSize) {
 	std::ifstream file(filename);

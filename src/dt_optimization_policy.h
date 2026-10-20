@@ -1,8 +1,5 @@
 #pragma once
-#include <array>
 #include <cstddef>
-#include <map>
-#include <unordered_map>
 #include <vector>
 
 namespace dt {
@@ -14,16 +11,6 @@ struct OptimizationPolicy {
     bool enabled = false, inTopology = false;
     double angleFloor = 0, jacobianFloor = 0;
     double meanAngle = 0, meanJacobian = 0;
-    double globalMaxEdge = 1e100;
-    int activeRegion = -1;
-    std::unordered_map<int, double> regionSize;
-    std::unordered_map<const double*, int> pointIds;
-    std::map<std::array<int, 3>, double> legacyLongEdges;
-
-    void captureSizes(DT& mesh);
-    bool edgeAllowed(int region, int a, int b, const double* pa, const double* pb) const;
-    bool moveAllowed(DT& mesh, int node, const double* point) const;
-    bool tetAllowed(const double* a, const double* b, const double* c, const double* d) const;
 };
 
 struct OptimizationQuality {

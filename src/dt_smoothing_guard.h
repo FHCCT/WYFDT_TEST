@@ -28,7 +28,7 @@ inline SmoothingQuality measureSmoothingQuality(DT& mesh, const std::vector<int>
         const double shape = mesh.quality_sus(a, b, c, d);
         double lo, hi;
         if (!(shape > 0) || !std::isfinite(shape) ||
-            !mesh.CalDihedral(a, b, d, c, lo, hi, angles) || !(lo > 0) || !std::isfinite(lo)) {
+            !mesh.CalDihedral(a, b, d, c, lo, hi, angles, true) || !(lo > 0) || !std::isfinite(lo)) {
             result.valid = false;
             return result;
         }

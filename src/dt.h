@@ -112,8 +112,6 @@ namespace dt {
             std::vector<double> neighborhood;
             int skips = 0;
             SusIdleState() = default;
-            SusIdleState(const std::vector<double>& savedNeighborhood, int savedSkips)
-                : neighborhood(savedNeighborhood), skips(savedSkips) {}
         };
         std::vector<SusIdleState> susIdleStates;
 		int improve_Metric;
@@ -239,8 +237,6 @@ namespace dt {
 		/****************** Mesh Improvement **************/
 		int improve_init(Args& args);
 		int TraditionalOptPass(Args& args);
-        int qualityOptimizationPass(int rounds, const std::unordered_map<int, double>& regionSize = {},
-            double globalMaxEdge = 1e100, bool smooth = true);
 		int OrthogonalityOptPass(Args& args);
 		int QuicklyOptPass(Args& args);
 		int QuicklyOptCoarsePass(Args& args);
@@ -282,14 +278,21 @@ namespace dt {
         struct TopologyCandidate { int tet; std::array<int, 4> form; };
         TopologyCandidate topologyCandidate(int t);
         bool topologyCandidateCurrent(const TopologyCandidate& candidate);
-        bool needsTopologyInsertion(int t, double angleDegrees);
-        bool hasBadDihedral(double angleDegrees);
-        // Quality threshold for flips; minimum dihedral in degrees for insertion (0 disables it).
-        int TopologicalPass(double improve_goal, double insert_angle_degrees, int nloop);
-        int TopologicalPass_serial(const std::vector<TopologyCandidate>& candidates, double improve_goal, double insert_angle_degrees);
-        int TopologicalPass_parallel(const std::vector<TopologyCandidate>& candidates, double improve_goal, double insert_angle_degrees, int workers);
-        // Failed flips: short boundary collapse first, then angle-gated insertion.
-        int tryTopologyRepair(const TopologyCandidate& candidate, double angleDegrees);
+        bool needsTopologyRepair(int t, double angleDegrees, bool includeJacobian = true);
+        // Angle < angleDegrees OR scaled Jacobian < 1e-5 selects repair.
+        // Zero disables only the angle branch, never the Jacobian safeguard.
+        int TopologicalPass(double improve_goal, double repair_angle_degrees, int nloop);
+        int TopologicalPass_serial(const std::vector<TopologyCandidate>& candidates, double improve_goal, double repair_angle_degrees);
+        int TopologicalPass_parallel(const std::vector<TopologyCandidate>& candidates, double improve_goal, double repair_angle_degrees, int workers);
+        // Failed ordinary flips: deeper flips, constrained remesh, then insertion.
+        int tryTopologyRepair(const TopologyCandidate& candidate, double angleDegrees,
+            OptimizationQuality* globalQuality = nullptr);
+        // Bounded constrained regeneration; no point or boundary changes.
+        // An optional current global summary is updated only after a successful commit.
+        int remeshTopologyPatch(int tet, OptimizationQuality* globalQuality = nullptr);
+        int repairBadTopologyPass(double angleDegrees);
+        bool topologyRepairEnabled = false, topologyRepairDeferred = false;
+        size_t topologyRemeshTrialBudget = 0;
         int removebadtet(int& iElm, int thread_n = -1);
         int removebadtet_addPnt(int iElm);
         // Extra interior repairs share a fixed budget across all optimization rounds.
@@ -420,8 +423,9 @@ namespace dt {
 		int getoppoP(int tet, int i);
 		//--------------------- Mesh Quality ---------------------
 		void printfDihedral(double& minD, double& minAvgD, double& maxD, double& maxAvgD);
-		int CalDihedral(double v1[3], double v2[3], double v3[3], double v4[3], double& minangle, double& maxangle, std::vector<double>& Dihedral);
-		double tetquality(double v1[3], double v2[3], double v3[3], double v4[3], double* AniMetric, int qualmeasure);
+        // minimumOnly leaves maxangle/Dihedral unmeasured and allocates no angle array.
+		int CalDihedral(double v1[3], double v2[3], double v3[3], double v4[3], double& minangle, double& maxangle, std::vector<double>& Dihedral, bool minimumOnly = false);
+		double tetquality(double v1[3], double v2[3], double v3[3], double v4[3], double* AniMetric, int qualmeasure, bool applyTopologyGuard = true);
 		double vlrms3ratio(double v1[3], double v2[3], double v3[3], double v4[3]);
 		double ScaledJacobian( double p0[3],  double p1[3],  double p2[3],  double p3[3], double eps= 1e-30);
 		double AspectRatio(double v1[3], double v2[3], double v3[3], double v4[3]);
@@ -493,7 +497,9 @@ namespace dt {
         };
         int prepareBoundarySmoothPoint(int node, BoundarySmoothWorkspace& workspace);
         int smoothPeriodicBoundaryGroup(const std::vector<int>& group, double minimumQualityFloor);
-        int smoothPlanarBoundaryPoint(int node, double minimumQualityFloor, BoundarySmoothWorkspace& workspace);
+        int smoothPlanarBoundaryPoint(int node, double minimumQualityFloor, BoundarySmoothWorkspace& workspace,
+            bool preserveAngleJacobian = false);
+        int smoothAngleJacobian(int node, double minimumQualityFloor);
         void mergeThinLayers(Mesh& mesh, TriHasher<int64_t>& tetFaces,
             const std::vector<double>& tetVolumes);
         int splitEdgImpl(int index, int deep, bool retryVolume);

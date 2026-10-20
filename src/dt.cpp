@@ -54,6 +54,8 @@ void DT::resetMeshState() {
     parallelFlipCount.fill(0); parallelTopologyBatch = false;
     susIdleStates.clear(); serialBW.slots.clear();
     topologyInteriorPointBudget = 0; topologyInteriorCellBudget = 0;
+    topologyRepairEnabled = false; topologyRepairDeferred = false;
+    topologyRemeshTrialBudget = 0;
     topologyInteriorQualityGoal = 0.2;
     ignoreIntersect = false; modifyBnd = false; addBoxFlag = false;
     tempfliptime = 0; initBWshell = 0; addst = 0; addstbnd = 0; AvgEdgLen = 0;

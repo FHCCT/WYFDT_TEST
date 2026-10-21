@@ -16,8 +16,7 @@ struct PatchFace { int cell = -1, face = -1, count = 0; };
 // All allocation and validation precede the first edit to the host mesh.
 bool replacePatch(DT& host, const std::vector<int>& cells, Mesh& mesh,
     const std::vector<int>& toGlobal, const std::map<Face, PatchBoundary>& boundary,
-    const OptimizationQuality& before, const DT::TopologyCandidate& seed,
-    OptimizationQuality* globalQuality) {
+    const OptimizationQuality& before, const DT::TopologyCandidate& seed) {
     if (mesh.V.size() != toGlobal.size() || mesh.T.empty() || mesh.T.size() > cells.size() * 2)
         return false;
     // outMesh may compact/reorder points. Match coordinates, never assume that
@@ -57,7 +56,7 @@ bool replacePatch(DT& host, const std::vector<int>& cells, Mesh& mesh,
         newVolume += volume;
         addOptimizationQuality(host,after,a,b,c,d);
         Elem element(v[0],v[1],v[2],v[3]); element.geo = host.Elems[seed.tet].geo;
-        element.q = host.tetquality(a,b,c,d,nullptr,host.improve_Metric);
+        element.q = host.tetquality(a,b,c,d,nullptr,host.improve_Metric,false);
         if (!(element.q > 0) || !std::isfinite(element.q)) return false;
         const int local = static_cast<int>(replacement.size());
         for (int f = 0; f < 4; ++f) {
@@ -85,22 +84,16 @@ bool replacePatch(DT& host, const std::vector<int>& cells, Mesh& mesh,
         "Local remesh quality: minA={:.6g}->{:.6g} minSJ={:.6g}->{:.6g} meanA={:.6g}->{:.6g} meanSJ={:.6g}->{:.6g}",
         before.minAngle,after.minAngle,before.minJacobian,after.minJacobian,
         before.meanAngle(),after.meanAngle(),before.meanJacobian(),after.meanJacobian());
-    // Preserve both bad tails and local means. SUS is only the generator's
-    // objective; accept a block by its actual angle and scaled Jacobian.
-    if (after.minAngle + 1e-10 < before.minAngle ||
-        after.minJacobian + 1e-12 < before.minJacobian ||
-        after.tinyAngle > before.tinyAngle || after.tinyJacobian > before.tinyJacobian ||
-        after.meanAngle() + 1e-10 < before.meanAngle() ||
-        after.meanJacobian() + 1e-12 < before.meanJacobian() ||
+    // Accept by the cavity's actual worst angle and scaled Jacobian: neither
+    // may decrease and at least one must improve by more than one percent.
+    // Local means/counts are diagnostics, not a veto on worst-cell repair.
+    // Near zero, an absolute tolerance must not mask a large relative loss.
+    const double angleTolerance = std::min(1e-10,before.minAngle*1e-10);
+    const double jacobianTolerance = std::min(1e-12,before.minJacobian*1e-10);
+    if (after.minAngle + angleTolerance < before.minAngle ||
+        after.minJacobian + jacobianTolerance < before.minJacobian ||
         !(after.minAngle > before.minAngle * 1.01 + 1e-10 ||
           after.minJacobian > before.minJacobian * 1.01 + 1e-12)) return false;
-    if (globalQuality) {
-        const double delta = double(after.count)-double(before.count);
-        if (!globalQuality->valid ||
-            after.angleSum-before.angleSum + 1e-10L < globalQuality->meanAngle()*delta ||
-            after.jacobianSum-before.jacobianSum + 1e-12L < globalQuality->meanJacobian()*delta)
-            return false;
-    }
     size_t exterior = 0;
     for (const auto& item : faces) if (item.second.count == 1) {
         ++exterior;
@@ -158,14 +151,6 @@ bool replacePatch(DT& host, const std::vector<int>& cells, Mesh& mesh,
     }
     host.Evacancy.swap(freeCells);
     if (host.QuantityControl) regionCount->second += static_cast<int>(count)-static_cast<int>(cells.size());
-    if (globalQuality) {
-        globalQuality->count = globalQuality->count-before.count+after.count;
-        globalQuality->angleSum += after.angleSum-before.angleSum;
-        globalQuality->jacobianSum += after.jacobianSum-before.jacobianSum;
-        globalQuality->tinyAngle = globalQuality->tinyAngle-before.tinyAngle+after.tinyAngle;
-        globalQuality->tinyJacobian = globalQuality->tinyJacobian-before.tinyJacobian+after.tinyJacobian;
-        // Local minima cannot decrease, so these remain conservative floors.
-    }
     for (int n : toGlobal) if (n < static_cast<int>(host.susIdleStates.size()))
         host.susIdleStates[n] = DT::SusIdleState{};
     if (host.infolevel > 1) host.meshLogger->debug(
@@ -175,40 +160,48 @@ bool replacePatch(DT& host, const std::vector<int>& cells, Mesh& mesh,
 }
 }
 
-int DT::remeshTopologyPatch(int tet, OptimizationQuality* globalQuality) {
+int DT::remeshTopologyPatch(int tet) {
     if (parallelTopologyBatch || omp_in_parallel())
         throw std::logic_error("Local remeshing must run outside a parallel region");
     if (!improve_step || !AniSol.empty() || topologyRemeshTrialBudget == 0 || tet < 0 ||
         tet >= static_cast<int>(Elems.size()) || isDelEle(tet) || ishulltet(tet) ||
         isvirtualtet(tet)) return 0;
     --topologyRemeshTrialBudget;
-    // Standalone failure repairs also need count-corrected global acceptance.
-    // The final batch supplies a shared, incrementally updated measurement.
-    OptimizationQuality measuredGlobal;
-    if (!globalQuality) {
-        measuredGlobal = measureOptimizationQuality(*this);
-        if (!measuredGlobal.valid) return 0;
-        globalQuality = &measuredGlobal;
-    }
     const auto seed = topologyCandidate(tet);
     const int region = Elems[tet].geo;
-    constexpr size_t maxCells = 96, maxNodes = 64;
-    std::vector<int> cells(1,tet), frontier(1,tet);
-    std::set<int> included{tet};
+    constexpr size_t maxCells = 192, maxNodes = 112;
     std::unique_ptr<DT> trial;
-    for (int ring = 1; ring <= 4; ++ring) {
-        std::vector<int> next;
-        for (int t : frontier) for (int f = 0; f < 4; ++f) {
+    std::set<std::vector<int>> tried;
+    auto physical = [&](int t) {
+        return t >= 0 && t < static_cast<int>(Elems.size()) && !isDelEle(t) &&
+            !ishulltet(t) && !isvirtualtet(t) && Elems[t].geo == region;
+    };
+    auto canAdd = [&](int t, const std::set<int>& included) {
+        if (!physical(t) || included.count(t)) return false;
+        for (int f = 0; f < 4; ++f) {
             const Face face = faceKey(Elems[t].form,f);
-            if (isBndTri(face[0],face[1],face[2])) continue;
-            const int n = getNeig(t,f);
-            if (n < 0 || n >= static_cast<int>(Elems.size()) || included.count(n) ||
-                isDelEle(n) || ishulltet(n) || isvirtualtet(n) || Elems[n].geo != region) continue;
-            if (cells.size() >= maxCells) continue;
-            included.insert(n); cells.push_back(n); next.push_back(n);
+            if (included.count(getNeig(t,f)) && isBndTri(face[0],face[1],face[2])) return false;
         }
-        frontier.swap(next);
-        if (ring == 1) continue;
+        return true;
+    };
+    auto expand = [&](std::vector<int>& cells, std::set<int>& included,
+                      const std::set<int>* allowed) {
+        const size_t original = cells.size();
+        for (size_t i = 0; i < original; ++i) {
+            const int t = cells[i];
+            for (int f = 0; f < 4; ++f) {
+                const Face face = faceKey(Elems[t].form,f);
+                if (isBndTri(face[0],face[1],face[2])) continue;
+                const int n = getNeig(t,f);
+                if (cells.size() >= maxCells || (allowed && !allowed->count(n)) || !canAdd(n,included)) continue;
+                included.insert(n); cells.push_back(n);
+            }
+        }
+        return cells.size() > original;
+    };
+    auto attempt = [&](const std::vector<int>& cells, const std::set<int>& included) {
+        auto signature = cells; std::sort(signature.begin(),signature.end());
+        if (!tried.insert(signature).second) return false;
         Mesh mesh;
         std::map<int,int> local;
         std::vector<int> toGlobal;
@@ -217,34 +210,27 @@ int DT::remeshTopologyPatch(int tet, OptimizationQuality* globalQuality) {
                 toGlobal.push_back(n);
                 mesh.V.push_back({{Nodes[n].pt[0],Nodes[n].pt[1],Nodes[n].pt[2]}});
             }
-        if (toGlobal.size() > maxNodes) break;
+        if (toGlobal.size() > maxNodes) return false;
         std::map<Face,PatchBoundary> boundary;
         for (int t : cells) for (int f = 0; f < 4; ++f) {
             const Face face = faceKey(Elems[t].form,f);
             if (included.count(getNeig(t,f))) {
-                // An internal constrained sheet can be reached around an edge.
-                // This first implementation only regenerates one unsplit block.
-                if (isBndTri(face[0],face[1],face[2])) return 0;
+                if (isBndTri(face[0],face[1],face[2])) return false;
                 continue;
             }
-            if (!boundary.emplace(face,PatchBoundary{t,f,getNeig(t,f),getNeigOrd(t,f)}).second) return 0;
+            if (!boundary.emplace(face,PatchBoundary{t,f,getNeig(t,f),getNeigOrd(t,f)}).second) return false;
             int ia,ib,ic,id; DNC(f,ia,ib,ic,id);
             mesh.F.push_back({{local[Elems[t].form[ib]],local[Elems[t].form[ic]],
                 local[Elems[t].form[id]],static_cast<int>(mesh.F.size())}});
         }
         const auto before = measureOptimizationQuality(*this,&cells);
-        if (!before.valid || boundary.empty()) return 0;
+        if (!before.valid || boundary.empty()) return false;
         std::map<std::array<int,2>,int> edgeUses;
         for (const auto& entry : boundary) for (int k = 0; k < 3; ++k) {
             std::array<int,2> edge{{entry.first[k],entry.first[(k+1)%3]}};
             std::sort(edge.begin(),edge.end()); ++edgeUses[edge];
         }
-        bool closed = true;
-        for (const auto& edge : edgeUses) if (edge.second != 2) { closed = false; break; }
-        if (!closed) {
-            if (frontier.empty()) break;
-            continue;
-        }
+        for (const auto& edge : edgeUses) if (edge.second != 2) return false;
         if (!trial) {
             trial.reset(new DT());
             trial->meshLogger = std::make_shared<spdlog::logger>("local_remesh_trial",
@@ -257,35 +243,32 @@ int DT::remeshTopologyPatch(int tet, OptimizationQuality* globalQuality) {
         catch (const std::bad_alloc&) { throw; }
         catch (...) { trial.reset(); }
         if (infolevel > 1) meshLogger->debug(
-            "Local remesh trial: ring={} cells={}->{} points={}->{} generated={}",
-            ring,cells.size(),mesh.T.size(),toGlobal.size(),mesh.V.size(),generated);
-        if (generated && replacePatch(*this,cells,mesh,toGlobal,boundary,before,seed,globalQuality)) return 1;
-        if (frontier.empty() || cells.size() >= maxCells) break;
+            "Local remesh trial: cells={}->{} points={}->{} generated={}",
+            cells.size(),mesh.T.size(),toGlobal.size(),mesh.V.size(),generated);
+        if (generated && replacePatch(*this,cells,mesh,toGlobal,boundary,before,seed)) return true;
+        return false;
+    };
+    // Start with small edge stars; a whole face ball can dilute a repair
+    // with unrelated cells. Each star stays in the seed's constrained sector.
+    for (int edge = 0; edge < 6; ++edge) {
+        const int a = seed.form[Egid[edge][0]], b = seed.form[Egid[edge][1]];
+        std::vector<int> star; findSphere(a,star);
+        std::set<int> allowed;
+        for (int t : star) if (physical(t) &&
+            std::find(Elems[t].form,Elems[t].form+4,b) != Elems[t].form+4)
+            allowed.insert(t);
+        std::vector<int> cells(1,tet); std::set<int> included{tet};
+        while (expand(cells,included,&allowed)) {}
+        if (attempt(cells,included)) return 1;
+    }
+    // If small stars fail, try face rings two through six with fixed limits.
+    std::vector<int> cells(1,tet); std::set<int> included{tet};
+    for (int ring = 1; ring <= 6; ++ring) {
+        const bool grew = expand(cells,included,nullptr);
+        if (ring > 1 && attempt(cells,included)) return 1;
+        if (!grew || cells.size() >= maxCells) break;
     }
     return 0;
 }
 
-int DT::repairBadTopologyPass(double angleDegrees) {
-    if (parallelTopologyBatch || omp_in_parallel())
-        throw std::logic_error("Local remeshing must run outside a parallel region");
-    if (!topologyRepairEnabled || topologyRepairDeferred) return 0;
-    MeshStageLog stageLog(*this,"Topology repair",2);
-    std::vector<TopologyCandidate> candidates;
-    for (int t = 0; t < static_cast<int>(Elems.size()); ++t)
-        if (needsTopologyRepair(t,angleDegrees))
-            candidates.push_back(topologyCandidate(t));
-    std::stable_sort(candidates.begin(),candidates.end(),[&](const TopologyCandidate& a,
-        const TopologyCandidate& b) { return Elems[a.tet].q < Elems[b.tet].q; });
-    if (candidates.empty()) return 0;
-    auto global = measureOptimizationQuality(*this);
-    if (!global.valid) return 0;
-    const size_t budget = topologyRemeshTrialBudget;
-    int accepted = 0;
-    for (const auto& candidate : candidates) {
-        if (topologyCandidateCurrent(candidate))
-            accepted += tryTopologyRepair(candidate,angleDegrees,&global);
-    }
-    if (infolevel > 1) meshLogger->debug("Topology repair pass: accepted={} remeshTrials={}",accepted,budget-topologyRemeshTrialBudget);
-    return accepted;
-}
 }

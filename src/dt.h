@@ -285,12 +285,10 @@ namespace dt {
         int TopologicalPass_serial(const std::vector<TopologyCandidate>& candidates, double improve_goal, double repair_angle_degrees);
         int TopologicalPass_parallel(const std::vector<TopologyCandidate>& candidates, double improve_goal, double repair_angle_degrees, int workers);
         // Failed ordinary flips: deeper flips, constrained remesh, then insertion.
-        int tryTopologyRepair(const TopologyCandidate& candidate, double angleDegrees,
-            OptimizationQuality* globalQuality = nullptr);
-        // Bounded constrained regeneration; no point or boundary changes.
-        // An optional current global summary is updated only after a successful commit.
-        int remeshTopologyPatch(int tet, OptimizationQuality* globalQuality = nullptr);
-        int repairBadTopologyPass(double angleDegrees);
+        int tryTopologyRepair(const TopologyCandidate& candidate, double angleDegrees);
+        // Edge stars followed by bounded face rings; no point/boundary changes.
+        // Quality acceptance measures only the cavity being replaced.
+        int remeshTopologyPatch(int tet);
         bool topologyRepairEnabled = false, topologyRepairDeferred = false;
         size_t topologyRemeshTrialBudget = 0;
         int removebadtet(int& iElm, int thread_n = -1);

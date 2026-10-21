@@ -800,7 +800,8 @@ int DT::OptSizeControl_yunbo(double lamasize,
 				if (facetNum[fid]>0 && FacetNum[fid] > facetNum[fid])
 					continue;
 			}
-            if (splitEdg(it.EdgeID) > 0) ++stop;
+            const int edge = longestRefinementBoundaryEdge(*this, it.EdgeID);
+            if (edge >= 0 && splitEdg(edge) > 0) ++stop;
 		}
 
         // 4. Recount after successful boundary splits.
@@ -847,7 +848,13 @@ int DT::OptSizeControl_yunbo(double lamasize,
                 const int boundaryEdge = refinementBoundary.nearby(addV, maxEdgLen, geoID);
                 if (boundaryEdge >= 0) {
                     ++redirected;
-                    if (!refinementBoundary.protectedEdge(boundaryEdge) && splitEdg(boundaryEdge) > 0) {
+                    // Redirection does not transfer the interior edge's size
+                    // violation to an already short boundary edge.
+                    const double boundarySize = distance(Nodes[SurEdgs[boundaryEdge].iStart].pt,
+                        Nodes[SurEdgs[boundaryEdge].iEnd].pt);
+                    const int splitEdge = needsSplit(geoID, boundarySize)
+                        ? longestRefinementBoundaryEdge(*this, boundaryEdge) : -1;
+                    if (splitEdge >= 0 && !refinementBoundary.protectedEdge(splitEdge) && splitEdg(splitEdge) > 0) {
                         ++boundarySplits;
                         ++stop;
                     }
@@ -888,7 +895,7 @@ int DT::OptSizeControl_yunbo(double lamasize,
     auto runOptimization = [&]() {
         improve_step = true;
         updateminVolume();
-        flipEdgPass(2);
+        flipEdgPass(1);
         improve_Metric = SUS_METRIC;
         prepareQuality();
         TopologicalPass(improve_goal, args.optanglestrict, 1);
@@ -1139,7 +1146,7 @@ void DT::updateminVolume(void) {
     std::vector<double> minima(workers, 1e-10);
 #pragma omp parallel num_threads(workers) if(workers > 1)
     {
-        double localMin = 1e-12;
+        double localMin = 1e-10;
 #pragma omp for schedule(static)
         for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
             if (isDelEle(t) || ishulltet(t) || isvirtualtet(t)) continue;
@@ -1369,79 +1376,59 @@ bool DT::needsTopologyRepair(int t, double angleDegrees, bool includeJacobian) {
     return !std::isfinite(minAngle) || RADIO2ANGLE(minAngle) < angleDegrees;
 }
 
-int DT::tryTopologyRepair(const TopologyCandidate& candidate, double angleDegrees,
-    OptimizationQuality* globalQuality) {
+int DT::tryTopologyRepair(const TopologyCandidate& candidate, double angleDegrees) {
     if (parallelTopologyBatch || omp_in_parallel())
         throw std::logic_error("Topology repair must run outside a parallel region");
     if (!topologyRepairEnabled || !topologyCandidateCurrent(candidate)) return 0;
-    // Preserve existing angle-triggered repairs inside size refinement. The
-    // added SJ trigger and deeper/remesh stages run after the size trajectory
-    // is finished, so they cannot make refinement recreate different slivers.
-    if (topologyRepairDeferred)
-        return needsTopologyRepair(candidate.tet,angleDegrees,false)
-            ? removebadtet_addPnt(candidate.tet) : 0;
-    if (!needsTopologyRepair(candidate.tet, angleDegrees)) return 0;
-    OptimizationQuality measured;
-    if (!globalQuality) {
-        measured = measureOptimizationQuality(*this);
-        if (!measured.valid) return 0;
-    }
-    const auto& baseline = globalQuality ? *globalQuality : measured;
-    // A metric-specific deep flip must not exchange one geometric failure for
-    // another. Scope A/J guards to this rare repair, leaving ordinary passes
-    // and the caller's selected objective unchanged.
-    struct RestoreRepairPolicy {
-        OptimizationPolicy& policy; OptimizationPolicy saved;
-        explicit RestoreRepairPolicy(OptimizationPolicy& value) : policy(value), saved(value) {}
-        ~RestoreRepairPolicy() { policy = saved; }
-    } restorePolicy(optimizationPolicy);
-    optimizationPolicy.enabled = optimizationPolicy.inTopology = true;
-    optimizationPolicy.angleFloor = std::max(optimizationPolicy.angleFloor,
-        std::max(baseline.minAngle,angleDegrees));
-    optimizationPolicy.jacobianFloor = std::max(optimizationPolicy.jacobianFloor,
-        std::max(baseline.minJacobian,1e-4));
-    optimizationPolicy.meanAngle = baseline.meanAngle();
-    optimizationPolicy.meanJacobian = baseline.meanJacobian();
-    int t = candidate.tet;
-    // Bound the extra search to the rare geometric failures, not every SUS
-    // candidate. Preserve callers that already used a deeper search.
+    // Size refinement retains its angle-only insertion path. Geometric repair
+    // is enabled only after refinement has finished changing the size field.
+    if (!needsTopologyRepair(candidate.tet, angleDegrees, !topologyRepairDeferred)) return 0;
+    if (topologyRepairDeferred) return removebadtet_addPnt(candidate.tet);
+
+    int tet = candidate.tet;
     if (optflipdeep < 4) {
-        struct RestoreDepth {
-            int& value; int saved;
-            explicit RestoreDepth(int& depth) : value(depth), saved(depth) {
-                value = std::min(4, std::max(2, saved + 2));
+        // Deep flips use the seed's geometric quality, never a mesh-wide
+        // minimum or mean. Their normal active-metric acceptance still applies.
+        OptimizationQuality quality;
+        const auto& p = candidate.form;
+        addOptimizationQuality(*this, quality, Nodes[p[0]].pt, Nodes[p[1]].pt,
+            Nodes[p[2]].pt, Nodes[p[3]].pt);
+        if (!quality.valid) return 0;
+        struct RestoreFlipState {
+            DT& mesh;
+            OptimizationPolicy policy;
+            int depth;
+            explicit RestoreFlipState(DT& value)
+                : mesh(value), policy(value.optimizationPolicy), depth(value.optflipdeep) {}
+            ~RestoreFlipState() {
+                mesh.optimizationPolicy = policy;
+                mesh.optflipdeep = depth;
             }
-            ~RestoreDepth() { value = saved; }
-        } restore(optflipdeep);
-        if (removebadtet(t, -1) == 1) {
-            // Existing flip primitives do not maintain region counters. A
-            // successful deep repair must leave them current for remeshing.
-            if (QuantityControl) {
-                GeoNum.clear();
-                for (int cell = 0; cell < static_cast<int>(Elems.size()); ++cell)
-                    if (!isDelEle(cell) && !ishulltet(cell) && !isvirtualtet(cell))
-                        ++GeoNum[Elems[cell].geo];
-            }
-            if (globalQuality) *globalQuality = measureOptimizationQuality(*this);
+        } restore(*this);
+        optimizationPolicy.enabled = optimizationPolicy.inTopology = true;
+        optimizationPolicy.angleFloor = std::max(quality.minAngle, angleDegrees);
+        optimizationPolicy.jacobianFloor = std::max(quality.minJacobian, 1e-4);
+        optflipdeep = std::min(4, std::max(2, optflipdeep + 2));
+        const int result = removebadtet(tet, -1);
+        if (result == 1) {
             if (infolevel > 1) meshLogger->debug("Topology repair: deeper flips succeeded");
             return 1;
         }
     }
-    // Failed trial flips may have relocated the original tetrahedron.
-    if (t < 0 || t >= static_cast<int>(Elems.size()) || isDelEle(t)) return 0;
-    auto current = topologyCandidate(t);
-    auto expected = candidate.form, actual = current.form;
-    std::sort(expected.begin(),expected.end()); std::sort(actual.begin(),actual.end());
-    if (actual != expected || !needsTopologyRepair(t, angleDegrees)) return 0;
-    if (remeshTopologyPatch(t,globalQuality ? globalQuality : &measured)) {
+
+    // Failed flips can relocate/reorder the seed. Do not repair a reused slot.
+    if (tet < 0 || tet >= static_cast<int>(Elems.size()) || isDelEle(tet)) return 0;
+    auto expected = candidate.form, actual = topologyCandidate(tet).form;
+    std::sort(expected.begin(), expected.end());
+    std::sort(actual.begin(), actual.end());
+    if (actual != expected || !needsTopologyRepair(tet, angleDegrees)) return 0;
+
+    // Each fallback validates its own actual cavity before committing changes.
+    if (remeshTopologyPatch(tet)) {
         if (infolevel > 1) meshLogger->debug("Topology repair: remesh succeeded");
         return 1;
     }
-    const int result = removebadtet_addPnt(t);
-    // The legacy boundary path can alter neighboring cells even if the seed
-    // survives; any caller-owned summary must describe the resulting mesh.
-    if (globalQuality && (result == 1 || !AniSol.empty()))
-        *globalQuality = measureOptimizationQuality(*this);
+    const int result = removebadtet_addPnt(tet);
     if (result == 1 && infolevel > 1) meshLogger->debug("Topology repair: insertion succeeded");
     return result;
 }
@@ -2080,15 +2067,10 @@ int DT::insertInteriorRepair(int tet) {
                 addOptimizationQuality(*this,after,plan.request.point.data(),
                     Nodes[face.vertices[0]].pt,Nodes[face.vertices[1]].pt,
                     Nodes[face.vertices[2]].pt);
-            OptimizationPolicy acceptance = optimizationPolicy;
-            if (!acceptance.enabled) {
-                acceptance.meanAngle = before.meanAngle();
-                acceptance.meanJacobian = before.meanJacobian();
-            }
+            OptimizationPolicy acceptance;
+            acceptance.meanAngle = before.meanAngle();
+            acceptance.meanJacobian = before.meanJacobian();
             if (!optimizationBoundaryAccept(acceptance,before,after) ||
-                (optimizationPolicy.enabled &&
-                 (after.minAngle + 1e-10 < optimizationPolicy.angleFloor ||
-                  after.minJacobian + 1e-12 < optimizationPolicy.jacobianFloor)) ||
                 after.minAngle + 1e-10 < before.minAngle ||
                 after.minJacobian + 1e-12 < before.minJacobian) continue;
         }

@@ -3,6 +3,37 @@
 
 namespace dt {
 
+// Follow increasing edge lengths before bisection. Splitting a short edge
+// repeatedly while leaving a long side intact creates a thin triangle fan.
+inline int longestRefinementBoundaryEdge(DT& mesh, int edge) {
+    const auto lengthSquared = [&](int e) {
+        return mesh.distance2(mesh.Nodes[mesh.SurEdgs[e].iStart].pt,
+            mesh.Nodes[mesh.SurEdgs[e].iEnd].pt);
+    };
+    for (;;) {
+        if (edge < 0 || edge >= static_cast<int>(mesh.SurEdgs.size()) ||
+            mesh.isDelSurEdg(edge) || mesh.lockE.count(edge)) return -1;
+        int longest = edge;
+        double maximum = lengthSquared(edge);
+        for (int face : mesh.SurEdgs[edge].face) {
+            if (mesh.isDelSurTri(face)) return -1;
+            if (mesh.lockF.count(face)) return -1;
+            const auto& p = mesh.SurTris[face].form;
+            for (int k = 0; k < 3; ++k) {
+                const int* found = mesh.BndEdg.find(p[k], p[(k+1)%3]);
+                if (!found || mesh.isDelSurEdg(*found)) return -1;
+                const double length = lengthSquared(*found);
+                if (length > maximum * (1 + 1e-12)) {
+                    maximum = length;
+                    longest = *found;
+                }
+            }
+        }
+        if (longest == edge) return edge;
+        edge = longest;
+    }
+}
+
 // Used only by the serial size-refinement pass. Rebuild after smoothing; during
 // refinement, append new edges and ignore deleted ones without changing the BW API.
 class RefinementBoundaryEdges {

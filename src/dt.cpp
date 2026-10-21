@@ -74,7 +74,7 @@ int DT::dt_init(Mesh& mesh, Args& args)
 	spdlogoutfile(args.outlogfile);
     meshLogger->set_level(infolevel == 0 ? spdlog::level::err :
         infolevel == 1 ? spdlog::level::info : spdlog::level::debug);
-	if (infolevel > 0) meshLogger->info("Version 2026.10.16");
+	if (infolevel > 0) meshLogger->info("Version 2026.10.21");
     MeshStageLog initLog(*this, "Initialize");
     if (infolevel > 0)
         meshLogger->info("Input mesh: points={} segments={} triangles={} tets={}",
@@ -5374,6 +5374,18 @@ int DT::flip32(std::vector<int>& oldtet, int ia, int ib, int thread_n) {
 		updateQuality(newb);
 	}
 
+    // Count the actual replaced cells, including inverse flips during rollback.
+    // Keeping this local avoids recounting the host mesh after each repair.
+    if (QuantityControl) {
+#pragma omp critical(dt_region_counts)
+        {
+            for (int cell : {oldtet[0], oldtet[1], oldtet[2]})
+                if (!ishulltet(cell) && !isvirtualtet(cell)) --GeoNum[Elems[cell].geo];
+            for (int cell : {newa, newb})
+                if (!ishulltet(cell) && !isvirtualtet(cell)) ++GeoNum[Elems[cell].geo];
+        }
+    }
+
 	//delet oldtet
 	if (thread_n == -1) {
 		DelEle(oldtet[0]);
@@ -5470,6 +5482,18 @@ int DT::flip23(std::vector<int>& oldtet, int a, int thread_n) {
 		updateQuality(newd);
 		updateQuality(newe);
 	}
+
+    // Count the actual replaced cells, including inverse flips during rollback.
+    // Keeping this local avoids recounting the host mesh after each repair.
+    if (QuantityControl) {
+#pragma omp critical(dt_region_counts)
+        {
+            for (int cell : {oldtet[0], oldtet[1]})
+                if (!ishulltet(cell) && !isvirtualtet(cell)) --GeoNum[Elems[cell].geo];
+            for (int cell : {newc, newd, newe})
+                if (!ishulltet(cell) && !isvirtualtet(cell)) ++GeoNum[Elems[cell].geo];
+        }
+    }
 
 	//delet oldtet
 	if (thread_n == -1) {

@@ -16,7 +16,7 @@ struct PatchFace { int cell = -1, face = -1, count = 0; };
 // All allocation and validation precede the first edit to the host mesh.
 bool replacePatch(DT& host, const std::vector<int>& cells, Mesh& mesh,
     const std::vector<int>& toGlobal, const std::map<Face, PatchBoundary>& boundary,
-    const OptimizationQuality& before, const DT::TopologyCandidate& seed) {
+    const OptimizationQuality& before, const DT::TopologyCandidate& seed, detail::QualityBudget* budget) {
     if (mesh.V.size() != toGlobal.size() || mesh.T.empty() || mesh.T.size() > cells.size() * 2)
         return false;
     // outMesh may compact/reorder points. Match coordinates, never assume that
@@ -38,6 +38,8 @@ bool replacePatch(DT& host, const std::vector<int>& cells, Mesh& mesh,
     std::set<std::array<int,4>> uniqueCells;
     auto seedKey = seed.form; std::sort(seedKey.begin(), seedKey.end());
     OptimizationQuality after;
+    detail::QualityTotals budgetBefore, budgetAfter;
+    if (budget) budgetBefore = budget->cells(host,cells);
     long double oldVolume = 0, newVolume = 0;
     for (int t : cells) oldVolume += host.calVolume(t);
     for (const auto& cell : mesh.T) {
@@ -55,6 +57,7 @@ bool replacePatch(DT& host, const std::vector<int>& cells, Mesh& mesh,
         if (!std::isfinite(volume) || !(volume > std::max(0.0,host.minVolume_bw))) return false;
         newVolume += volume;
         addOptimizationQuality(host,after,a,b,c,d);
+        if (budget) budget->add(host,budgetAfter,a,b,c,d);
         Elem element(v[0],v[1],v[2],v[3]); element.geo = host.Elems[seed.tet].geo;
         element.q = host.tetquality(a,b,c,d,nullptr,host.improve_Metric,false);
         if (!(element.q > 0) || !std::isfinite(element.q)) return false;
@@ -80,7 +83,7 @@ bool replacePatch(DT& host, const std::vector<int>& cells, Mesh& mesh,
     }
     if (used != matched || !after.valid || !after.count ||
         std::abs(newVolume-oldVolume) > 1e-10L * std::max(oldVolume,1e-30L)) return false;
-    if (host.infolevel > 1) host.meshLogger->debug(
+    if (!budget && host.infolevel > 1) host.meshLogger->debug(
         "Local remesh quality: minA={:.6g}->{:.6g} minSJ={:.6g}->{:.6g} meanA={:.6g}->{:.6g} meanSJ={:.6g}->{:.6g}",
         before.minAngle,after.minAngle,before.minJacobian,after.minJacobian,
         before.meanAngle(),after.meanAngle(),before.meanJacobian(),after.meanJacobian());
@@ -113,6 +116,8 @@ bool replacePatch(DT& host, const std::vector<int>& cells, Mesh& mesh,
         if (!((oldSide < 0 && newSide < 0) || (oldSide > 0 && newSide > 0))) return false;
     }
     if (exterior != boundary.size() || !host.topologyCandidateCurrent(seed)) return false;
+
+    if (budget && !budget->accepts(budgetBefore,budgetAfter)) return false;
 
     const size_t count = replacement.size(), originalSize = host.Elems.size();
     const size_t extra = count > cells.size() ? count-cells.size() : 0;
@@ -150,18 +155,19 @@ bool replacePatch(DT& host, const std::vector<int>& cells, Mesh& mesh,
         e.info = -1; e.geo = -1; e.q = -1;
     }
     host.Evacancy.swap(freeCells);
+    if (budget) budget->commit(budgetBefore,budgetAfter);
     if (host.QuantityControl) regionCount->second += static_cast<int>(count)-static_cast<int>(cells.size());
     for (int n : toGlobal) if (n < static_cast<int>(host.susIdleStates.size()))
         host.susIdleStates[n] = DT::SusIdleState{};
-    if (host.infolevel > 1) host.meshLogger->debug(
+    if (!budget && host.infolevel > 1) host.meshLogger->debug(
         "Local remesh: cells={}->{} minAngle={:.6g}->{:.6g} minSJ={:.6g}->{:.6g}",
         cells.size(),count,before.minAngle,after.minAngle,before.minJacobian,after.minJacobian);
     return true;
 }
 }
 
-int DT::remeshTopologyPatch(int tet) {
-    if (parallelTopologyBatch || omp_in_parallel())
+int DT::remeshTopologyPatch(int tet, detail::QualityBudget* budget) {
+    if (omp_in_parallel())
         throw std::logic_error("Local remeshing must run outside a parallel region");
     if (!improve_step || !AniSol.empty() || topologyRemeshTrialBudget == 0 || tet < 0 ||
         tet >= static_cast<int>(Elems.size()) || isDelEle(tet) || ishulltet(tet) ||
@@ -236,16 +242,45 @@ int DT::remeshTopologyPatch(int tet) {
             trial->meshLogger = std::make_shared<spdlog::logger>("local_remesh_trial",
                 std::make_shared<spdlog::sinks::null_sink_mt>());
         }
+        // Under a quality ledger, try deep flips privately before regenerating
+        // this same constrained patch. Export may compact points; replacePatch
+        // always matches actual host coordinates and validates the whole cavity.
+        if (budget) {
+            try {
+                Mesh flipMesh = mesh;
+                for (int cell : cells) {
+                    const auto& v = Elems[cell].form;
+                    flipMesh.T.push_back({{local[v[0]],local[v[1]],local[v[2]],local[v[3]],1}});
+                }
+                Args flipArgs; flipArgs.infolevel=0; flipArgs.outlogfile=0; flipArgs.nthread=1; flipArgs.optlevel=1;
+                if (trial->dt_init(flipMesh,flipArgs)) {
+                    trial->buildTetInfo(flipMesh,flipArgs); trial->improve_init(flipArgs);
+                    trial->modifyBnd=false; trial->improve_Metric=improve_Metric;
+                    trial->optflipdeep=2; trial->prepareQuality();
+                    int localSeed=0;
+                    if (trial->removebadtet(localSeed,-1)==1) {
+                        trial->RemoveTet(flipArgs); trial->outMesh(flipMesh,flipArgs);
+                        if (replacePatch(*this,cells,flipMesh,toGlobal,boundary,before,seed,budget)) return true;
+                    }
+                }
+            } catch (const std::bad_alloc&) { throw; }
+            catch (...) { trial.reset(); }
+            if (!trial) {
+                trial.reset(new DT());
+                trial->meshLogger = std::make_shared<spdlog::logger>("local_remesh_trial",
+                    std::make_shared<spdlog::sinks::null_sink_mt>());
+            }
+        }
         Args args; args.infolevel = 0; args.refine = 0; args.optlevel = 0;
         args.nthread = 1; args.constrain = 1; args.outlogfile = 0;
         bool generated = false;
         try { generated = trial->tetrahedralize(mesh,args) != 0; }
         catch (const std::bad_alloc&) { throw; }
         catch (...) { trial.reset(); }
-        if (infolevel > 1) meshLogger->debug(
+        if (!budget && infolevel > 1) meshLogger->debug(
             "Local remesh trial: cells={}->{} points={}->{} generated={}",
             cells.size(),mesh.T.size(),toGlobal.size(),mesh.V.size(),generated);
-        if (generated && replacePatch(*this,cells,mesh,toGlobal,boundary,before,seed)) return true;
+        if (generated && replacePatch(*this,cells,mesh,toGlobal,boundary,before,seed,budget)) return true;
         return false;
     };
     // Start with small edge stars; a whole face ball can dilute a repair

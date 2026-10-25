@@ -1,5 +1,6 @@
 #include "dt.h"
 #include "dt_joint_smoothing.h"
+#include <stdexcept>
 
 // Escobar et al., CMAME 192 (2003), 2775-2787; SUS code (2010),
 // Calcula_Delta / K_Knupp_Modif_directa and TechNote.pdf.
@@ -833,4 +834,147 @@ int dt::DT::smoothAngleJacobian(int node,double floor) {
     // Keep the caller's cached metric; topology and node selection are unchanged.
     for (int t:star)updateQuality(t);
     return 1;
+}
+
+namespace dt {
+namespace {
+using Vec = Eigen::Vector3d;
+detail::QualityTotals atPosition(DT& mesh, const std::vector<int>& star, int node,
+    const Vec& position, const detail::QualityBudget& budget, double volumeFloor = -DBL_MAX) {
+    detail::QualityTotals q;
+    for (int t : star) {
+        const double* p[4];
+        for (int k = 0; k < 4; ++k) {
+            const int n = mesh.Elems[t].form[k];
+            p[k] = n == node ? position.data() : mesh.Nodes[n].pt;
+        }
+        // A position below the unchanged local volume floor can never pass.
+        // Reject it before evaluating angles and Jacobians of the whole star.
+        if (volumeFloor != -DBL_MAX && !(GEOM_FUNC::orient3d(const_cast<double*>(p[0]),
+            const_cast<double*>(p[1]),const_cast<double*>(p[3]),const_cast<double*>(p[2])) > volumeFloor)) {
+            q.valid = false; break;
+        }
+        budget.add(mesh, q, p[0], p[1], p[2], p[3]);
+        if (!q.valid) break;
+    }
+    return q;
+}
+
+detail::QualityTotals tailCell(DT& mesh, int tet, const detail::QualityBudget& budget) {
+    detail::QualityTotals q;
+    const auto& p = mesh.Elems[tet].form;
+    double low = 0, high = 0;
+    std::vector<double> angles;
+    if (!mesh.CalDihedral(mesh.Nodes[p[0]].pt,mesh.Nodes[p[1]].pt,
+        mesh.Nodes[p[3]].pt,mesh.Nodes[p[2]].pt,low,high,angles,true) ||
+        !(RADIO2ANGLE(low) < budget.target())) return q;
+    // Retain the full finite/positive-shape check for all selected cells.
+    budget.add(mesh,q,mesh.Nodes[p[0]].pt,mesh.Nodes[p[1]].pt,
+        mesh.Nodes[p[2]].pt,mesh.Nodes[p[3]].pt);
+    return q;
+}
+
+int smoothTailPoint(DT& mesh, int node, detail::QualityBudget& budget) {
+    if (node < 0 || node >= static_cast<int>(mesh.Nodes.size()) || node == mesh.ghost ||
+        mesh.isDelNod(node) || mesh.isbndpnt(node) || mesh.lockV.count(node) || mesh.periodic_P.count(node)) return 0;
+    std::vector<int> star;
+    mesh.findSphere(node, star);
+    if (star.empty()) return 0;
+    std::vector<int> neighbors;
+    neighbors.reserve(star.size()*3);
+    for (int t : star) {
+        if (mesh.isDelEle(t) || mesh.ishulltet(t) || mesh.isvirtualtet(t)) return 0;
+        for (int n : mesh.Elems[t].form) if (n != node) neighbors.push_back(n);
+    }
+    std::sort(neighbors.begin(),neighbors.end());
+    neighbors.erase(std::unique(neighbors.begin(),neighbors.end()),neighbors.end());
+    const Vec origin(mesh.Nodes[node].pt);
+    const auto before = atPosition(mesh, star, node, origin, budget);
+    if (!before.valid || !(before.minAngle < budget.target())) return 0;
+    double scale = DBL_MAX;
+    Vec center = Vec::Zero();
+    for (int n : neighbors) {
+        const Vec offset = Vec(mesh.Nodes[n].pt) - origin;
+        scale = std::min(scale, offset.norm()); center += offset;
+    }
+    if (!(scale > 0) || !std::isfinite(scale) || neighbors.empty()) return 0;
+    center /= neighbors.size();
+    Vec gradient;
+    for (int k = 0; k < 3; ++k) {
+        Vec shift = Vec::Zero(); shift[k] = scale * 1e-5;
+        const auto plus = atPosition(mesh, star, node, origin + shift, budget);
+        const auto minus = atPosition(mesh, star, node, origin - shift, budget);
+        gradient[k] = plus.valid && minus.valid ? static_cast<double>(plus.focus - minus.focus) : 0;
+    }
+    std::vector<Vec> directions;
+    directions.reserve(8);
+    if (gradient.allFinite() && gradient.norm() > 0) directions.push_back(gradient.normalized());
+    if (center.norm() > 0) directions.push_back(center.normalized());
+    for (int k = 0; k < 3; ++k) {
+        Vec axis = Vec::Zero(); axis[k] = 1; directions.push_back(axis); directions.push_back(-axis);
+    }
+    Vec best = origin;
+    auto bestQuality = before;
+    double localVolumeFloor = DBL_MAX;
+    for (int t : star) localVolumeFloor = std::min(localVolumeFloor, mesh.calVolume(t));
+    localVolumeFloor *= .1;
+    for (const auto& direction : directions) {
+        double step = .25 * scale;
+        for (int iteration = 0; iteration < 16; ++iteration, step *= .5) {
+            const Vec candidate = origin + step * direction;
+            const auto q = atPosition(mesh, star, node, candidate, budget, localVolumeFloor);
+            if (!budget.accepts(before, q)) continue;
+            if (q.focus > bestQuality.focus) { best = candidate; bestQuality = q; }
+            break;
+        }
+    }
+    if (!(bestQuality.focus > before.focus)) return 0;
+    for (int k = 0; k < 3; ++k) mesh.Nodes[node].pt[k] = best[k];
+    for (int t : star) mesh.updateQuality(t);
+    budget.commit(before, bestQuality);
+    return 1;
+}
+}
+
+int DT::repairQualityTailPass(double targetAngle, int rounds) {
+    if (omp_in_parallel())
+        throw std::logic_error("Quality tail repair must run outside a parallel region");
+    if (!improve_step || !AniSol.empty() || !topologyRepairEnabled || topologyRepairDeferred || rounds <= 0) return 0;
+    detail::QualityBudget budget(*this, targetAngle);
+    if (!budget.valid()) return 0;
+    size_t moves = 0, repairs = 0;
+    for (int round = 0; round < rounds; ++round) {
+        std::vector<unsigned char> targets(Nodes.size(), 0);
+        std::vector<std::pair<double, TopologyCandidate>> candidates;
+        for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
+            if (isDelEle(t) || ishulltet(t) || isvirtualtet(t)) continue;
+            const auto q = tailCell(*this,t,budget);
+            if (!q.valid || !(q.minAngle < targetAngle)) continue;
+            for (int n : Elems[t].form) targets[n] = 1;
+        }
+        size_t roundMoves = 0, roundRepairs = 0;
+        for (int n = 0; n < static_cast<int>(targets.size()); ++n)
+            if (targets[n]) roundMoves += smoothTailPoint(*this, n, budget);
+        // Prioritize tiny Jacobians, then the low-angle tail. Frozen identities
+        // prevent later trials from accidentally operating on reused slots.
+        for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
+            if (isDelEle(t) || ishulltet(t) || isvirtualtet(t)) continue;
+            const auto q = tailCell(*this,t,budget);
+            if (!q.valid || !(q.minAngle < targetAngle)) continue;
+            candidates.push_back({q.minJacobian < 1e-4 ? q.minJacobian - 1 : q.minAngle, topologyCandidate(t)});
+        }
+        std::stable_sort(candidates.begin(), candidates.end(),
+            [](const std::pair<double,TopologyCandidate>& a, const std::pair<double,TopologyCandidate>& b) { return a.first < b.first; });
+        size_t roundAttempts = 0;
+        for (const auto& entry : candidates) {
+            if (roundAttempts >= 128) break;
+            if (!topologyCandidateCurrent(entry.second)) continue;
+            ++roundAttempts;
+            roundRepairs += tryTopologyRepair(entry.second, 0, &budget) == 1;
+        }
+        moves += roundMoves; repairs += roundRepairs;
+        if (!roundMoves && !roundRepairs) break;
+    }
+    return static_cast<int>(moves + repairs);
+}
 }

@@ -686,7 +686,7 @@ BWStatus prepareBWFill(DT& m, BWPlan& p, bool checkInitialVisibility) {
             p.request.midpointOnFace(f.vertices[0], f.vertices[1], f.vertices[2]))
             return p.status = BWStatus::Rejected;
     }
-    // Refinement checks signed volume only; optimization retains its shape guard.
+    // Volume-only requests check signed volume; default optimization keeps its shape guard.
     // Keep this independent of improve_step, which also updates quality caches.
     const bool volumeOnly = p.request.acceptance == BWAcceptance::VolumeOnly;
     if (volumeOnly) {

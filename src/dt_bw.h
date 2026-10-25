@@ -11,7 +11,7 @@ class DT;
 
 enum class BWStatus { Ready, Inserted, Duplicate, Rejected, RetryConflict, Stale };
 
-// Size refinement must not inherit the optimization shape-quality threshold.
+// Volume-only insertion skips shape thresholds; callers may add local volume floors.
 enum class BWAcceptance { Default, VolumeOnly };
 
 // A request owns candidate data; node == -1 denotes an unallocated point.
@@ -35,6 +35,8 @@ struct BWRequest {
     // Initially a midpoint; bounded searches may move it inside the same segment.
     // A face containing both endpoints contains every such point exactly.
     std::array<int, 2> midpointEdge{{-1, -1}};
+    // Matched rectangle/periodic points must retain their requested position.
+    bool fixedEdgePoint = false;
     bool midpointOnFace(int a, int b, int c) const {
         if (midpointEdge[0] < 0 || midpointEdge[1] < 0 || midpointEdge[0] == midpointEdge[1]) return false;
         return (a == midpointEdge[0] || b == midpointEdge[0] || c == midpointEdge[0]) &&

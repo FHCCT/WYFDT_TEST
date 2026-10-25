@@ -89,14 +89,34 @@ namespace dt {
 		std::unordered_set<int> lockF;
 		std::unordered_set<int> lockV;
 		std::unordered_set<int> lockE;
+        // Front-end Tetid refinement points may survive, but not be deleted by quality collapses.
+        std::unordered_map<int, bool> refinementProtectedPoints;
 		
 		bool QuantityControl = false;
 		std::unordered_map<int, int> GeoNum;
 		std::unordered_map<int, int> FacetNum;
+        struct PlanarFace {
+            std::array<double, 3> origin, normal, along, across;
+            double tolerance = 0;
+        };
+        std::unordered_map<int, PlanarFace> planarFaces;
+        struct RectangularFace {
+            std::array<double, 3> origin, along, across;
+            double length = 0, width = 0, tolerance = 0;
+            std::set<int> longSideNodes[2];
+        };
+        // Per-mesh geometry cache; rebuilt once with the input topology.
+        std::unordered_map<int, RectangularFace> rectangularFaces;
+        double rectangularFaceAspectRatio = 3.0;
+        // Ordinary interior splits are allowed up to this many transverse widths.
+        double rectangularInteriorSplitWidthRatio = 16.0;
+        size_t rectangularPairedSplits = 0, rectangularPairFailures = 0, rectangularRedirectedSplits = 0;
+        int repairQualityTailPass(double targetAngle = 1.5, int rounds = 3);
+        size_t qualityEdgeCollapses = 0, localStripPairedSplits = 0;
+        void buildRectangularFaces();
 		std::vector<std::array<int, 3>> flipnmRecll;
         std::array<std::vector<std::array<int, 3>>, 128> parallelFlipHistory;
         std::array<int, 128> parallelFlipCount{};
-        bool parallelTopologyBatch = false; // No container growth inside a topology batch.
 
 		std::unordered_map<int, std::vector<int>> periodic_P;
 		enum { SUS_METRIC = 9, ANGLE_JACOBIAN_METRIC = 10 }; // Signed Knupp mean-ratio quality; SUS regularized smoothing.
@@ -173,7 +193,7 @@ namespace dt {
 		void buildPntInfo(Mesh& mesh);
 		void buildTetInfo(Mesh& mesh, Args& args);
 		int BW_insert_vertex(int iNod, std::vector<int>& srchtet, int info, int thread_n = -1,
-            std::array<int, 2> midpointEdge = {{-1, -1}});
+            std::array<int, 2> midpointEdge = {{-1, -1}}, bool fixedEdgePoint = false);
 		int locate_pnt(int iNod, int& searchtet);
 		void AddBox(double scaled);
 		int findShell(const int t, const  int p2, const int p3, std::vector<int>& Shell, std::vector<int>& shell_point, int thread_n = -1);
@@ -281,21 +301,21 @@ namespace dt {
         bool needsTopologyRepair(int t, double angleDegrees, bool includeJacobian = true);
         // Angle < angleDegrees OR scaled Jacobian < 1e-5 selects repair.
         // Zero disables only the angle branch, never the Jacobian safeguard.
-        int TopologicalPass(double improve_goal, double repair_angle_degrees, int nloop);
-        int TopologicalPass_serial(const std::vector<TopologyCandidate>& candidates, double improve_goal, double repair_angle_degrees);
-        int TopologicalPass_parallel(const std::vector<TopologyCandidate>& candidates, double improve_goal, double repair_angle_degrees, int workers);
-        // Failed ordinary flips: deeper flips, constrained remesh, then insertion.
-        int tryTopologyRepair(const TopologyCandidate& candidate, double angleDegrees);
+        int TopologicalPass(double improve_goal, double repair_angle_degrees, int nloop, bool deferQualityRepairs = false);
+        int TopologicalPass_serial(const std::vector<TopologyCandidate>& candidates, double improve_goal, double repair_angle_degrees, bool deferQualityRepairs = false);
+        // Failed ordinary flips: existing-vertex repairs, then strict insertion.
+        // The insertion angle does not gate deeper flips or constrained remeshing.
+        int tryTopologyRepair(const TopologyCandidate& candidate, double insertionAngleDegrees, detail::QualityBudget* budget = nullptr);
         // Edge stars followed by bounded face rings; no point/boundary changes.
         // Quality acceptance measures only the cavity being replaced.
-        int remeshTopologyPatch(int tet);
+        int remeshTopologyPatch(int tet, detail::QualityBudget* budget = nullptr);
+        // Derived run state: boundary trials cannot recurse; size control defers geometry repair.
         bool topologyRepairEnabled = false, topologyRepairDeferred = false;
         size_t topologyRemeshTrialBudget = 0;
         int removebadtet(int& iElm, int thread_n = -1);
         int removebadtet_addPnt(int iElm);
         // Extra interior repairs share a fixed budget across all optimization rounds.
         size_t topologyInteriorPointBudget = 0, topologyInteriorCellBudget = 0;
-        double topologyInteriorQualityGoal = 0.2;
         int insertInteriorRepair(int tet);
 		int findtet(int p[], std::vector<int> sph);
 		int matchtet(int p[], int t);
@@ -422,7 +442,7 @@ namespace dt {
 		//--------------------- Mesh Quality ---------------------
 		void printfDihedral(double& minD, double& minAvgD, double& maxD, double& maxAvgD);
         // minimumOnly leaves maxangle/Dihedral unmeasured and allocates no angle array.
-		int CalDihedral(double v1[3], double v2[3], double v3[3], double v4[3], double& minangle, double& maxangle, std::vector<double>& Dihedral, bool minimumOnly = false);
+		int CalDihedral(double v1[3], double v2[3], double v3[3], double v4[3], double& minangle, double& maxangle, std::vector<double>& Dihedral, bool minimumOnly = false, double* scaledJacobian = nullptr, double* edgeRatio = nullptr);
 		double tetquality(double v1[3], double v2[3], double v3[3], double v4[3], double* AniMetric, int qualmeasure, bool applyTopologyGuard = true);
 		double vlrms3ratio(double v1[3], double v2[3], double v3[3], double v4[3]);
 		double ScaledJacobian( double p0[3],  double p1[3],  double p2[3],  double p3[3], double eps= 1e-30);
@@ -500,7 +520,17 @@ namespace dt {
         int smoothAngleJacobian(int node, double minimumQualityFloor);
         void mergeThinLayers(Mesh& mesh, TriHasher<int64_t>& tetFaces,
             const std::vector<double>& tetVolumes);
-        int splitEdgImpl(int index, int deep, bool retryVolume);
+        int splitEdgImpl(int index, int deep, bool retryVolume,
+            double fraction = 0.5, bool fixedEdgePoint = false);
+        int collapsePoorTetShortEdge(int tet, double angleDegrees, detail::QualityBudget* budget = nullptr);
+        bool collapsePointOnFace(int face, const double* target);
+        int pairLocalStrip(int node, int geo);
+        std::vector<int> pendingBoundaryPairs;
+        void synchronizeRectangularSplit(int node);
+        int redirectRectangularSplit(int edge, int deep, bool retryVolume, double fraction);
+        int cachedFaceFlipGeometry(int a, int b, int c, int d);
+        bool rectangularPairingInProgress = false;
+        bool qualityBoundarySplitInProgress = false;
         int removeInteriorEdge(std::vector<int>& oldtet, int ia, int ib, int info,
             int thread_n, std::vector<int>& shellPoints);
         int flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial);

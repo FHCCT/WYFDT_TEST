@@ -837,7 +837,8 @@ double DT::tetquality(double v1[3], double v2[3], double v3[3], double v4[3], do
 	because this formula is accurate in the entire range.
 */
 int  DT::CalDihedral(double v1[3], double v2[3], double v3[3], double v4[3],
-	double& minangle, double& maxangle, std::vector<double>& Dihedral, bool minimumOnly) {
+	double& minangle, double& maxangle, std::vector<double>& Dihedral, bool minimumOnly,
+    double* scaledJacobian, double* edgeRatio) {
 	double point[4][3];      /* tet vertices */
 	double edgelength[3][4]; /* the lengths of each of the edges of the tet */
 	double facenormal[4][3]; /* the normals of each face of the tet */
@@ -951,6 +952,26 @@ int  DT::CalDihedral(double v1[3], double v2[3], double v3[3], double v4[3],
 		}
 	}
     if (minimumOnly) minangle = atan(minimumTangent);
+    // Reuse the same signed volume and edge lengths when callers need several
+    // shape measures. Inputs here have the positive CalDihedral orientation;
+    // swap the last two vertices to match ScaledJacobian's edge product order.
+    if (scaledJacobian) {
+        const double l12 = sqrt(edgelength[0][1]), l13 = sqrt(edgelength[0][3]);
+        const double l14 = sqrt(edgelength[0][2]), l23 = sqrt(edgelength[1][3]);
+        const double l24 = sqrt(edgelength[1][2]), l34 = sqrt(edgelength[2][3]);
+        const double denominator = std::max(std::max(l12*l13*l14,l12*l23*l24),
+            std::max(l13*l23*l34,l14*l24*l34));
+        const double q = denominator == 0 ? 0 : std::sqrt(2.0)*pyrvolume/denominator;
+        *scaledJacobian = q > 1 ? 1 : q < -1 ? -1 : q;
+    }
+    if (edgeRatio) {
+        double shortest2 = DBL_MAX, longest2 = 0;
+        for (int a = 0; a < 3; ++a) for (int b = a + 1; b < 4; ++b) {
+            shortest2 = std::min(shortest2,edgelength[a][b]);
+            longest2 = std::max(longest2,edgelength[a][b]);
+        }
+        *edgeRatio = std::sqrt(longest2/shortest2);
+    }
 	return 1;
 }
 
@@ -1208,7 +1229,7 @@ double DT::ScaledJacobian(double v1[3],double v2[3],double v3[3],double v4[3], d
 //#pragma optimize("",off)
 double DT::caltet33_ani(double v1[3], double v2[3], double v3[3], double v4[3], double* mm) {
 	double ab[3], ac[3], ad[3], bc[3], bd[3], cd[3];
-	double  v1c, v2c, v3c, vol, det, h1, h2, h3, h4, h5, h6, rap, num, cal;
+	double vol, det, h1, h2, h3, h4, h5, h6, rap, num, cal;
 	constexpr double minV = 1e-7;
 
 	// Edge vectors
@@ -1975,7 +1996,6 @@ double DT::insphere_s(int a, int b, int c, int d, int e) {
 	}
 
 	// Symbolic perturbation.
-	double pt[5][3];
 	double oriA, oriB;
 	int swaps, count, n, i, mp[5];
 	mp[0] = a; mp[1] = b; mp[2] = c; mp[3] = d; mp[4] = e;
@@ -2428,7 +2448,7 @@ void DT::prinfPnt(int iNod) {
 }
 
 void DT::outHullTri(std::string filename) {
-	int i, j;
+	int i;
 	Mesh mesh;
 	mesh.V.reserve(Nodes.size());
 	//mesh.S.resize(SurEdgs.size());
@@ -2447,7 +2467,7 @@ void DT::outHullTri(std::string filename) {
 }
 
 void DT::outTempMesh(std::string filename) {
-	int i, j;
+	int i;
 	Mesh mesh;
 	mesh.V.reserve(Nodes.size());
 	//mesh.S.resize(SurEdgs.size());
@@ -2622,7 +2642,7 @@ void DT::outUnRecvEdge(std::string filename) {
 	return;
 }
 void DT::printSph_VTK(const std::vector<int> Sph, std::string filename) {
-	int i, j;
+	int i;
 	Mesh mesh;
 	mesh.V.reserve(Nodes.size());
 	mesh.T.reserve(Sph.size());
@@ -2643,7 +2663,7 @@ void DT::checkMeshError() {
 	//Don't start in test
 	return;
 #endif
-	int ia, ib, ic, id, a, b, c, d, i, j, k, minidx = -1;
+	int ia, ib, ic, id, b, c, d, i, j, k, minidx = -1;
 	double minVolum = DBL_MAX;
 	//outTempMesh("./temp.vtk");
 	for (i = 0; i < Elems.size(); i++) {
@@ -2827,7 +2847,7 @@ void DT::checkEdgeDegree() {
 
 int DT::checkEdgeLen() {
 	int  pa, pb, maxEid = -1, numE = 0;
-	double sumE = 0, maxE = 0, minE = DBL_MAX, dt;
+	double sumE = 0, maxE = 0, minE = DBL_MAX;
 	EdgeHasher<int> EdgeDegree;
 	for (int i = 0; i < Elems.size(); i++) {
 		if (isDelEle(i) || ishulltet(i))
@@ -2861,7 +2881,7 @@ int DT::checkEdgeLen() {
 	return maxEid;
 }
 void DT::printSph(const std::vector<int> Sph) {
-	int i, j;
+	int i;
 	meshLogger->debug("Sph size: {}", Sph.size());
 	for (i = 0; i < Sph.size(); i++) {
 		meshLogger->debug("{}: {} {} {} {}", Sph[i], Elems[Sph[i]].form[0],

@@ -103,8 +103,6 @@ int DT::addElem(int thread_n, bool UseVacancy) {
 		Elems[newE].q = -1;
 	}
 	else {
-        if (parallelTopologyBatch)
-            throw std::runtime_error("Topology batch exhausted preallocated element slots");
 #pragma omp critical
 		{
 			newE = Elems.size();
@@ -132,8 +130,6 @@ int DT::addElem(int pa, int pb, int pc, int pd, int thread_n, bool UseVacancy) {
 		Elems[newE].q = -1;
 	}
 	else {
-        if (parallelTopologyBatch)
-            throw std::runtime_error("Topology batch exhausted preallocated element slots");
 #pragma omp critical
 		{
 			newE = Elems.size();

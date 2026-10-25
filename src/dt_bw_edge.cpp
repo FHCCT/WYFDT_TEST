@@ -75,7 +75,7 @@ bool betterPosition(DT& mesh, const BWPlan& best, EdgeQuality a,
 
 BWStatus planBWOnEdge(DT& mesh, const BWRequest& request, BWPlan& plan) {
     const int a = request.midpointEdge[0], b = request.midpointEdge[1];
-    if (request.info == 0 || request.anisotropic || a < 0 || b < 0 || a == b ||
+    if (request.fixedEdgePoint || request.info == 0 || request.anisotropic || a < 0 || b < 0 || a == b ||
         a >= static_cast<int>(mesh.Nodes.size()) || b >= static_cast<int>(mesh.Nodes.size()) ||
         a == mesh.ghost || b == mesh.ghost || mesh.isDelNod(a) || mesh.isDelNod(b))
         return planBW(mesh, request, plan);

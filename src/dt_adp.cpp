@@ -1,4 +1,5 @@
 #include "./dt.h"
+#include <limits>
 
 int DT::adaptation_by_pError(Mesh& mesh, Args& args, std::vector<std::array<double, 4>>& addVertex, double GrowRatio) {
 	int p1, p2;
@@ -53,13 +54,6 @@ int DT::adaptation_by_pError(Mesh& mesh, Args& args, std::vector<std::array<doub
 			////Old Edg idndex may be destroy
 			double dis = distance(Nodes[p1].pt, Nodes[p2].pt);
 
-			if (auto* boundaryEntry = BndEdg.find(p1, p2)) {
-				const int boundaryIndex = *boundaryEntry;
-				//dis *= 1.1;
-				int Edgid = boundaryIndex;
-				if(SurEdgs[Edgid].constrain > 0)
-					dis *= 1.25;
-			}
 			if (dis > maxEdgLen) {
 				maxEdgLen = dis;
 				maxEdgIdx = j;
@@ -89,7 +83,7 @@ int DT::adaptation_by_pError(Mesh& mesh, Args& args, std::vector<std::array<doub
 			int Edgid = boundaryIndex;
 			if (isDelSurEdg(Edgid))
 				continue;
-			int ret = splitEdg(Edgid);
+			splitEdg(Edgid);
 		}
 		else {
 			double addV[3] = { 0.5 * (Nodes[p1].pt[0] + Nodes[p2].pt[0]),
@@ -171,9 +165,6 @@ int DT::adaptation_by_Tetid (Mesh& mesh, Args& args, std::vector<int> refine_tri
 			////Old Edg idndex may be destroy
 			double dis = distance(Nodes[p1].pt, Nodes[p2].pt);
 
-			int Edgid = BndEdg.get(p1, p2);
-			if (SurEdgs[Edgid].constrain > 0)
-				dis *= 1.25;
 
 			if (dis > maxEdgLen) {
 				maxEdgLen = dis;
@@ -198,13 +189,6 @@ int DT::adaptation_by_Tetid (Mesh& mesh, Args& args, std::vector<int> refine_tri
 			////Old Edg idndex may be destroy
 			double dis = distance(Nodes[p1].pt, Nodes[p2].pt);
 
-			if (auto* boundaryEntry = BndEdg.find(p1, p2)) {
-				const int boundaryIndex = *boundaryEntry;
-				//dis *= 1.1;
-				int Edgid = boundaryIndex;
-				if (SurEdgs[Edgid].constrain > 0)
-					dis *= 1.12;//1.118 1.25
-			}
 
 			if (dis > maxEdgLen) {
 				maxEdgLen = dis;
@@ -219,6 +203,7 @@ int DT::adaptation_by_Tetid (Mesh& mesh, Args& args, std::vector<int> refine_tri
 	}
 
 	/************************ Start Refine ******************************/
+    const int firstRefinementNode = static_cast<int>(Nodes.size());
 	for (auto it : EdgOrd) {
 		p1 = it[0];
 		p2 = it[1];
@@ -257,7 +242,7 @@ int DT::adaptation_by_Tetid (Mesh& mesh, Args& args, std::vector<int> refine_tri
 			int Edgid = boundaryIndex;
 			if (isDelSurEdg(Edgid))
 				continue;
-			int ret = splitEdg(Edgid);
+			splitEdg(Edgid);
 		}
 		else {
 			double addV[3] = { 0.5 * (Nodes[p1].pt[0] + Nodes[p2].pt[0]),
@@ -284,6 +269,11 @@ int DT::adaptation_by_Tetid (Mesh& mesh, Args& args, std::vector<int> refine_tri
 			}
 		}
 	}
+
+    // Failed insertion slots can be reused. Register live points only after
+    // all front-end splits, including redirected and matched boundary splits.
+    for (int n = firstRefinementNode; n < static_cast<int>(Nodes.size()); ++n)
+        if (!isDelNod(n)) refinementProtectedPoints.emplace(n,true);
 
 	int ne = 0;
 	for (int i = 0; i < Elems.size(); i++) {
@@ -756,5 +746,461 @@ void DT::buildTetInfo(Mesh& mesh, Args& args) {
     for (int edge = 0; edge < static_cast<int>(SurEdgs.size()); ++edge)
         if (disconnectedVertices.count(SurEdgs[edge].iStart) ||
             disconnectedVertices.count(SurEdgs[edge].iEnd)) lockE.insert(edge);
+    buildRectangularFaces();
 	return;
+}
+
+namespace dt {
+namespace {
+using Vec = Eigen::Vector3d;
+using Edge = std::pair<int, int>;
+Vec point(const DT& mesh, int node) { return Vec(mesh.Nodes[node].pt); }
+Vec vector(const std::array<double, 3>& v) { return Vec(v.data()); }
+std::array<double, 3> array(const Vec& v) { return {{v[0], v[1], v[2]}}; }
+
+struct RailLocation {
+    int node = -1, edge = -1;
+    double fraction = 0;
+};
+
+bool plane(DT& mesh, const std::vector<int>& faces, DT::PlanarFace& result) {
+    std::set<int> nodes;
+    Vec origin = Vec::Zero(), normal = Vec::Zero();
+    double maximumAreaSquared = 0;
+    for (int f : faces) {
+        const auto& v = mesh.SurTris[f].form;
+        for (int n : v) nodes.insert(n);
+        const Vec a = point(mesh, v[0]);
+        const Vec n = (point(mesh, v[1]) - a).cross(point(mesh, v[2]) - a);
+        if (n.squaredNorm() > maximumAreaSquared) {
+            maximumAreaSquared = n.squaredNorm(); origin = a; normal = n;
+        }
+    }
+    if (!(maximumAreaSquared > 0) || !std::isfinite(maximumAreaSquared)) return false;
+    normal.normalize();
+    Vec lo = point(mesh, *nodes.begin()), hi = lo;
+    double magnitude = 0;
+    for (int n : nodes) {
+        const Vec p = point(mesh, n);
+        if (!p.allFinite()) return false;
+        lo = lo.cwiseMin(p); hi = hi.cwiseMax(p);
+        magnitude = std::max(magnitude, p.cwiseAbs().maxCoeff());
+    }
+    const double tolerance = std::max(1e-8 * (hi - lo).norm(),
+        128 * std::numeric_limits<double>::epsilon() * magnitude);
+    // Fit the plane offset as well as its normal. Input rounding can place
+    // vertices on either side: anchoring at an extreme vertex doubles error.
+    double minimumOffset = DBL_MAX, maximumOffset = -DBL_MAX;
+    for (int n : nodes) {
+        const double offset = (point(mesh,n)-origin).dot(normal);
+        minimumOffset = std::min(minimumOffset,offset); maximumOffset = std::max(maximumOffset,offset);
+    }
+    origin += .5*(minimumOffset+maximumOffset)*normal;
+    for (int n : nodes)
+        if (std::abs((point(mesh, n) - origin).dot(normal)) > tolerance) return false;
+    const Vec along = normal.unitOrthogonal(), across = normal.cross(along);
+    result.origin = array(origin); result.normal = array(normal);
+    result.along = array(along); result.across = array(across); result.tolerance = tolerance;
+    return true;
+}
+
+RailLocation locateRail(DT& mesh, const DT::RectangularFace& face, int geo, int side, double position) {
+    RailLocation result;
+    const Vec origin = vector(face.origin), along = vector(face.along), across = vector(face.across);
+    int before = -1, after = -1; double lower = -DBL_MAX, upper = DBL_MAX;
+    for (int n : face.longSideNodes[side]) {
+        if (mesh.isDelNod(n) || !mesh.isbndpnt(n)) continue;
+        const Vec p = point(mesh, n) - origin;
+        if (std::abs(p.dot(across) - side * face.width) > face.tolerance ||
+            std::abs(p.dot(along.cross(across))) > face.tolerance) continue;
+        const double x = p.dot(along);
+        if (std::abs(x - position) <= face.tolerance) {
+            // Recycled slots belonging to another geometry cannot be reused.
+            std::unordered_set<int> current;
+            mesh.findSphere_tri(n, current);
+            for (int f : current) if (!mesh.isDelSurTri(f) && mesh.SurTris[f].parent == geo) {
+                result.node = n; return result;
+            }
+            continue;
+        }
+        if (x < position && x > lower) { lower = x; before = n; }
+        if (x > position && x < upper) { upper = x; after = n; }
+    }
+    const int* found = before >= 0 && after >= 0 ? mesh.BndEdg.find(before, after) : nullptr;
+    if (!found || mesh.isDelSurEdg(*found) || mesh.lockE.count(*found)) return result;
+    int uses = 0;
+    for (int f : mesh.SurEdgs[*found].face) {
+        if (mesh.lockF.count(f)) return result;
+        if (!mesh.isDelSurTri(f) && mesh.SurTris[f].parent == geo) ++uses;
+    }
+    if (uses != 1) return result;
+    result.edge = *found;
+    result.fraction = (position - lower) / (upper - lower);
+    if (mesh.SurEdgs[*found].iStart != before) result.fraction = 1 - result.fraction;
+    return result;
+}
+
+bool rectangle(DT& mesh, const std::vector<int>& faces, DT::RectangularFace& result) {
+    struct Use { int face = -1, count = 0, direction = 0; };
+    std::map<Edge, Use> edges;
+    std::set<int> nodes;
+    std::vector<std::vector<std::pair<int, int>>> adjacent(faces.size());
+    for (int i = 0; i < static_cast<int>(faces.size()); ++i) {
+        const auto& f = mesh.SurTris[faces[i]];
+        for (int k = 0; k < 3; ++k) {
+            const int a = f.form[k], b = f.form[(k + 1) % 3];
+            if (a == b) return false;
+            nodes.insert(a);
+            auto& use = edges[std::minmax(a, b)];
+            const int direction = a < b ? 1 : -1;
+            if (++use.count > 2) return false;
+            if (use.face >= 0) {
+                const int sign = direction == use.direction ? -1 : 1;
+                adjacent[i].push_back({use.face, sign}); adjacent[use.face].push_back({i, sign});
+            } else { use.face = i; use.direction = direction; }
+        }
+    }
+    if (faces.empty() || static_cast<int64_t>(nodes.size()) - static_cast<int64_t>(edges.size()) +
+        static_cast<int64_t>(faces.size()) != 1)
+        return false;
+    std::vector<int> signs(faces.size(), 0);
+    std::vector<int> connected(1, 0); signs[0] = 1;
+    for (size_t i = 0; i < connected.size(); ++i)
+        for (const auto& entry : adjacent[connected[i]]) {
+            const int n = entry.first, sign = signs[connected[i]] * entry.second;
+            if (!signs[n]) { signs[n] = sign; connected.push_back(n); }
+            else if (signs[n] != sign) return false;
+        }
+    if (connected.size() != faces.size()) return false;
+
+    std::map<int, std::vector<int>> boundary;
+    size_t boundaryEdges = 0;
+    for (const auto& edge : edges) if (edge.second.count == 1) {
+        boundary[edge.first.first].push_back(edge.first.second);
+        boundary[edge.first.second].push_back(edge.first.first); ++boundaryEdges;
+    }
+    if (boundary.size() < 4) return false;
+    for (const auto& entry : boundary) if (entry.second.size() != 2) return false;
+    std::vector<int> loop;
+    int previous = -1, current = boundary.begin()->first;
+    do {
+        if (loop.size() >= boundary.size()) return false;
+        loop.push_back(current);
+        const auto& next = boundary.at(current);
+        const int n = next[0] == previous ? next[1] : next[0];
+        previous = current; current = n;
+    } while (current != loop.front());
+    // Exactly one boundary loop: holes and disconnected components are excluded.
+    if (loop.size() != boundary.size() || loop.size() != boundaryEdges) return false;
+
+    Vec lo = point(mesh, loop.front()), hi = lo;
+    double magnitude = 0;
+    for (int n : nodes) {
+        const Vec p = point(mesh, n); lo = lo.cwiseMin(p); hi = hi.cwiseMax(p);
+        magnitude = std::max(magnitude, p.cwiseAbs().maxCoeff());
+    }
+    const double tolerance = std::max((hi - lo).norm() * 1e-8,
+        128 * std::numeric_limits<double>::epsilon() * magnitude);
+    std::vector<int> corners;
+    for (size_t i = 0; i < loop.size(); ++i) {
+        const Vec a = point(mesh, loop[(i + loop.size() - 1) % loop.size()]);
+        const Vec b = point(mesh, loop[i]), c = point(mesh, loop[(i + 1) % loop.size()]);
+        const Vec u = b - a, v = c - b;
+        if (u.norm() <= tolerance || v.norm() <= tolerance) return false;
+        if (u.dot(v) <= 0 || u.cross(v).norm() > tolerance * (u.norm() + v.norm()))
+            corners.push_back(loop[i]);
+    }
+    if (corners.size() != 4) return false;
+    const Vec origin = point(mesh, corners[0]);
+    Vec along = point(mesh, corners[1]) - origin;
+    Vec across = point(mesh, corners[3]) - origin;
+    if ((point(mesh, corners[2]) - origin - along - across).norm() > 4 * tolerance) return false;
+    if (std::abs(along.dot(across)) > 1e-7 * along.norm() * across.norm()) return false;
+    if (along.squaredNorm() < across.squaredNorm()) std::swap(along, across);
+    const double length = along.norm(), width = across.norm();
+    if (!(width > 16 * tolerance && length > mesh.rectangularFaceAspectRatio * width)) return false;
+    along /= length; across /= width;
+    const Vec normal = along.cross(across);
+    for (int n : nodes) {
+        const Vec p = point(mesh, n) - origin;
+        const double x = p.dot(along), y = p.dot(across);
+        if (std::abs(p.dot(normal)) > tolerance || x < -tolerance || x > length + tolerance ||
+            y < -tolerance || y > width + tolerance) return false;
+    }
+    for (const auto& edge : edges) if (edge.second.count == 1) {
+        const Vec a = point(mesh, edge.first.first) - origin, b = point(mesh, edge.first.second) - origin;
+        const double x1 = a.dot(along), x2 = b.dot(along), y1 = a.dot(across), y2 = b.dot(across);
+        const bool side = (std::abs(x1) <= tolerance && std::abs(x2) <= tolerance) ||
+            (std::abs(x1 - length) <= tolerance && std::abs(x2 - length) <= tolerance) ||
+            (std::abs(y1) <= tolerance && std::abs(y2) <= tolerance) ||
+            (std::abs(y1 - width) <= tolerance && std::abs(y2 - width) <= tolerance);
+        if (!side) return false;
+    }
+    double area = 0, orientation = 0;
+    for (size_t i = 0; i < faces.size(); ++i) {
+        const auto& v = mesh.SurTris[faces[i]].form;
+        const double a = (point(mesh, v[1]) - point(mesh, v[0])).cross(
+            point(mesh, v[2]) - point(mesh, v[0])).dot(normal) * signs[i];
+        if (a == 0 || (orientation != 0 && a * orientation <= 0)) return false;
+        orientation = a; area += std::abs(a) * .5;
+    }
+    if (std::abs(area - length * width) > tolerance * (length + width) * 4) return false;
+    result.origin = array(origin); result.along = array(along); result.across = array(across);
+    result.length = length; result.width = width; result.tolerance = tolerance;
+    for (const auto& entry : boundary) {
+        const double y = (point(mesh, entry.first) - origin).dot(across);
+        if (std::abs(y) <= tolerance) result.longSideNodes[0].insert(entry.first);
+        if (std::abs(y - width) <= tolerance) result.longSideNodes[1].insert(entry.first);
+    }
+    return true;
+}
+}
+
+void DT::buildRectangularFaces() {
+    rectangularFaces.clear();
+    planarFaces.clear();
+    std::map<int, std::vector<int>> groups;
+    for (int f = 0; f < static_cast<int>(SurTris.size()); ++f)
+        if (!isDelSurTri(f)) groups[SurTris[f].parent].push_back(f);
+    for (const auto& group : groups) {
+        RectangularFace face;
+        if (rectangle(*this, group.second, face)) rectangularFaces.emplace(group.first, std::move(face));
+        else {
+            PlanarFace planar;
+            if (plane(*this, group.second, planar)) planarFaces.emplace(group.first, std::move(planar));
+        }
+    }
+    if (infolevel > 1) meshLogger->debug("Cached boundary geometry: rectangles={} otherPlanes={}",
+        rectangularFaces.size(), planarFaces.size());
+}
+
+int DT::cachedFaceFlipGeometry(int a, int b, int c, int d) {
+    const int* edge = BndEdg.find(a, b);
+    if (!edge || SurEdgs[*edge].constrain > 0 || SurEdgs[*edge].face.size() != 2) return -1;
+    const int f = SurEdgs[*edge].face[0], g = SurEdgs[*edge].face[1];
+    if (isDelSurTri(f) || isDelSurTri(g) || SurTris[f].parent != SurTris[g].parent) return -1;
+    const auto cached = rectangularFaces.find(SurTris[f].parent);
+    const RectangularFace* rectangle = cached == rectangularFaces.end() ? nullptr : &cached->second;
+    Vec origin, along, across, normal;
+    double tolerance, length = 1, width = 1;
+    if (rectangle) {
+        origin = vector(rectangle->origin); along = vector(rectangle->along); across = vector(rectangle->across);
+        normal = along.cross(across); tolerance = rectangle->tolerance;
+        length = rectangle->length; width = rectangle->width;
+    } else {
+        const auto planar = planarFaces.find(SurTris[f].parent);
+        if (planar == planarFaces.end()) return -1;
+        const auto& face = planar->second;
+        origin = vector(face.origin); along = vector(face.along); across = vector(face.across);
+        normal = vector(face.normal); tolerance = face.tolerance;
+    }
+    const int ids[] = {a,b,c,d};
+    long double xy[4][2];
+    for (int i = 0; i < 4; ++i) {
+        if (ids[i] < 0 || ids[i] >= static_cast<int>(Nodes.size()) || isDelNod(ids[i])) return 0;
+        const Vec p = point(*this, ids[i]) - origin;
+        const double x = p.dot(along), y = p.dot(across);
+        if (!p.allFinite() || std::abs(p.dot(normal)) > tolerance) return 0;
+        if (rectangle && (x < -tolerance || x > length + tolerance ||
+            y < -tolerance || y > width + tolerance)) return 0;
+        xy[i][0] = x / length; xy[i][1] = y / width;
+    }
+    auto orientation = [&](int i, int j, int k) {
+        const long double x = (xy[j][0]-xy[i][0])*(xy[k][1]-xy[i][1]);
+        const long double y = (xy[j][1]-xy[i][1])*(xy[k][0]-xy[i][0]);
+        const long double value = x-y;
+        const long double error = 64*std::numeric_limits<double>::epsilon()*(std::abs(x)+std::abs(y));
+        return value > error ? 1 : value < -error ? -1 : 0;
+    };
+    // Both diagonals must lie inside the quadrilateral. This also excludes
+    // folds/overlaps and degenerate replacements in the original plane frame.
+    return orientation(0,1,2)*orientation(0,1,3) == -1 &&
+        orientation(2,3,0)*orientation(2,3,1) == -1 ? 1 : 0;
+}
+
+int DT::redirectRectangularSplit(int edge, int deep, bool retryVolume, double fraction) {
+    // -1 means an ordinary split. Once a long interior edge is recognized,
+    // failure/no-op must not fall back to inserting another point on it.
+    if (!modifyBnd || rectangularPairingInProgress || rectangularFaces.empty() ||
+        SurEdgs[edge].constrain > 0 || SurEdgs[edge].face.size() != 2) return -1;
+    const int first = SurEdgs[edge].face[0], second = SurEdgs[edge].face[1];
+    if (isDelSurTri(first) || isDelSurTri(second)) return -1;
+    const int geo = SurTris[first].parent;
+    if (SurTris[second].parent != geo) return -1;
+    const auto cached = rectangularFaces.find(geo);
+    if (cached == rectangularFaces.end()) return -1;
+    const auto& face = cached->second;
+    const Vec origin = vector(face.origin), along = vector(face.along), across = vector(face.across);
+    const Vec a = point(*this, SurEdgs[edge].iStart) - origin;
+    const Vec b = point(*this, SurEdgs[edge].iEnd) - origin;
+    // A local diagonal must be splittable to replace its fan connectivity.
+    // Redirect only diagonals that are still long relative to the strip width.
+    if ((b - a).norm() <= rectangularInteriorSplitWidthRatio * face.width + face.tolerance)
+        return -1;
+    if (std::abs(a.dot(along.cross(across))) > face.tolerance ||
+        std::abs(b.dot(along.cross(across))) > face.tolerance) return -1;
+    const double position = ((1 - fraction) * a + fraction * b).dot(along);
+    if (position <= face.tolerance || position >= face.length - face.tolerance) return -1;
+    const RailLocation sides[] = {locateRail(*this, face, geo, 0, position),
+        locateRail(*this, face, geo, 1, position)};
+    if (sides[0].node >= 0 && sides[1].node >= 0) return 0;
+    for (const auto& side : sides) if (side.edge >= 0) {
+        const int inserted = splitEdgImpl(side.edge, deep, retryVolume, side.fraction, true);
+        if (inserted > 0) {
+            ++rectangularRedirectedSplits;
+            if (infolevel > 1) meshLogger->debug(
+                "Rectangle split redirected: geometry={} diagonal={} railNode={} position={:.12g}",
+                geo, edge, inserted, position);
+            return inserted;
+        }
+    }
+    ++rectangularPairFailures;
+    if (infolevel > 1) meshLogger->debug("Rectangle redirection rejected: geometry={} diagonal={}", geo, edge);
+    return 0;
+}
+
+void DT::synchronizeRectangularSplit(int node) {
+    if (node < 0 || isDelNod(node)) return;
+    std::unordered_set<int> incident;
+    findSphere_tri(node, incident);
+    std::set<int> geometries;
+    for (int f : incident) if (!isDelSurTri(f) && rectangularFaces.count(SurTris[f].parent))
+        geometries.insert(SurTris[f].parent);
+    // Register child nodes even during paired/periodic splits. Edge IDs are not
+    // cached: later queries resolve current edges after splitting or collapse.
+    for (int geo : geometries) {
+        auto& face = rectangularFaces.at(geo);
+        const double y = (point(*this, node) - vector(face.origin)).dot(vector(face.across));
+        if (std::abs(y) <= face.tolerance) face.longSideNodes[0].insert(node);
+        if (std::abs(y - face.width) <= face.tolerance) face.longSideNodes[1].insert(node);
+    }
+    if (!modifyBnd) return;
+    pendingBoundaryPairs.push_back(node);
+    if (rectangularPairingInProgress) return;
+    struct Scope {
+        bool& active;
+        explicit Scope(bool& value) : active(value) { active = true; }
+        ~Scope() { active = false; }
+    } scope(rectangularPairingInProgress);
+    for (int geo : geometries) {
+        auto& face = rectangularFaces.at(geo);
+        const Vec origin = vector(face.origin), along = vector(face.along);
+        const double position = (point(*this, node) - origin).dot(along);
+        if (position <= face.tolerance || position >= face.length - face.tolerance) continue;
+        for (int side = 0; side < 2; ++side) {
+            const auto target = locateRail(*this, face, geo, side, position);
+            if (target.node >= 0) continue;
+            if (target.edge < 0) {
+                ++rectangularPairFailures;
+                if (infolevel > 1) meshLogger->debug("Rectangle pair unavailable: geometry={} node={} side={}", geo, node, side);
+                continue;
+            }
+            struct Acceptance {
+                BWAcceptance& value; BWAcceptance saved;
+                explicit Acceptance(BWAcceptance& v) : value(v), saved(v) { value = BWAcceptance::VolumeOnly; }
+                ~Acceptance() { value = saved; }
+            } acceptance(bwAcceptance);
+            const int paired = splitEdgImpl(target.edge, 0, false, target.fraction, true);
+            if (paired > 0) {
+                ++rectangularPairedSplits;
+                if (infolevel > 1) meshLogger->debug("Rectangle pair inserted: geometry={} node={} paired={} fraction={:.12g}", geo, node, paired, target.fraction);
+            } else {
+                ++rectangularPairFailures;
+                if (infolevel > 1) meshLogger->debug("Rectangle pair rejected by volume/insertion checks: geometry={} node={}", geo, node);
+            }
+        }
+    }
+    // Paired points can border another, nonrectangular geometry. Process that
+    // local cross-section too, without recursive splitting around a face chain.
+    std::set<int> pairedGeometries;
+    const size_t originalPairs = pendingBoundaryPairs.size();
+    for (size_t i = 0; i < originalPairs; ++i) {
+        const int current = pendingBoundaryPairs[i];
+        if (!qualityBoundarySplitInProgress || isDelNod(current)) continue;
+        std::unordered_set<int> star;
+        findSphere_tri(current,star);
+        std::set<int> local;
+        for (int f : star) if (!isDelSurTri(f) && !rectangularFaces.count(SurTris[f].parent))
+            local.insert(SurTris[f].parent);
+        for (int geo : local) if (pairedGeometries.insert(geo).second) {
+            const int paired = pairLocalStrip(current,geo);
+            if (paired > 0) ++localStripPairedSplits;
+        }
+    }
+    pendingBoundaryPairs.clear();
+}
+
+int DT::pairLocalStrip(int node, int geo) {
+    // The source must lie inside a straight feature rail, not at a corner.
+    std::unordered_set<int> star;
+    findSphere_tri(node,star);
+    std::set<int> rail;
+    Vec normal = Vec::Zero(); double area = 0;
+    for (int f : star) if (!isDelSurTri(f) && SurTris[f].parent == geo) {
+        const auto& v = SurTris[f].form;
+        const Vec n = (point(*this,v[1])-point(*this,v[0])).cross(point(*this,v[2])-point(*this,v[0]));
+        if (n.squaredNorm() > area) { normal = n; area = n.squaredNorm(); }
+        for (int other : v) if (other != node) {
+            const int* e = BndEdg.find(node,other);
+            if (e && SurEdgs[*e].constrain > 0) rail.insert(other);
+        }
+    }
+    if (rail.size() != 2 || !(area > 0)) return 0;
+    const Vec origin = point(*this,node);
+    auto it = rail.begin(); const Vec left = point(*this,*it++)-origin, right = point(*this,*it)-origin;
+    const double span = left.norm()+right.norm();
+    if (!(left.norm()>0 && right.norm()>0) || left.normalized().dot(right.normalized()) > -.999999) return 0;
+    const Vec along = left.normalized(); normal.normalize();
+    Vec across = normal.cross(along).normalized();
+    // Use a local stable plane: a remote part of the same geometry may bend.
+    const double tolerance = std::max(1e-8*span,128*std::numeric_limits<double>::epsilon()*origin.cwiseAbs().maxCoeff());
+    bool inward = false;
+    for (int f : star) if (!isDelSurTri(f) && SurTris[f].parent == geo)
+        for (int n : SurTris[f].form) if (std::abs((point(*this,n)-origin).dot(across))>tolerance) {
+            if ((point(*this,n)-origin).dot(across)<0) across = -across;
+            inward = true; break;
+        }
+    if (!inward) return 0;
+    std::vector<int> queue;
+    for (int f : star) if (!isDelSurTri(f) && SurTris[f].parent == geo) queue.push_back(f);
+    std::set<int> visited(queue.begin(),queue.end());
+    int target = -1; double fraction = 0, width = DBL_MAX;
+    // Walk only triangles intersected by this inward ray. Bound the geometric
+    // search by the rail's local support, not by the size of the whole face.
+    for (size_t i=0;i<queue.size();++i) {
+        const auto& v = SurTris[queue[i]].form;
+        for (int n : v) if (std::abs((point(*this,n)-origin).dot(normal))>tolerance) return 0;
+        for (int k=0;k<3;++k) {
+            const Vec a = point(*this,v[k])-origin, b = point(*this,v[(k+1)%3])-origin;
+            const double x = a.dot(along), dx = (b-a).dot(along);
+            if (std::abs(dx)<=tolerance) continue;
+            const double t = -x/dx;
+            if (t < -1e-10 || t > 1+1e-10) continue;
+            const double y = (a+t*(b-a)).dot(across);
+            if (y<=tolerance || y>span/rectangularFaceAspectRatio || y>width+tolerance) continue;
+            const int* e = BndEdg.find(v[k],v[(k+1)%3]);
+            if (!e) return 0;
+            if (SurEdgs[*e].constrain > 0) {
+                if (std::abs((b-a).normalized().dot(along)) < std::cos(5*PI/180)) return 0;
+                if (y<width) { target=*e; width=y; fraction=SurEdgs[*e].iStart==v[k]?t:1-t; }
+            } else {
+                for (int f : SurEdgs[*e].face) if (!isDelSurTri(f) && SurTris[f].parent==geo && visited.insert(f).second)
+                    queue.push_back(f);
+            }
+        }
+    }
+    if (target<0 || lockE.count(target)) return 0;
+    for (int f : SurEdgs[target].face) if (lockF.count(f)) return 0;
+    const double length = distance(Nodes[SurEdgs[target].iStart].pt,Nodes[SurEdgs[target].iEnd].pt);
+    // Reuse an existing transverse match; do not create an almost coincident point.
+    if (std::min(fraction,1-fraction)*length<=std::max(tolerance,.5*width)) return 0;
+    struct Acceptance {
+        BWAcceptance& value; BWAcceptance saved;
+        ~Acceptance() { value=saved; }
+    } acceptance{bwAcceptance,bwAcceptance};
+    bwAcceptance=BWAcceptance::VolumeOnly;
+    const int paired=splitEdgImpl(target,0,false,fraction,true);
+    if (paired>0 && infolevel>1) meshLogger->debug("Local strip pair: geometry={} node={} paired={} width={:.12g}",geo,node,paired,width);
+    return paired;
+}
 }

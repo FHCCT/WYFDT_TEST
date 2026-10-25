@@ -48,15 +48,19 @@ void DT::resetMeshState() {
     SteinerOrd.clear(); EdgSteiner.clear(); TriSteiner.clear(); AniSol.clear();
     BndTri.clear(); BndEdg.clear(); periodic_P.clear(); surTri_mapping.clear();
     lockF.clear(); lockE.clear(); lockV.clear();
+    refinementProtectedPoints.clear();
     GeoNum.clear(); FacetNum.clear(); QuantityControl = false;
+    rectangularFaces.clear(); planarFaces.clear(); rectangularPairingInProgress = false;
+    rectangularPairedSplits = 0; rectangularPairFailures = 0; rectangularRedirectedSplits = 0;
+    qualityBoundarySplitInProgress = false;
+    qualityEdgeCollapses = 0; localStripPairedSplits = 0; pendingBoundaryPairs.clear();
     flipnmRecll.clear();
     for (auto& history : parallelFlipHistory) history.clear();
-    parallelFlipCount.fill(0); parallelTopologyBatch = false;
+    parallelFlipCount.fill(0);
     susIdleStates.clear(); serialBW.slots.clear();
     topologyInteriorPointBudget = 0; topologyInteriorCellBudget = 0;
     topologyRepairEnabled = false; topologyRepairDeferred = false;
     topologyRemeshTrialBudget = 0;
-    topologyInteriorQualityGoal = 0.2;
     ignoreIntersect = false; modifyBnd = false; addBoxFlag = false;
     tempfliptime = 0; initBWshell = 0; addst = 0; addstbnd = 0; AvgEdgLen = 0;
     minVolume_bw = 0; // Derived from the mesh/algorithm run.
@@ -74,7 +78,7 @@ int DT::dt_init(Mesh& mesh, Args& args)
 	spdlogoutfile(args.outlogfile);
     meshLogger->set_level(infolevel == 0 ? spdlog::level::err :
         infolevel == 1 ? spdlog::level::info : spdlog::level::debug);
-	if (infolevel > 0) meshLogger->info("Version 2026.10.21");
+	if (infolevel > 0) meshLogger->info("Version 2026.10.25");
     MeshStageLog initLog(*this, "Initialize");
     if (infolevel > 0)
         meshLogger->info("Input mesh: points={} segments={} triangles={} tets={}",
@@ -1164,7 +1168,7 @@ void DT::buildPntInfo(Mesh& mesh) {
 // Compatibility entry point for serial callers. Parallel insertion uses frozen
 // planning and conflict-free batch commits in dt_bw_parallel.cpp.
 int DT::BW_insert_vertex(int iNod, std::vector<int>& srchtet, int info, int thread_n,
-    std::array<int, 2> midpointEdge) {
+    std::array<int, 2> midpointEdge, bool fixedEdgePoint) {
     if (srchtet.empty()) return 0;
     // Node occupation alone cannot protect concurrent location or container growth.
     if (omp_in_parallel()) return -1;
@@ -1173,6 +1177,7 @@ int DT::BW_insert_vertex(int iNod, std::vector<int>& srchtet, int info, int thre
     BWPlan& plan = serialBW.plan;
     BWRequest request = makeBWRequest(*this, iNod, srchtet, info);
     request.midpointEdge = midpointEdge;
+    request.fixedEdgePoint = fixedEdgePoint;
     request.trackAccess = false;
     const BWStatus status = planBWOnEdge(*this, request, plan);
     if (status == BWStatus::Duplicate) return -plan.duplicateNode;
@@ -1903,7 +1908,7 @@ int DT::findIntersectwithEdgs(const int targetE, std::vector<std::array<int, 3>>
 //info's 0's bit mean if goto full search
 int DT::recoverEdgebyFlip(const int targetE, int dirflag, int info)
 {
-	int dir, srctet, ia, ib, ic, id, pa, pb, pc, pd, i, tried = 0;
+	int dir, srctet, ia, ib, ic, id, pa, pb, pc, tried = 0;
 	SurEdg* lostE = &SurEdgs[targetE];
 	int p1 = lostE->iStart;
 	int p2 = lostE->iEnd;
@@ -3387,7 +3392,7 @@ int DT::addinnerSteiner_Edge(const int lostE, std::vector<int>& newN, int info) 
     double p2[3] = {Nodes[pb].pt[0],Nodes[pb].pt[1],Nodes[pb].pt[2]};
 	double LenEdg = distance(p1, p2);
 	double space = (Nodes[pa].space + Nodes[pb].space) / 2.0;
-	double linep[2][3], facept[3][3], intPnt[3], pnt[3];
+	double linep[2][3], facept[3][3], intPnt[3];
 	int intTyp, intCod, srctet, nVid = Vid.size();
 
 	for (int k = 0; k < 3; k++) {
@@ -3607,8 +3612,6 @@ int DT::addinnerSteiner_Edge2(const int lostE, std::vector<int>& newN, int info)
 	double lenEdg = distance(p1,p2);
 	double space = (Nodes[pa].space + Nodes[pb].space) / 2.0;
 	double pnt[3] = { 0 };
-	double linep[2][3], facept[3][3], intPnt[3];
-	int intTyp, intCod, srctet;
 	std::vector < std::array<double, 3>> Normal;
 
 	std::set<int> P_all;
@@ -4814,7 +4817,7 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
     auto& flipCount = thread_n < 0 ? tempfliptime : parallelFlipCount[thread_n];
 
 	int pa, pb, pc, pd, pe, pf, a, b, c = 0, d = 0, e = 0, n, nn, i, j, k, hullflag, flipflag, newtet, flatflag = 0, flatedge;
-	double ori, qa, qb, qc;
+	double ori;
 	int oldtet0P[4] = { Elems[oldtet[0]].form[0] ,Elems[oldtet[0]].form[1] ,Elems[oldtet[0]].form[2] ,Elems[oldtet[0]].form[3] };
 	n = oldtet.size();
 
@@ -5303,7 +5306,7 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 * s.t. only flip,if it could be fliped should be deterine in last step
 */
 int DT::flip32(std::vector<int>& oldtet, int ia, int ib, int thread_n) {
-	int a[3], b[3], c[2], d[2], e[2], i, pa, pb, pc, pd, pe, adj1, adj2, newa, newb;
+	int a[3], b[3], c[2], d[2], e[2], pa, pb, pc, pd, pe, adj1, adj2, newa, newb;
 
 	pa = Elems[oldtet[0]].form[ia];
 	pb = Elems[oldtet[0]].form[ib];
@@ -6617,7 +6620,7 @@ void DT::SurMeshClean(Mesh& mesh, Args& args){
 }
 
 int DT::ColorTets() {
-	int layer = 0, iElem, iSrch, ia, ib, ic, id, pb, pc, pd;
+	int layer = 0;
 
     std::vector<unsigned> marks(Elems.size(), 0);
     std::vector<int> queue;
@@ -6850,7 +6853,7 @@ void DT::buildspace(Mesh& mesh, Args& args) {
 // Compatibility helper: direct callers retain the original element-bit contract.
 // MeshRefine uses an explicit call-local rejection map instead.
 int DT::createRefineCandidate(int i, Args& args, bool& rejected) {
-	int  j, k;
+	int j;
 	double pnt[3] = { 0 }, dp = 0, dt[4] = { 0 }, SizeAlpha = args.size;
 
 	if (isDelEle(i))

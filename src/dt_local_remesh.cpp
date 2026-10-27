@@ -49,7 +49,7 @@ bool replacePatch(DT& host, const std::vector<int>& cells, Mesh& mesh,
             v[i] = returned[cell[i]]; used.insert(v[i]);
         }
         auto key = v; std::sort(key.begin(), key.end());
-        if (std::adjacent_find(key.begin(),key.end()) != key.end() || key == seedKey ||
+        if (std::adjacent_find(key.begin(),key.end()) != key.end() || (key == seedKey && host.improve_Metric != 8) ||
             !uniqueCells.insert(key).second) return false;
         double *a = host.Nodes[v[0]].pt, *b = host.Nodes[v[1]].pt,
             *c = host.Nodes[v[2]].pt, *d = host.Nodes[v[3]].pt;
@@ -93,10 +93,10 @@ bool replacePatch(DT& host, const std::vector<int>& cells, Mesh& mesh,
     // Near zero, an absolute tolerance must not mask a large relative loss.
     const double angleTolerance = std::min(1e-10,before.minAngle*1e-10);
     const double jacobianTolerance = std::min(1e-12,before.minJacobian*1e-10);
-    if (after.minAngle + angleTolerance < before.minAngle ||
-        after.minJacobian + jacobianTolerance < before.minJacobian ||
-        !(after.minAngle > before.minAngle * 1.01 + 1e-10 ||
-          after.minJacobian > before.minJacobian * 1.01 + 1e-12)) return false;
+    if (after.minAngle + angleTolerance < (host.improve_Metric==8 ? std::min(before.minAngle,1.0) : before.minAngle) ||
+        after.minJacobian + jacobianTolerance < (host.improve_Metric==8 ? std::min(before.minJacobian,.001) : before.minJacobian) ||
+        (host.improve_Metric != 8 && !(after.minAngle > before.minAngle * 1.01 + 1e-10 ||
+          after.minJacobian > before.minJacobian * 1.01 + 1e-12))) return false;
     size_t exterior = 0;
     for (const auto& item : faces) if (item.second.count == 1) {
         ++exterior;
@@ -116,6 +116,11 @@ bool replacePatch(DT& host, const std::vector<int>& cells, Mesh& mesh,
         if (!((oldSide < 0 && newSide < 0) || (oldSide > 0 && newSide > 0))) return false;
     }
     if (exterior != boundary.size() || !host.topologyCandidateCurrent(seed)) return false;
+    if (host.improve_Metric == 8) {
+        std::vector<std::array<int,4>> proposed;
+        for (const auto& e : replacement) proposed.push_back({{e.form[0],e.form[1],e.form[2],e.form[3]}});
+        if (!host.acceptOrthogonalPatch(cells,proposed)) return false;
+    }
 
     if (budget && !budget->accepts(budgetBefore,budgetAfter)) return false;
 
@@ -155,6 +160,7 @@ bool replacePatch(DT& host, const std::vector<int>& cells, Mesh& mesh,
         e.info = -1; e.geo = -1; e.q = -1;
     }
     host.Evacancy.swap(freeCells);
+    if (host.improve_Metric == 8) for (int cell : slots) host.updateQuality(cell);
     if (budget) budget->commit(budgetBefore,budgetAfter);
     if (host.QuantityControl) regionCount->second += static_cast<int>(count)-static_cast<int>(cells.size());
     for (int n : toGlobal) if (n < static_cast<int>(host.susIdleStates.size()))
@@ -245,7 +251,7 @@ int DT::remeshTopologyPatch(int tet, detail::QualityBudget* budget) {
         // Under a quality ledger, try deep flips privately before regenerating
         // this same constrained patch. Export may compact points; replacePatch
         // always matches actual host coordinates and validates the whole cavity.
-        if (budget) {
+        if (budget || improve_Metric == 8) {
             try {
                 Mesh flipMesh = mesh;
                 for (int cell : cells) {
@@ -256,7 +262,7 @@ int DT::remeshTopologyPatch(int tet, detail::QualityBudget* budget) {
                 if (trial->dt_init(flipMesh,flipArgs)) {
                     trial->buildTetInfo(flipMesh,flipArgs); trial->improve_init(flipArgs);
                     trial->modifyBnd=false; trial->improve_Metric=improve_Metric;
-                    trial->optflipdeep=2; trial->prepareQuality();
+                    trial->optflipdeep=improve_Metric == 8 ? 4 : 2; trial->prepareQuality();
                     int localSeed=0;
                     if (trial->removebadtet(localSeed,-1)==1) {
                         trial->RemoveTet(flipArgs); trial->outMesh(flipMesh,flipArgs);

@@ -1,5 +1,6 @@
 #include "dt.h"
 #include "dt_joint_smoothing.h"
+#include "dt_geometry_guard.h"
 #include <stdexcept>
 
 // Escobar et al., CMAME 192 (2003), 2775-2787; SUS code (2010),
@@ -543,6 +544,10 @@ int dt::DT::smoothInteriorPoint(int iNod, double minimumQualityFloor) {
         susIdleStates[iNod] = SusIdleState{};
         return 0;
     }
+    if (improve_Metric == 8) {
+        BoundarySmoothWorkspace boundary;
+        return smoothOrthogonalPoint(iNod,minimumQualityFloor,boundary);
+    }
     if (improve_Metric == 2) return smooth_angle(iNod, minimumQualityFloor);
     return smooth_sus(iNod, minimumQualityFloor);
 }
@@ -874,11 +879,16 @@ detail::QualityTotals tailCell(DT& mesh, int tet, const detail::QualityBudget& b
     return q;
 }
 
-int smoothTailPoint(DT& mesh, int node, detail::QualityBudget& budget) {
+} // namespace
+
+int DT::smoothTailPoint(int node, detail::QualityBudget& budget, BoundarySmoothWorkspace* boundary) {
+    DT& mesh = *this;
     if (node < 0 || node >= static_cast<int>(mesh.Nodes.size()) || node == mesh.ghost ||
-        mesh.isDelNod(node) || mesh.isbndpnt(node) || mesh.lockV.count(node) || mesh.periodic_P.count(node)) return 0;
+        mesh.isDelNod(node) || (mesh.isbndpnt(node) && !boundary) || mesh.lockV.count(node) || mesh.periodic_P.count(node)) return 0;
+    if (boundary && !prepareBoundarySmoothPoint(node, *boundary)) return 0;
     std::vector<int> star;
-    mesh.findSphere(node, star);
+    if (boundary) star = boundary->star;
+    else mesh.findSphere(node, star);
     if (star.empty()) return 0;
     std::vector<int> neighbors;
     neighbors.reserve(star.size()*3);
@@ -899,33 +909,96 @@ int smoothTailPoint(DT& mesh, int node, detail::QualityBudget& budget) {
     }
     if (!(scale > 0) || !std::isfinite(scale) || neighbors.empty()) return 0;
     center /= neighbors.size();
-    Vec gradient;
-    for (int k = 0; k < 3; ++k) {
-        Vec shift = Vec::Zero(); shift[k] = scale * 1e-5;
-        const auto plus = atPosition(mesh, star, node, origin + shift, budget);
-        const auto minus = atPosition(mesh, star, node, origin - shift, budget);
-        gradient[k] = plus.valid && minus.valid ? static_cast<double>(plus.focus - minus.focus) : 0;
-    }
     std::vector<Vec> directions;
     directions.reserve(8);
-    if (gradient.allFinite() && gradient.norm() > 0) directions.push_back(gradient.normalized());
-    if (center.norm() > 0) directions.push_back(center.normalized());
-    for (int k = 0; k < 3; ++k) {
-        Vec axis = Vec::Zero(); axis[k] = 1; directions.push_back(axis); directions.push_back(-axis);
+    if (boundary) {
+        Vec basis[2];
+        const int dimension = isFacetpnt(node) ? 2 : 1;
+        if (dimension == 2) {
+            const Vec normal = Vec(boundary->normal.data()) / boundary->normalLength;
+            basis[0] = normal.unitOrthogonal();
+            basis[1] = normal.cross(basis[0]);
+        } else {
+            basis[0] = (Vec(Nodes[boundary->neighbors[0]].pt) -
+                        Vec(Nodes[boundary->neighbors[1]].pt)).normalized();
+        }
+        Vec gradient = Vec::Zero(), tangentCenter = Vec::Zero();
+        for (int k = 0; k < dimension; ++k) {
+            const Vec shift = scale * 1e-5 * basis[k];
+            const auto plus = atPosition(mesh, star, node, origin + shift, budget);
+            const auto minus = atPosition(mesh, star, node, origin - shift, budget);
+            if (plus.valid && minus.valid)
+                gradient += basis[k] * static_cast<double>(plus.focus - minus.focus);
+            tangentCenter += basis[k] * center.dot(basis[k]);
+        }
+        if (gradient.allFinite() && gradient.norm() > 0) directions.push_back(gradient.normalized());
+        if (tangentCenter.norm() > 0) directions.push_back(tangentCenter.normalized());
+        for (int k = 0; k < dimension; ++k) {
+            directions.push_back(basis[k]); directions.push_back(-basis[k]);
+        }
+    } else {
+        Vec gradient;
+        for (int k = 0; k < 3; ++k) {
+            Vec shift = Vec::Zero(); shift[k] = scale * 1e-5;
+            const auto plus = atPosition(mesh, star, node, origin + shift, budget);
+            const auto minus = atPosition(mesh, star, node, origin - shift, budget);
+            gradient[k] = plus.valid && minus.valid ? static_cast<double>(plus.focus - minus.focus) : 0;
+        }
+        if (gradient.allFinite() && gradient.norm() > 0) directions.push_back(gradient.normalized());
+        if (center.norm() > 0) directions.push_back(center.normalized());
+        for (int k = 0; k < 3; ++k) {
+            Vec axis = Vec::Zero(); axis[k] = 1; directions.push_back(axis); directions.push_back(-axis);
+        }
     }
     Vec best = origin;
     auto bestQuality = before;
     double localVolumeFloor = DBL_MAX;
     for (int t : star) localVolumeFloor = std::min(localVolumeFloor, mesh.calVolume(t));
     localVolumeFloor *= .1;
-    for (const auto& direction : directions) {
+    struct Proposal {
+        Vec position;
+        detail::QualityTotals quality;
+        bool accepted = false;
+    };
+    std::array<Proposal,8> proposals;
+    const int directionCount = static_cast<int>(directions.size());
+    const int workers = std::max(1,std::min(4,std::min(mesh.num_threads,directionCount)));
+    // Proposals read one frozen star and ledger. Commit in the original order;
+    // no neighboring point can move until this vertex has finished.
+#pragma omp parallel for num_threads(workers) schedule(static) if(workers > 1)
+    for (int i = 0; i < directionCount; ++i) {
+        const auto& direction = directions[i];
         double step = .25 * scale;
         for (int iteration = 0; iteration < 16; ++iteration, step *= .5) {
             const Vec candidate = origin + step * direction;
+            if (boundary) {
+                bool valid = true;
+                for (const auto& f : boundary->faces) {
+                    const Vec a(Nodes[f[0]].pt), b(Nodes[f[1]].pt), c(Nodes[f[2]].pt);
+                    if (!pointOnBoundaryPlane(a.data(), b.data(), c.data(), candidate.data())) {
+                        valid = false; break;
+                    }
+                    const Vec nextA = f[0] == node ? candidate : a;
+                    const Vec nextB = f[1] == node ? candidate : b;
+                    const Vec nextC = f[2] == node ? candidate : c;
+                    if (!((b-a).cross(c-a).dot((nextB-nextA).cross(nextC-nextA)) > 0)) {
+                        valid = false; break;
+                    }
+                }
+                if (!valid) continue;
+            }
             const auto q = atPosition(mesh, star, node, candidate, budget, localVolumeFloor);
             if (!budget.accepts(before, q)) continue;
-            if (q.focus > bestQuality.focus) { best = candidate; bestQuality = q; }
+            proposals[i].position = candidate;
+            proposals[i].quality = q;
+            proposals[i].accepted = true;
             break;
+        }
+    }
+    for (int i = 0; i < directionCount; ++i) {
+        const auto& p = proposals[i];
+        if (p.accepted && p.quality.focus > bestQuality.focus) {
+            best = p.position; bestQuality = p.quality;
         }
     }
     if (!(bestQuality.focus > before.focus)) return 0;
@@ -933,7 +1006,6 @@ int smoothTailPoint(DT& mesh, int node, detail::QualityBudget& budget) {
     for (int t : star) mesh.updateQuality(t);
     budget.commit(before, bestQuality);
     return 1;
-}
 }
 
 int DT::repairQualityTailPass(double targetAngle, int rounds) {
@@ -943,6 +1015,7 @@ int DT::repairQualityTailPass(double targetAngle, int rounds) {
     detail::QualityBudget budget(*this, targetAngle);
     if (!budget.valid()) return 0;
     size_t moves = 0, repairs = 0;
+    std::vector<unsigned char> boundaryTargets(modifyBnd ? Nodes.size() : 0, 0);
     for (int round = 0; round < rounds; ++round) {
         std::vector<unsigned char> targets(Nodes.size(), 0);
         std::vector<std::pair<double, TopologyCandidate>> candidates;
@@ -950,11 +1023,14 @@ int DT::repairQualityTailPass(double targetAngle, int rounds) {
             if (isDelEle(t) || ishulltet(t) || isvirtualtet(t)) continue;
             const auto q = tailCell(*this,t,budget);
             if (!q.valid || !(q.minAngle < targetAngle)) continue;
-            for (int n : Elems[t].form) targets[n] = 1;
+            for (int n : Elems[t].form) {
+                targets[n] = 1;
+                if (modifyBnd && isbndpnt(n)) boundaryTargets[n] = 1;
+            }
         }
         size_t roundMoves = 0, roundRepairs = 0;
         for (int n = 0; n < static_cast<int>(targets.size()); ++n)
-            if (targets[n]) roundMoves += smoothTailPoint(*this, n, budget);
+            if (targets[n]) roundMoves += smoothTailPoint(n, budget);
         // Prioritize tiny Jacobians, then the low-angle tail. Frozen identities
         // prevent later trials from accidentally operating on reused slots.
         for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
@@ -974,6 +1050,18 @@ int DT::repairQualityTailPass(double targetAngle, int rounds) {
         }
         moves += roundMoves; repairs += roundRepairs;
         if (!roundMoves && !roundRepairs) break;
+    }
+    // Finish boundary motion after the established interior/topology pass.
+    // A fresh ledger protects all quality measures of that completed result.
+    BoundarySmoothWorkspace boundary;
+    std::vector<int> boundaryNodes;
+    for (int n = 0; n < static_cast<int>(boundaryTargets.size()); ++n)
+        if (boundaryTargets[n] && !periodic_P.count(n) && prepareBoundarySmoothPoint(n, boundary))
+            boundaryNodes.push_back(n);
+    if (!boundaryNodes.empty()) {
+        detail::QualityBudget boundaryBudget(*this, targetAngle);
+        if (boundaryBudget.valid()) for (int n : boundaryNodes)
+            moves += smoothTailPoint(n, boundaryBudget, &boundary);
     }
     return static_cast<int>(moves + repairs);
 }

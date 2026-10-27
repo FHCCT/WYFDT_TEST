@@ -796,6 +796,7 @@ double DT::tetquality(double v1[3], double v2[3], double v3[3], double v4[3], do
         if (qualmeasure == ANGLE_JACOBIAN_METRIC)
             return angleJacobianQuality(low / std::acos(1.0 / 3.0), jacobian);
     }
+    if (qualmeasure == 8) return orthogonal(v1,v2,v3,v4,nullptr,nullptr,nullptr,nullptr);
 	if (qualmeasure == SUS_METRIC) return quality_sus(v1, v2, v3, v4);
 
 	double quality = 0;

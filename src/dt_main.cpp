@@ -33,7 +33,7 @@ int main(int argc, char* argv[]) {
 	app.add_option("--refine", args.refine, "If refine mesh. (int, optional, int:1)");
 	app.add_option("--optlevel", args.optlevel, "Mesh improvement level. (int, optional, int:2)");
 	app.add_option("--optloop", args.optloop, "Mesh improvement rounds (default:5, adptype 2:3)");
-	app.add_option("--optanglestrict", args.optanglestrict, "Minimum dihedral repair threshold in degrees; 0 disables only the angle trigger (SJ < 1e-5 still triggers; default:1, adptype 2:0.0001)");
+	app.add_option("--optanglestrict", args.optanglestrict, "Minimum dihedral insertion threshold in degrees (default:1). optlevel 5: >0 enables Q<0.01 tail repair; 0 keeps pure flips/smoothing. Other levels: 0 disables only the angle trigger (SJ<1e-5 still triggers).");
 	app.add_option("--optTh", args.optTh, "Quality candidate threshold in the active metric (default:0.2, adptype 2:0.3)");
 	app.add_option("--adpangle", args.adpangle, "Adaptation boundary angle (default:170, adptype 2:160)");
 	app.add_option("--nthread", args.nthread, "Maximum threads for every stage; active teams adapt to mesh size (-1: automatic).");
@@ -98,11 +98,11 @@ int main(int argc, char* argv[]) {
 				//args.periodic_P = { 115,0,117,201,122,7,123,195,131,9,134,113,140,197,141,196,198,184,200,187,204,223,205,222,206,221,207,224,208,225,209,227,210,226,211,228,212,229,213,231,214,230,215,232,216,235,217,234,218,233,219,237,220,236,558,559,46,175,47,27,49,30,105,146,107,26,136,53,150,22,151,25,155,156,157,50,159,158,161,164,163,147,176,177,182,181,193,194,202,162,203,100,9,7,11,8,46,175,47,27,49,30,105,146,107,26,113,0,114,2,129,128,131,122,133,127,134,115,136,53,150,22,151,25,155,156,157,50,159,158,161,164,163,147,176,177,182,181,189,190,192,191,193,194,202,162,203,100,208,207,209,214,210,213,211,215,212,204,219,218,220,217,225,224,226,231,227,230,228,232,229,223,236,234,237,233 };
 				// Shared isotropic quality profile; explicit CLI values take precedence.
 				if (app.get_option("--adpangle")->count() == 0) args.adpangle = 160;
-				if (app.get_option("--optloop")->count() == 0) args.optloop =3;
+				if (app.get_option("--optloop")->count() == 0) args.optloop = 10;
 				if (app.get_option("--nthread")->count() == 0) args.nthread = 4;
 				if (app.get_option("--optTh")->count() == 0) args.optTh = 0.3;
 				if (app.get_option("--optanglestrict")->count() == 0) args.optanglestrict = 1;
-				ret = d.adaptation_by_Tetid(mesh, args, refine_tri_id, refine_tet_id, 1.234);
+				ret = d.adaptation_by_Tetid(mesh, args, refine_tri_id, refine_tet_id, 1.242);
 			}
 			else if (adptype == 3) {
 				ret = d.adaptation_Coarse(mesh, args);
@@ -133,7 +133,7 @@ int main(int argc, char* argv[]) {
 
 				args.optloop = 10;
 				args.optTh = 0.3;
-				args.optanglestrict = 0.01;
+				args.optanglestrict = 1;
 				// Keep the user-provided minimum dihedral insertion angle.
 				args.adpangle = 170;
 				constexpr double lamasize = 33.3069;

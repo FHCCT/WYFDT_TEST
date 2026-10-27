@@ -448,7 +448,12 @@ namespace dt {
 		double ScaledJacobian( double p0[3],  double p1[3],  double p2[3],  double p3[3], double eps= 1e-30);
 		double AspectRatio(double v1[3], double v2[3], double v3[3], double v4[3]);
 		//--------------------- Orthogonality ---------------------
+        // Omit hull and removed-region neighbors in mesh-quality queries.
+        double orthogonalQuality(int tet, int movedNode = -1, const double* position = nullptr);
+        bool acceptOrthogonalPatch(const std::vector<int>& removed,
+            const std::vector<std::array<int,4>>& replacement, int newNode = -1, const double* position = nullptr);
 		double calskewness(double* pa, double* pb, double* pc, double* pd);
+        // Optional arguments are opposite vertices, not neighbor centroids.
 		double orthogonal(double* pa, double* pb, double* pc, double* pd, double* oppositeA, double* oppositeB, double* oppositeC, double* oppositeD);
 
 		//--------------------- Hilbert sort ---------------------
@@ -513,6 +518,10 @@ namespace dt {
             std::array<double, 3> normal;
             double normalLength, scale, minimum, qualitySum;
         };
+        double* orthogonalOppositeVertex(int cell, int face);
+        int smoothOrthogonalPoint(int node, double minimumShapeFloor, BoundarySmoothWorkspace& boundary, bool tail = false);
+        void repairOrthogonalTail(double insertionAngleDegrees, int rounds);
+        int smoothTailPoint(int node, detail::QualityBudget& budget, BoundarySmoothWorkspace* boundary = nullptr);
         int prepareBoundarySmoothPoint(int node, BoundarySmoothWorkspace& workspace);
         int smoothPeriodicBoundaryGroup(const std::vector<int>& group, double minimumQualityFloor);
         int smoothPlanarBoundaryPoint(int node, double minimumQualityFloor, BoundarySmoothWorkspace& workspace,
@@ -526,7 +535,7 @@ namespace dt {
         bool collapsePointOnFace(int face, const double* target);
         int pairLocalStrip(int node, int geo);
         std::vector<int> pendingBoundaryPairs;
-        void synchronizeRectangularSplit(int node);
+        void synchronizeRectangularSplit(int node, double sourceLength);
         int redirectRectangularSplit(int edge, int deep, bool retryVolume, double fraction);
         int cachedFaceFlipGeometry(int a, int b, int c, int d);
         bool rectangularPairingInProgress = false;

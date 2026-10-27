@@ -78,7 +78,7 @@ int DT::dt_init(Mesh& mesh, Args& args)
 	spdlogoutfile(args.outlogfile);
     meshLogger->set_level(infolevel == 0 ? spdlog::level::err :
         infolevel == 1 ? spdlog::level::info : spdlog::level::debug);
-	if (infolevel > 0) meshLogger->info("Version 2026.10.25");
+	if (infolevel > 0) meshLogger->info("Version 2026.10.27");
     MeshStageLog initLog(*this, "Initialize");
     if (infolevel > 0)
         meshLogger->info("Input mesh: points={} segments={} triangles={} tets={}",
@@ -733,7 +733,7 @@ int DT::ColorVirtualTet(Args& args) {
 	//color all tet
 	int subdomain = ColorTets();
 	if (infolevel > 0)
-		meshLogger->debug("Have {} SubDomain.", subdomain);
+		meshLogger->info("Have {} SubDomain.", subdomain);
 
 	if (args.extrashell) {
 		shellextra();
@@ -863,11 +863,6 @@ int DT::ColorVirtualTet(Args& args) {
 		//meshLogger->debug("TetGeo connect to TriGeo:");
 		std::map<int, std::set<int>> geo2tet;
 		for (const auto& tid : t2s) {
-			//std::printf("%d : ", tid.first);
-			//for (auto fid : tid.second) {
-			//	std::printf("%d ", fid);
-			//}
-			//std::printf("\n");
 			if (args.bnd_bodyid.size() != 0) {
 				for (const auto& temptid : args.bnd_bodyid) {
 					int belong = 0;
@@ -1366,8 +1361,10 @@ int visitNodeStar(DT& mesh, int node, std::vector<int>& sphere, Predicate matche
             if (!mesh.isDelEle(t) && mesh.isNod_in_Tet(node,t)>=0) { seed=t; break; }
     }
     if (seed < 0) return -1;
+    // The usual star is small: its BFS queue is also a contiguous visited set.
+    // Large stars switch to hashing, keeping the quadratic part bounded.
     std::unordered_set<int> visited;
-    visited.insert(seed); sphere.push_back(seed);
+    sphere.push_back(seed);
     for (size_t k=0; k<sphere.size(); ++k) {
         const int t=sphere[k];
         if (matches(t)) return t;
@@ -1376,7 +1373,13 @@ int visitNodeStar(DT& mesh, int node, std::vector<int>& sphere, Predicate matche
             if (face==ord) continue;
             const int next=mesh.getNeig(t,face);
             if (next<0 || next>=static_cast<int>(mesh.Elems.size()) || mesh.isDelEle(next) || mesh.isNod_in_Tet(node,next)<0) continue;
-            if (visited.insert(next).second) sphere.push_back(next);
+            if (sphere.size() < 64) {
+                if (std::find(sphere.begin(),sphere.end(),next) != sphere.end()) continue;
+            } else {
+                if (visited.empty()) visited.insert(sphere.begin(),sphere.end());
+                if (!visited.insert(next).second) continue;
+            }
+            sphere.push_back(next);
         }
     }
     return -1;
@@ -4680,14 +4683,14 @@ int DT::removeface(std::vector<int>& oldtet, int ia, int info, int thread_n) {
 			}
 			else {
 				q1 = orthogonal(pa, pb, pd, pe,
-					getoppoP(oldtet[1], isNod_in_Tet(c, oldtet[1])) == ghost ? NULL : Nodes[getoppoP(oldtet[1], isNod_in_Tet(c, oldtet[1]))].pt, pc, pc,
-					getoppoP(oldtet[0], ic) == ghost ? NULL : Nodes[getoppoP(oldtet[0], ic)].pt);
+					orthogonalOppositeVertex(oldtet[1], isNod_in_Tet(c, oldtet[1])), pc, pc,
+					orthogonalOppositeVertex(oldtet[0], ic));
 				q2 = orthogonal(pa, pd, pc, pe,
-					getoppoP(oldtet[1], isNod_in_Tet(b, oldtet[1])) == ghost ? NULL : Nodes[getoppoP(oldtet[1], isNod_in_Tet(b, oldtet[1]))].pt, pb, pb,
-					getoppoP(oldtet[0], ib) == ghost ? NULL : Nodes[getoppoP(oldtet[0], ib)].pt);
+					orthogonalOppositeVertex(oldtet[1], isNod_in_Tet(b, oldtet[1])), pb, pb,
+					orthogonalOppositeVertex(oldtet[0], ib));
 				q3 = orthogonal(pa, pc, pb, pe,
-					getoppoP(oldtet[1], isNod_in_Tet(d, oldtet[1])) == ghost ? NULL : Nodes[getoppoP(oldtet[1], isNod_in_Tet(d, oldtet[1]))].pt, pd, pd,
-					getoppoP(oldtet[0], id) == ghost ? NULL : Nodes[getoppoP(oldtet[0], id)].pt);
+					orthogonalOppositeVertex(oldtet[1], isNod_in_Tet(d, oldtet[1])), pd, pd,
+					orthogonalOppositeVertex(oldtet[0], id));
 			}
 			if (q1 < minq || q2 < minq || q3 < minq) {
 				if (thread_n != -1) clearOccupying(Nodes[e].occupying, thread_n);
@@ -4897,13 +4900,13 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 						int tetce = oldtet[1] + oldtet[2] - tetde;
 
 						qa = orthogonal(Nodes[pd].pt, Nodes[pc].pt, Nodes[pe].pt, Nodes[pa].pt,
-							getoppoP(tetce, isNod_in_Tet(pb, tetce)) == ghost ? NULL : Nodes[getoppoP(tetce, isNod_in_Tet(pb, tetce))].pt,
-							getoppoP(tetde, isNod_in_Tet(pb, tetde)) == ghost ? NULL : Nodes[getoppoP(tetde, isNod_in_Tet(pb, tetde))].pt,
-							getoppoP(oldtet[0], isNod_in_Tet(pb, oldtet[0])) == ghost ? NULL : Nodes[getoppoP(oldtet[0], isNod_in_Tet(pb, oldtet[0]))].pt, Nodes[pb].pt);
+							orthogonalOppositeVertex(tetce, isNod_in_Tet(pb, tetce)),
+							orthogonalOppositeVertex(tetde, isNod_in_Tet(pb, tetde)),
+							orthogonalOppositeVertex(oldtet[0], isNod_in_Tet(pb, oldtet[0])), Nodes[pb].pt);
 						qb = orthogonal(Nodes[pc].pt, Nodes[pd].pt, Nodes[pe].pt, Nodes[pb].pt, 
-							getoppoP(tetde, isNod_in_Tet(pa, tetde)) == ghost ? NULL : Nodes[getoppoP(tetde, isNod_in_Tet(pa, tetde))].pt,
-							getoppoP(tetce, isNod_in_Tet(pa, tetce)) == ghost ? NULL : Nodes[getoppoP(tetce, isNod_in_Tet(pa, tetce))].pt,
-							getoppoP(oldtet[0], isNod_in_Tet(pa, oldtet[0])) == ghost ? NULL : Nodes[getoppoP(oldtet[0], isNod_in_Tet(pa, oldtet[0]))].pt, Nodes[pa].pt);
+							orthogonalOppositeVertex(tetde, isNod_in_Tet(pa, tetde)),
+							orthogonalOppositeVertex(tetce, isNod_in_Tet(pa, tetce)),
+							orthogonalOppositeVertex(oldtet[0], isNod_in_Tet(pa, oldtet[0])), Nodes[pa].pt);
 					}
 
 					if (qa <= minq + 1e-15 || qb <= minq + 1e-15) {
@@ -5020,12 +5023,12 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 				else {
 					qa = orthogonal(Nodes[pc].pt, Nodes[pb].pt, Nodes[pd].pt, Nodes[pe].pt,
 						Nodes[pa].pt, Nodes[pa].pt,
-						getoppoP(lefttet, isNod_in_Tet(pa, lefttet)) == ghost ? NULL : Nodes[getoppoP(lefttet, isNod_in_Tet(pa, lefttet))].pt,
-						getoppoP(oldtet[i], isNod_in_Tet(pa, oldtet[i])) == ghost ? NULL : Nodes[getoppoP(oldtet[i], isNod_in_Tet(pa, oldtet[i]))].pt);
+						orthogonalOppositeVertex(lefttet, isNod_in_Tet(pa, lefttet)),
+						orthogonalOppositeVertex(oldtet[i], isNod_in_Tet(pa, oldtet[i])));
 					qb = orthogonal(Nodes[pa].pt, Nodes[pc].pt, Nodes[pd].pt, Nodes[pe].pt,
 						Nodes[pb].pt, Nodes[pb].pt,
-						getoppoP(lefttet, isNod_in_Tet(pb, lefttet)) == ghost ? NULL : Nodes[getoppoP(lefttet, isNod_in_Tet(pb, lefttet))].pt,
-						getoppoP(oldtet[i], isNod_in_Tet(pb, oldtet[i])) == ghost ? NULL : Nodes[getoppoP(oldtet[i], isNod_in_Tet(pb, oldtet[i]))].pt);
+						orthogonalOppositeVertex(lefttet, isNod_in_Tet(pb, lefttet)),
+						orthogonalOppositeVertex(oldtet[i], isNod_in_Tet(pb, oldtet[i])));
 				}
 
 				if (qa <= minq + 1e-15 || qb <= minq + 1e-15) {

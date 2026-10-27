@@ -18,7 +18,7 @@ void DT::colorBadQualityNodes(std::vector<std::vector<int>>& colors, double impr
         if (n == ghost || isDelNod(n) || isCornerpnt(n) || lockV.count(n) ||
             periodic_P.count(n) || (addBoxFlag && n > ghost && n < ghost + 9)) continue;
         // Boundary movement is allowed only in the geometric isotropic passes.
-        if (isbndpnt(n) && (!modifyBnd || (improve_Metric != SUS_METRIC && improve_Metric != 2))) continue;
+        if (isbndpnt(n) && (!modifyBnd || (improve_Metric != SUS_METRIC && improve_Metric != 2 && improve_Metric != 8))) continue;
         candidateIndex[n] = static_cast<int>(candidates.size());
         candidates.push_back(n);
     }
@@ -31,6 +31,33 @@ void DT::colorBadQualityNodes(std::vector<std::vector<int>>& colors, double impr
             const int index = candidateIndex[n];
             if (index >= 0) incident[index].push_back(t);
         }
+    }
+    if(improve_Metric==8) {
+        // Orthogonality depends on both cell centres at a face. A vertex move
+        // updates its incident cells AND their face neighbors. Color overlapping
+        // affected cell sets, rather than just tetrahedra sharing moved vertices.
+        std::vector<std::vector<int>> users(Elems.size());
+        for(int index=0;index<static_cast<int>(incident.size());++index) {
+            auto& cells=incident[index];const size_t count=cells.size();
+            for(size_t j=0;j<count;++j)for(int face=0;face<4;++face) {
+                const int neighbor=getNeig(cells[j],face);
+                if(neighbor>=0 && neighbor<static_cast<int>(Elems.size()) && !isDelEle(neighbor) &&
+                    !ishulltet(neighbor) && !isvirtualtet(neighbor))cells.push_back(neighbor);
+            }
+            std::sort(cells.begin(),cells.end());
+            cells.erase(std::unique(cells.begin(),cells.end()),cells.end());
+            for(int cell:cells)users[cell].push_back(index);
+        }
+        std::vector<int> assigned(candidates.size(),-1),used;
+        for(int index=0;index<static_cast<int>(candidates.size());++index) {
+            used.assign(colors.size(),-1);
+            for(int cell:incident[index])for(int other:users[cell])
+                if(assigned[other]>=0)used[assigned[other]]=index;
+            int color=0;while(color<static_cast<int>(used.size()) && used[color]==index)++color;
+            if(color==static_cast<int>(colors.size()))colors.emplace_back();
+            assigned[index]=color;colors[color].push_back(candidates[index]);
+        }
+        return;
     }
     std::vector<int> assigned(candidates.size(), -1), used;
     for (int index = 0; index < static_cast<int>(candidates.size()); ++index) {

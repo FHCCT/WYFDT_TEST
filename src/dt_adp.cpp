@@ -754,6 +754,8 @@ namespace dt {
 namespace {
 using Vec = Eigen::Vector3d;
 using Edge = std::pair<int, int>;
+constexpr double rectangularSynchronizationWidthRatio = 2.0;
+constexpr double rectangularRailMatchWidthRatio = 0.25;
 Vec point(const DT& mesh, int node) { return Vec(mesh.Nodes[node].pt); }
 Vec vector(const std::array<double, 3>& v) { return Vec(v.data()); }
 std::array<double, 3> array(const Vec& v) { return {{v[0], v[1], v[2]}}; }
@@ -808,24 +810,29 @@ RailLocation locateRail(DT& mesh, const DT::RectangularFace& face, int geo, int 
     RailLocation result;
     const Vec origin = vector(face.origin), along = vector(face.along), across = vector(face.across);
     int before = -1, after = -1; double lower = -DBL_MAX, upper = DBL_MAX;
+    // A transverse station need not agree to floating-point precision. Reuse
+    // the closest live station within a quarter width before splitting its rail.
+    const double matchTolerance = std::max(face.tolerance, rectangularRailMatchWidthRatio * face.width);
+    double nearest = DBL_MAX;
     for (int n : face.longSideNodes[side]) {
         if (mesh.isDelNod(n) || !mesh.isbndpnt(n)) continue;
         const Vec p = point(mesh, n) - origin;
         if (std::abs(p.dot(across) - side * face.width) > face.tolerance ||
             std::abs(p.dot(along.cross(across))) > face.tolerance) continue;
         const double x = p.dot(along);
-        if (std::abs(x - position) <= face.tolerance) {
+        if (std::abs(x - position) <= matchTolerance && std::abs(x - position) < nearest) {
             // Recycled slots belonging to another geometry cannot be reused.
             std::unordered_set<int> current;
             mesh.findSphere_tri(n, current);
             for (int f : current) if (!mesh.isDelSurTri(f) && mesh.SurTris[f].parent == geo) {
-                result.node = n; return result;
+                result.node = n; nearest = std::abs(x - position); break;
             }
             continue;
         }
         if (x < position && x > lower) { lower = x; before = n; }
         if (x > position && x < upper) { upper = x; after = n; }
     }
+    if (result.node >= 0) return result;
     const int* found = before >= 0 && after >= 0 ? mesh.BndEdg.find(before, after) : nullptr;
     if (!found || mesh.isDelSurEdg(*found) || mesh.lockE.count(*found)) return result;
     int uses = 0;
@@ -1059,7 +1066,7 @@ int DT::redirectRectangularSplit(int edge, int deep, bool retryVolume, double fr
     return 0;
 }
 
-void DT::synchronizeRectangularSplit(int node) {
+void DT::synchronizeRectangularSplit(int node, double sourceLength) {
     if (node < 0 || isDelNod(node)) return;
     std::unordered_set<int> incident;
     findSphere_tri(node, incident);
@@ -1084,6 +1091,10 @@ void DT::synchronizeRectangularSplit(int node) {
     } scope(rectangularPairingInProgress);
     for (int geo : geometries) {
         auto& face = rectangularFaces.at(geo);
+        // A large rectangle can already contain a fine local triangulation.
+        // Synchronize only an actual split that is long relative to its width;
+        // local diagonals and short rail segments must not refine remote sides.
+        if (!(sourceLength > rectangularSynchronizationWidthRatio * face.width + face.tolerance)) continue;
         const Vec origin = vector(face.origin), along = vector(face.along);
         const double position = (point(*this, node) - origin).dot(along);
         if (position <= face.tolerance || position >= face.length - face.tolerance) continue;

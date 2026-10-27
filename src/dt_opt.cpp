@@ -62,7 +62,7 @@ int DT::MeshImprove(Args& args) {
 		TraditionalOptPass(args);
 	}
 	else if (args.optlevel == 5) {
-		//quickly opt,modify bnd
+        // Orthogonal quality; boundary motion still follows args.constrain.
 		OrthogonalityOptPass(args);
 	}
 	else if (args.optlevel == 7) {
@@ -233,21 +233,22 @@ int DT::OptbyAnisotropicPass(Args& args) {
 }
 
 int DT::OrthogonalityOptPass(Args& args) {
-	int nLoop = 3, nbad = 0;
-	double  minD = 0, minAvgD = 0, maxD = 0, maxAvgD = 0, minq;
-
-	constexpr double improve_goal = 0.1;
-
-	nLoop = std::max(args.optloop, nLoop);
+    const int nLoop=std::max(args.optloop,3);
+    int nbad=0;
+    double minq;
 	improve_Metric = 8; //Orthogonality
 	prepareQuality();
 	printQuality(0.01, nbad, minq, false);
 
 	for (int loop = 0; loop < nLoop; loop++) {
-		TopologicalPass(improve_goal, args.optanglestrict, 1);
-		SmoothPass(1, improve_goal);
+		TopologicalPass(args.optTh, args.optanglestrict, 1);
+		SmoothPass(1, args.optTh);
 		printQuality(0.01, nbad, minq, false);
 	}
+    if (args.optanglestrict > 0) {
+        repairOrthogonalTail(args.optanglestrict, nLoop);
+        printQuality(0.01, nbad, minq, false);
+    }
 	return 1;
 }
 
@@ -1063,21 +1064,8 @@ int DT::prepareQuality() {
                 meshLogger->warn("Warning:Inverted tet: {} {}", i, calVolume(i));
 			}
 		}
-		else {
-			q = orthogonal(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt,
-				getoppoP(i, 0) == ghost ? NULL : Nodes[getoppoP(i, 0)].pt,
-				getoppoP(i, 1) == ghost ? NULL : Nodes[getoppoP(i, 1)].pt,
-				getoppoP(i, 2) == ghost ? NULL : Nodes[getoppoP(i, 2)].pt,
-				getoppoP(i, 3) == ghost ? NULL : Nodes[getoppoP(i, 3)].pt);
-			if (q < 0) {
-				double ori = calVolume(i);
-				q = orthogonal(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt,
-					getoppoP(i, 0) == ghost ? NULL : Nodes[getoppoP(i, 0)].pt,
-					getoppoP(i, 1) == ghost ? NULL : Nodes[getoppoP(i, 1)].pt,
-					getoppoP(i, 2) == ghost ? NULL : Nodes[getoppoP(i, 2)].pt,
-					getoppoP(i, 3) == ghost ? NULL : Nodes[getoppoP(i, 3)].pt);
-			}
-		}
+        else q = orthogonalQuality(i);
+
 		Elems[i].q = q;
 	}
 	return 1;
@@ -1134,13 +1122,17 @@ void DT::updateQuality(int i) {
 		//	q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt, AniMetric, improve_Metric, false);
 		//}
 	}
-	else {
-		q = orthogonal(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt,
-			getoppoP(i, 0) == ghost ? NULL : Nodes[getoppoP(i, 0)].pt,
-			getoppoP(i, 1) == ghost ? NULL : Nodes[getoppoP(i, 1)].pt,
-			getoppoP(i, 2) == ghost ? NULL : Nodes[getoppoP(i, 2)].pt,
-			getoppoP(i, 3) == ghost ? NULL : Nodes[getoppoP(i, 3)].pt);
-	}
+    else {
+        q=orthogonalQuality(i);
+        // A cell-centre change also changes the shared-face term of neighbors.
+        for(int face=0;face<4;++face) {
+            const int neighbor=getNeig(i,face);
+            if(neighbor>=0 && neighbor<static_cast<int>(Elems.size()) && !isDelEle(neighbor) &&
+                !ishulltet(neighbor) && !isvirtualtet(neighbor))
+                Elems[neighbor].q=orthogonalQuality(neighbor);
+        }
+    }
+
 	Elems[i].q = q;
 	return;
 }
@@ -1212,7 +1204,7 @@ int DT::SmoothPass(int nloop, double improve_goal) {
                     const int node = group[i];
                     ++attempts;
                     const bool joint = improve_Metric == 2 && !optimizationPolicy.enabled;
-                    success += (isbndpnt(node)
+                    success += (improve_Metric == 8 ? smoothOrthogonalPoint(node, minimumQualityFloor, boundaryWorkspace) : isbndpnt(node)
                         ? smoothPlanarBoundaryPoint(node, minimumQualityFloor, boundaryWorkspace, joint)
                         : (joint ? smoothAngleJacobian(node, minimumQualityFloor)
                                  : smoothInteriorPoint(node, minimumQualityFloor))) == 1;
@@ -1397,6 +1389,13 @@ int DT::tryTopologyRepair(const TopologyCandidate& candidate, double insertionAn
 
     int tet = candidate.tet;
     if (collapsePoorTetShortEdge(tet, insertionAngleDegrees, budget)) return 1;
+    if (improve_Metric == 8) {
+        // Orthogonal repairs need the real outside-neighbor stencil. Run deep
+        // flips privately and validate the complete replacement before commit.
+        if (remeshTopologyPatch(tet, budget)) return 1;
+        if (!needsTopologyRepair(tet, insertionAngleDegrees)) return 0;
+        return insertInteriorRepair(tet);
+    }
     // Tail proposals use a private constrained patch. No speculative deep
     // flip can mutate the host before its complete quality delta is accepted.
     if (budget) return remeshTopologyPatch(tet, budget);
@@ -1465,6 +1464,7 @@ int DT::tryTopologyRepair(const TopologyCandidate& candidate, double insertionAn
             const double minimum = calculateTriangleAngles(Nodes[face[0]].pt,
                 Nodes[face[1]].pt, Nodes[face[2]].pt, angles);
             if (!(minimum < worstAngle)) continue;
+            if (AniSol.empty() && detail::boundaryQualityRefinementStagnates(*this,*entry,insertionAngleDegrees)) continue;
             int longest = -1;
             double maximum = -1;
             for (int k = 0; k < 3; ++k) {
@@ -1480,6 +1480,10 @@ int DT::tryTopologyRepair(const TopologyCandidate& candidate, double insertionAn
             worstAngle = minimum;
             boundaryEdge = longest;
         }
+        // Compare the incident triangles before splitting: a short local
+        // edge must not repeatedly refine a fan while a longer side remains.
+        if (boundaryEdge >= 0 && AniSol.empty())
+            boundaryEdge = longestAdjacentQualityBoundaryEdge(*this,boundaryEdge);
         if (boundaryEdge >= 0) {
             struct RestoreAcceptance {
                 BWAcceptance& value; BWAcceptance saved;
@@ -1516,7 +1520,7 @@ int DT::TopologicalPass(double improve_goal, double repair_angle_degrees, int nl
             if (isDelEle(t) || isvirtualtet(t) || ishulltet(t) || Elems[t].q < 0) continue;
             // Geometrically poor cells must not be hidden by a different
             // active objective or its cached threshold.
-            if (Elems[t].q <= improve_goal || (topologyRepairEnabled && !topologyRepairDeferred &&
+            if (Elems[t].q <= improve_goal || (improve_Metric != 8 && topologyRepairEnabled && !topologyRepairDeferred &&
                 needsTopologyRepair(t, repair_angle_degrees)))
                 candidates.push_back(topologyCandidate(t));
         }
@@ -1542,13 +1546,13 @@ int DT::TopologicalPass_serial(const std::vector<TopologyCandidate>& candidates,
     for (const auto& candidate : candidates) {
         if (!topologyCandidateCurrent(candidate) || Elems[candidate.tet].q < 0 ||
             (Elems[candidate.tet].q > improve_goal &&
-             (topologyRepairDeferred || !needsTopologyRepair(candidate.tet, repair_angle_degrees)))) continue;
+             (improve_Metric == 8 || topologyRepairDeferred || !needsTopologyRepair(candidate.tet, repair_angle_degrees)))) continue;
         int t = candidate.tet;
         const int result = removebadtet(t, -1);
         if (result == 1) ++success;
         // Only emergency repairs are dispatched during initial forming.
         // Broad proposals follow once their complete-patch ledger is ready.
-        else if (result == 0 && t >= 0 && !isDelEle(t) &&
+        else if (improve_Metric != 8 && result == 0 && t >= 0 && !isDelEle(t) &&
             (!deferQualityRepairs || needsTopologyRepair(t, repair_angle_degrees)))
             success += tryTopologyRepair(topologyCandidate(t), repair_angle_degrees) == 1;
     }
@@ -1931,6 +1935,13 @@ int DT::insertInteriorRepair(int tet) {
             if (!std::isfinite(volume) || !(volume > volumeFloor)) { valid = false; break; }
         }
         if (!valid) continue;
+        if (improve_Metric == 8) {
+            std::vector<std::array<int,4>> replacement;
+            const int proposedNode = static_cast<int>(Nodes.size());
+            for (const BWFace& face : plan.faces)
+                replacement.push_back({{proposedNode,face.vertices[0],face.vertices[1],face.vertices[2]}});
+            if (!acceptOrthogonalPatch(plan.cavity,replacement,proposedNode,plan.request.point.data())) continue;
+        }
         std::vector<int>& slots = serialBW.slots;
         slots.clear(); slots.reserve(plan.faces.size());
         const int node = addNode(plan.request.point[0],plan.request.point[1],plan.request.point[2],plan.request.space);
@@ -3900,7 +3911,7 @@ int DT::splitEdgImpl(int index, int deep, bool retryVolume, double fraction, boo
 		}
 	}
 
-    synchronizeRectangularSplit(newp);
+    synchronizeRectangularSplit(newp, distance(Nodes[p1].pt, Nodes[p2].pt));
 	return newp;
 }
 #pragma optimize("",on)
@@ -6560,7 +6571,7 @@ int DT::collapsePoorTetShortEdge(int tet, double angleDegrees, detail::QualityBu
             const int level = collapsePointLevel(remove), keepLevel = collapsePointLevel(keep);
             // Keep ridges/corners fixed. A facet point may merge into its own
             // ridge/corner; an interior point may merge into a boundary point.
-            if (level > 1 || level > keepLevel || lockV.count(remove) ||
+            if ((improve_Metric == 8 && level != 0) || level > 1 || level > keepLevel || lockV.count(remove) ||
                 periodic_P.count(remove) || periodic_P.count(keep) || (isbndpnt(remove) && !modifyBnd)) continue;
             std::unordered_set<int> faces;
             if (level) findSphere_tri(remove,faces);
@@ -6633,6 +6644,19 @@ int DT::collapsePoorTetShortEdge(int tet, double angleDegrees, detail::QualityBu
             // Existing directional validation checks link, volume, sizes and
             // geometry. Surface collapse must also maintain surface hash tables.
             if (budget && !budget->accepts(budgetBefore,budgetAfter)) continue;
+            if (improve_Metric == 8) {
+                std::vector<int> oldCells;
+                std::vector<std::array<int,4>> replacement;
+                for (int cell : cavity) {
+                    if (isDelEle(cell) || ishulltet(cell) || isvirtualtet(cell)) continue;
+                    oldCells.push_back(cell);
+                    if (isNod_in_Tet(remove,cell)>=0 && isNod_in_Tet(keep,cell)>=0) continue;
+                    const auto& f=Elems[cell].form;
+                    replacement.push_back({{f[0]==remove?keep:f[0],f[1]==remove?keep:f[1],
+                        f[2]==remove?keep:f[2],f[3]==remove?keep:f[3]}});
+                }
+                if (!acceptOrthogonalPatch(oldCells,replacement)) continue;
+            }
             const int result = boundary ? collapseEdg(*boundary,remove,keep) : destroyShortEdge(tet,ia,ib,1e-14);
             if (result) {
                 if (budget) budget->commit(budgetBefore,budgetAfter);

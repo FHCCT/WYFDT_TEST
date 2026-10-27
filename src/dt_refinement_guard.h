@@ -3,6 +3,105 @@
 
 namespace dt {
 
+namespace detail {
+struct BoundaryRefinementSector {
+    int faces = 0;
+    double angle = 0;
+    bool bounded = false;
+};
+
+inline double boundaryRefinementCornerAngle(DT& mesh, int face, int vertex) {
+    const auto& points = mesh.SurTris[face].form;
+    int position = 0;
+    while (position < 3 && points[position] != vertex) ++position;
+    if (position == 3) return -1;
+    const Eigen::Vector3d origin(mesh.Nodes[vertex].pt);
+    const Eigen::Vector3d a = Eigen::Vector3d(mesh.Nodes[points[(position + 1) % 3]].pt) - origin;
+    const Eigen::Vector3d b = Eigen::Vector3d(mesh.Nodes[points[(position + 2) % 3]].pt) - origin;
+    if (!(a.squaredNorm() > 0 && b.squaredNorm() > 0)) return -1;
+    return std::atan2(a.cross(b).norm(), a.dot(b)) * 180.0 / std::acos(-1.0);
+}
+
+inline BoundaryRefinementSector boundaryRefinementSector(DT& mesh, int face, int vertex) {
+    BoundaryRefinementSector result;
+    const int geometry = mesh.SurTris[face].parent;
+    std::vector<int> faces(1, face);
+    std::unordered_set<int> seen{face};
+    std::set<int> rays;
+    for (size_t i = 0; i < faces.size(); ++i) {
+        // An ambiguous/large fan supplies no restriction; do not guess its angle.
+        if (faces.size() > 128) return BoundaryRefinementSector{};
+        const int current = faces[i];
+        const double angle = boundaryRefinementCornerAngle(mesh, current, vertex);
+        if (!(angle >= 0) || !std::isfinite(angle)) return BoundaryRefinementSector{};
+        result.angle += angle;
+        for (int other : mesh.SurTris[current].form) if (other != vertex) {
+            const int* edge = mesh.BndEdg.find(vertex, other);
+            if (!edge || mesh.isDelSurEdg(*edge)) return BoundaryRefinementSector{};
+            const auto& boundary = mesh.SurEdgs[*edge];
+            int count = 0, next = -1;
+            for (int neighbor : boundary.face)
+                if (!mesh.isDelSurTri(neighbor) && mesh.SurTris[neighbor].parent == geometry) {
+                    ++count;
+                    if (neighbor != current) next = neighbor;
+                }
+            // Feature edges and nonmanifold branches bound distinct sectors.
+            if (boundary.constrain > 0 || count != 2) {
+                rays.insert(other);
+                continue;
+            }
+            if (next >= 0 && seen.insert(next).second) faces.push_back(next);
+        }
+    }
+    result.faces = static_cast<int>(faces.size());
+    result.bounded = rays.size() == 2;
+    return result;
+}
+
+// Bisection preserves the angle sum at an existing vertex and cannot reduce
+// its triangle count. An already overfull feature sector cannot meet the same
+// boundary-angle target by adding more points. Flips/smoothing can still act;
+// re-evaluate their current result rather than permanently marking geometry.
+inline bool boundaryQualityRefinementStagnates(DT& mesh, int face, double target) {
+    for (int vertex : mesh.SurTris[face].form) {
+        if (!(boundaryRefinementCornerAngle(mesh, face, vertex) < target)) continue;
+        const auto sector = boundaryRefinementSector(mesh, face, vertex);
+        const double required = target * sector.faces;
+        if (sector.bounded && sector.angle + 1e-8 * std::max(sector.angle, required) < required)
+            return true;
+    }
+    return false;
+}
+} // namespace detail
+
+// Quality repair stays within the requested edge's incident triangles.
+// Following an increasing-edge chain can split remote, otherwise good areas.
+inline int longestAdjacentQualityBoundaryEdge(DT& mesh, int edge) {
+    if (edge < 0 || mesh.isDelSurEdg(edge)) return -1;
+    int best = edge;
+    double maximum = mesh.distance2(mesh.Nodes[mesh.SurEdgs[edge].iStart].pt,
+        mesh.Nodes[mesh.SurEdgs[edge].iEnd].pt);
+    for (int face : mesh.SurEdgs[edge].face) {
+        if (mesh.isDelSurTri(face) || mesh.lockF.count(face)) continue;
+        const auto& points = mesh.SurTris[face].form;
+        for (int k = 0; k < 3; ++k) {
+            const int* candidate = mesh.BndEdg.find(points[k], points[(k + 1) % 3]);
+            if (!candidate || mesh.isDelSurEdg(*candidate) || mesh.lockE.count(*candidate)) continue;
+            bool locked = false;
+            for (int neighbor : mesh.SurEdgs[*candidate].face)
+                locked |= mesh.lockF.count(neighbor) != 0;
+            if (locked) continue;
+            const double length = mesh.distance2(mesh.Nodes[points[k]].pt,
+                mesh.Nodes[points[(k + 1) % 3]].pt);
+            if (length > maximum * (1 + 1e-12)) {
+                maximum = length;
+                best = *candidate;
+            }
+        }
+    }
+    return best;
+}
+
 // Follow increasing edge lengths before bisection. Splitting a short edge
 // repeatedly while leaving a long side intact creates a thin triangle fan.
 inline int longestRefinementBoundaryEdge(DT& mesh, int edge) {

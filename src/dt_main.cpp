@@ -34,7 +34,7 @@ int main(int argc, char* argv[]) {
 	app.add_option("--optlevel", args.optlevel, "Mesh improvement level. (int, optional, int:2)");
 	app.add_option("--optloop", args.optloop, "Mesh improvement rounds (default:5, adptype 2:3)");
 	app.add_option("--optanglestrict", args.optanglestrict, "Minimum dihedral insertion threshold in degrees (default:1). optlevel 5: >0 enables Q<0.01 tail repair; 0 keeps pure flips/smoothing. Other levels: 0 disables only the angle trigger (SJ<1e-5 still triggers).");
-	app.add_option("--optTh", args.optTh, "Quality candidate threshold in the active metric (default:0.2, adptype 2:0.3)");
+	app.add_option("--optTh", args.optTh, "Worst-quality fraction per optimization round, in [0,1] (default:0.2, adptype 2:0.5)")->check(CLI::Range(0.0, 1.0));
 	app.add_option("--adpangle", args.adpangle, "Adaptation boundary angle (default:170, adptype 2:160)");
 	app.add_option("--nthread", args.nthread, "Maximum threads for every stage; active teams adapt to mesh size (-1: automatic).");
 	app.add_option("--extrashell", args.extrashell, "Extraction Shell. (int, optional, int:-1)");
@@ -100,9 +100,9 @@ int main(int argc, char* argv[]) {
 				if (app.get_option("--adpangle")->count() == 0) args.adpangle = 160;
 				if (app.get_option("--optloop")->count() == 0) args.optloop = 10;
 				if (app.get_option("--nthread")->count() == 0) args.nthread = 4;
-				if (app.get_option("--optTh")->count() == 0) args.optTh = 0.3;
+				if (app.get_option("--optTh")->count() == 0) args.optTh = 0.5;
 				if (app.get_option("--optanglestrict")->count() == 0) args.optanglestrict = 1;
-				ret = d.adaptation_by_Tetid(mesh, args, refine_tri_id, refine_tet_id, 1.242);
+				ret = d.adaptation_by_Tetid(mesh, args, refine_tri_id, refine_tet_id, 1.268);
 			}
 			else if (adptype == 3) {
 				ret = d.adaptation_Coarse(mesh, args);

@@ -54,6 +54,8 @@ void DT::resetMeshState() {
     rectangularPairedSplits = 0; rectangularPairFailures = 0; rectangularRedirectedSplits = 0;
     qualityBoundarySplitInProgress = false;
     qualityEdgeCollapses = 0; localStripPairedSplits = 0; pendingBoundaryPairs.clear();
+    boundaryQualityTrial.reset(); boundaryFlipTrials.clear();
+    boundaryQualityTried.clear(); boundaryQualityMetric = -1;
     flipnmRecll.clear();
     for (auto& history : parallelFlipHistory) history.clear();
     parallelFlipCount.fill(0);
@@ -78,7 +80,7 @@ int DT::dt_init(Mesh& mesh, Args& args)
 	spdlogoutfile(args.outlogfile);
     meshLogger->set_level(infolevel == 0 ? spdlog::level::err :
         infolevel == 1 ? spdlog::level::info : spdlog::level::debug);
-	if (infolevel > 0) meshLogger->info("Version 2026.10.27");
+	if (infolevel > 0) meshLogger->info("Version 2026.11.01");
     MeshStageLog initLog(*this, "Initialize");
     if (infolevel > 0)
         meshLogger->info("Input mesh: points={} segments={} triangles={} tets={}",

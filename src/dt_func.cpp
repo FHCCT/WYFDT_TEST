@@ -785,16 +785,12 @@ void DT::getMeshEdgebyGeo(Mesh& mesh) {
 	return;
 }
 //--------------------- Mesh Quality ---------------------
-double DT::tetquality(double v1[3], double v2[3], double v3[3], double v4[3], double* AniMetric, int qualmeasure, bool applyTopologyGuard) {
-    const bool guarded = applyTopologyGuard && optimizationPolicy.enabled && optimizationPolicy.inTopology;
-    if (guarded || qualmeasure == ANGLE_JACOBIAN_METRIC) {
+double DT::tetquality(double v1[3], double v2[3], double v3[3], double v4[3], double* AniMetric, int qualmeasure) {
+    // Return only the requested metric; other quality objectives cannot veto it.
+    if (qualmeasure == ANGLE_JACOBIAN_METRIC) {
         double low = 0, high = 0; std::vector<double> angles;
         if (!CalDihedral(v1, v2, v4, v3, low, high, angles, true)) return 0;
-        const double jacobian = ScaledJacobian(v1, v2, v3, v4);
-        if (guarded && (RADIO2ANGLE(low) + 1e-10 < optimizationPolicy.angleFloor ||
-            jacobian + 1e-12 < optimizationPolicy.jacobianFloor)) return 0;
-        if (qualmeasure == ANGLE_JACOBIAN_METRIC)
-            return angleJacobianQuality(low / std::acos(1.0 / 3.0), jacobian);
+        return angleJacobianQuality(low / std::acos(1.0 / 3.0), ScaledJacobian(v1, v2, v3, v4));
     }
     if (qualmeasure == 8) return orthogonal(v1,v2,v3,v4,nullptr,nullptr,nullptr,nullptr);
 	if (qualmeasure == SUS_METRIC) return quality_sus(v1, v2, v3, v4);

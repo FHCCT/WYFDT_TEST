@@ -18,7 +18,7 @@ void DT::colorBadQualityNodes(std::vector<std::vector<int>>& colors, double impr
         if (n == ghost || isDelNod(n) || isCornerpnt(n) || lockV.count(n) ||
             periodic_P.count(n) || (addBoxFlag && n > ghost && n < ghost + 9)) continue;
         // Boundary movement is allowed only in the geometric isotropic passes.
-        if (isbndpnt(n) && (!modifyBnd || (improve_Metric != SUS_METRIC && improve_Metric != 2 && improve_Metric != 8))) continue;
+        if (isbndpnt(n) && (!modifyBnd || (improve_Metric != SUS_METRIC && improve_Metric != 2 && improve_Metric != 6 && improve_Metric != 8))) continue;
         candidateIndex[n] = static_cast<int>(candidates.size());
         candidates.push_back(n);
     }

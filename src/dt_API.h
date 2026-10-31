@@ -45,7 +45,7 @@ namespace dt {
 		double maxEdge = -1;		//最大网格边长，默认不启动（-1），可以主动设置
 		double growsize = 1.01;     //边界增长率，默认1.01，大于1
 		double optanglestrict = 1; // Minimum dihedral repair threshold in degrees; 0 disables only the angle trigger (SJ < 1e-5 still triggers).
-		double optTh = 0.2;		    //通用优化目标
+		double optTh = 0.2; // Worst-quality fraction per optimization round, in [0,1].
 		double adpangle = 170;
 		std::string filename;
 		std::string fine_mesh_file;		// optional dense/reference mesh for boundary point projection

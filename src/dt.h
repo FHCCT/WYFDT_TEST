@@ -111,7 +111,6 @@ namespace dt {
         // Ordinary interior splits are allowed up to this many transverse widths.
         double rectangularInteriorSplitWidthRatio = 16.0;
         size_t rectangularPairedSplits = 0, rectangularPairFailures = 0, rectangularRedirectedSplits = 0;
-        int repairQualityTailPass(double targetAngle = 1.5, int rounds = 3);
         size_t qualityEdgeCollapses = 0, localStripPairedSplits = 0;
         void buildRectangularFaces();
 		std::vector<std::array<int, 3>> flipnmRecll;
@@ -259,11 +258,14 @@ namespace dt {
 		int TraditionalOptPass(Args& args);
 		int OrthogonalityOptPass(Args& args);
 		int QuicklyOptPass(Args& args);
+        // One frozen sweep; degree is the incident triangle count on one plane.
+        int refineHighDegreePlanarPoints(int maxDegree);
 		int QuicklyOptCoarsePass(Args& args);
 		int OptSizeControl_yunbo(double lamasize, std::unordered_map<int, double>& facetSize, std::unordered_map<int, int>& facetNum, std::unordered_map<int, double>& elementSize, std::unordered_map<int, int>& elementNum, Args& args);
 		int OptbyAnisotropicPass(Args& args);
 		int VolumeImprovePass(Args& args);
-		int prepareQuality();
+		// Refresh q; return the cutoff for the worst optTh fraction (ties included).
+		double prepareQuality(double optTh = 0.2);
 		// Returns the first minimum-quality live physical cell, or -1 if none.
 		int printQuality(double  improve_goal, int& nbad, double& minq, bool outWorst = false);
 		void updateQuality(int i);
@@ -355,7 +357,7 @@ namespace dt {
 		// filp
 		int flipEdgPass(int nloop);
 		void Type_Vertex_Edg(double Angle, const Mesh& mesh);
-		int ifflipEdg(int index);
+		int ifflipEdg(int index, bool qualityDriven = false);
 		int checkFlipNormal(int p1, int p2, int p3, int p4);
 		int flipEdg(int index, int deep = 0);
 
@@ -443,7 +445,7 @@ namespace dt {
 		void printfDihedral(double& minD, double& minAvgD, double& maxD, double& maxAvgD);
         // minimumOnly leaves maxangle/Dihedral unmeasured and allocates no angle array.
 		int CalDihedral(double v1[3], double v2[3], double v3[3], double v4[3], double& minangle, double& maxangle, std::vector<double>& Dihedral, bool minimumOnly = false, double* scaledJacobian = nullptr, double* edgeRatio = nullptr);
-		double tetquality(double v1[3], double v2[3], double v3[3], double v4[3], double* AniMetric, int qualmeasure, bool applyTopologyGuard = true);
+		double tetquality(double v1[3], double v2[3], double v3[3], double v4[3], double* AniMetric, int qualmeasure);
 		double vlrms3ratio(double v1[3], double v2[3], double v3[3], double v4[3]);
 		double ScaledJacobian( double p0[3],  double p1[3],  double p2[3],  double p3[3], double eps= 1e-30);
 		double AspectRatio(double v1[3], double v2[3], double v3[3], double v4[3]);
@@ -521,18 +523,18 @@ namespace dt {
         double* orthogonalOppositeVertex(int cell, int face);
         int smoothOrthogonalPoint(int node, double minimumShapeFloor, BoundarySmoothWorkspace& boundary, bool tail = false);
         void repairOrthogonalTail(double insertionAngleDegrees, int rounds);
-        int smoothTailPoint(int node, detail::QualityBudget& budget, BoundarySmoothWorkspace* boundary = nullptr);
         int prepareBoundarySmoothPoint(int node, BoundarySmoothWorkspace& workspace);
         int smoothPeriodicBoundaryGroup(const std::vector<int>& group, double minimumQualityFloor);
-        int smoothPlanarBoundaryPoint(int node, double minimumQualityFloor, BoundarySmoothWorkspace& workspace,
-            bool preserveAngleJacobian = false);
-        int smoothAngleJacobian(int node, double minimumQualityFloor);
+        int smoothPlanarBoundaryPoint(int node, double minimumQualityFloor, BoundarySmoothWorkspace& workspace);
+        int smoothWorstQualityPoints(const std::vector<int>& nodes, int metric,
+            BoundarySmoothWorkspace* boundary = nullptr);
         void mergeThinLayers(Mesh& mesh, TriHasher<int64_t>& tetFaces,
             const std::vector<double>& tetVolumes);
         int splitEdgImpl(int index, int deep, bool retryVolume,
             double fraction = 0.5, bool fixedEdgePoint = false);
         int collapsePoorTetShortEdge(int tet, double angleDegrees, detail::QualityBudget* budget = nullptr);
         bool collapsePointOnFace(int face, const double* target);
+        int insertPlanarBoundaryPoint(int face, const std::array<double, 3>& weights);
         int pairLocalStrip(int node, int geo);
         std::vector<int> pendingBoundaryPairs;
         void synchronizeRectangularSplit(int node, double sourceLength);
@@ -542,7 +544,12 @@ namespace dt {
         bool qualityBoundarySplitInProgress = false;
         int removeInteriorEdge(std::vector<int>& oldtet, int ia, int ib, int info,
             int thread_n, std::vector<int>& shellPoints);
-        int flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial);
+        int flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial, bool qualityDriven = false);
+        std::unique_ptr<DT> boundaryQualityTrial;
+        std::unordered_map<int, std::array<size_t, 2>> boundaryFlipTrials;
+        std::unordered_set<uint64_t> boundaryQualityTried;
+        int boundaryQualityMetric = -1;
+        int tryBoundaryQualityFlip(int edge);
         int calculateDihedral(double& minD, double& minAvgD, double& maxD, double& maxAvgD);
         void resetMeshState();
         void removeInteriorSteiner();

@@ -1,5 +1,5 @@
 #include "dt.h"
-#include "dt_joint_smoothing.h"
+#include "dt_minimax_smoothing.h"
 #include "dt_geometry_guard.h"
 #include <stdexcept>
 
@@ -101,7 +101,7 @@ Vec smallHullNearest(const std::vector<Vec>& g) {
     return best;
 }
 
-// Shared convex-hull solve for SUS and individual dihedral-angle gradients.
+// Shared convex-hull solve for SUS and single-metric angle/SJ constraints.
 Vec commonAscentDirection(std::vector<Vec>& gradients, double scale) {
     if (gradients.empty()) return Vec::Zero();
     if (!(scale > 0) || !std::isfinite(scale)) return Vec::Zero();
@@ -158,50 +158,6 @@ Vec activeSetDirection(const std::vector<SusTet>& tets, const Vec& x) {
         if (direction.squaredNorm() > 0) return direction;
     }
     return Vec::Zero();
-}
-
-// All six angles are separate smooth constraints. Differentiating the minimum
-// of a tet directly would lose tied worst edges (notably symmetric slivers).
-bool dihedralGradients(const SusTet& tet, const Vec& x,
-                       std::array<double, 6>& angles, std::array<Vec, 6>& gradients) {
-    auto p = tet.points;
-    p[tet.freeIndex] = x;
-    const double det = sigma(p) / std::sqrt(2.0);
-    if (!(det > 0) || !std::isfinite(det)) return false;
-    const Vec a = p[1]-p[0], b = p[2]-p[0], c = p[3]-p[0];
-    std::array<Vec, 4> gd;
-    gd[1] = b.cross(c); gd[2] = c.cross(a); gd[3] = a.cross(b);
-    gd[0] = -gd[1]-gd[2]-gd[3];
-    const int faces[4][3] = {{1,2,3},{0,3,2},{0,1,3},{0,2,1}};
-    std::array<Vec, 4> normals;
-    std::array<Mat, 4> dn;
-    for (int f=0; f<4; ++f) {
-        const int i=faces[f][0], j=faces[f][1], k=faces[f][2];
-        const Vec u=p[j]-p[i], v=p[k]-p[i];
-        normals[f]=u.cross(v);
-        for (int axis=0; axis<3; ++axis) {
-            const Vec e=Vec::Unit(axis);
-            dn[f].col(axis)=((j==tet.freeIndex)-(i==tet.freeIndex))*e.cross(v)
-                + ((k==tet.freeIndex)-(i==tet.freeIndex))*u.cross(e);
-        }
-    }
-    int edge=0;
-    for (int i=0; i<3; ++i) for (int j=i+1; j<4; ++j,++edge) {
-        const int k=i>0?0:(j>1?1:2), l=6-i-j-k;
-        const Vec d=p[j]-p[i];
-        const double length=d.norm();
-        if (!(length>0)) return false;
-        const double y=det*length, z=-normals[k].dot(normals[l]);
-        const Vec gy=length*gd[tet.freeIndex]
-            + det*((j==tet.freeIndex)-(i==tet.freeIndex))*d/length;
-        const Vec gz=-dn[k].transpose()*normals[l]-dn[l].transpose()*normals[k];
-        const double denom=y*y+z*z;
-        if (!(denom>0) || !std::isfinite(denom)) return false;
-        angles[edge]=std::atan2(y,z);
-        gradients[edge]=(z*gy-y*gz)/denom;
-        if (!std::isfinite(angles[edge]) || !gradients[edge].allFinite()) return false;
-    }
-    return true;
 }
 
 double energy(const std::vector<SusTet>& tets, const Vec& x, double delta,
@@ -516,6 +472,8 @@ int dt::DT::smooth_sus(int iNod, double minimumQualityFloor) {
 // Quality-driven interior smoothing must enter here, including topology repair.
 // Other legacy metrics retain their previous SUS fallback.
 int dt::DT::smoothInteriorPoint(int iNod, double minimumQualityFloor) {
+    if(improve_Metric==2 || improve_Metric==6)
+        return smoothWorstQualityPoints(std::vector<int>(1,iNod),improve_Metric);
     if (optimizationPolicy.enabled) {
         if (iNod < 0 || iNod >= static_cast<int>(Nodes.size()) || iNod == ghost ||
             isDelNod(iNod) || isbndpnt(iNod)) return 0;
@@ -548,521 +506,206 @@ int dt::DT::smoothInteriorPoint(int iNod, double minimumQualityFloor) {
         BoundarySmoothWorkspace boundary;
         return smoothOrthogonalPoint(iNod,minimumQualityFloor,boundary);
     }
-    if (improve_Metric == 2) return smooth_angle(iNod, minimumQualityFloor);
     return smooth_sus(iNod, minimumQualityFloor);
 }
 
-int dt::DT::smooth_angle(int iNod, double minimumQualityFloor) {
-    if (iNod < 0 || iNod >= static_cast<int>(Nodes.size()) || iNod == ghost ||
-        isDelNod(iNod) || isbndpnt(iNod) || isCornerpnt(iNod) ||
-        lockV.count(iNod) || periodic_P.count(iNod)) return 0;
-    std::vector<int> star;
-    findSphere(iNod, star);
-    if (star.empty()) return 0;
-    const Vec origin=Eigen::Map<Vec>(Nodes[iNod].pt);
-    double scale=0;
-    std::vector<SusTet> tets(star.size());
-    std::vector<std::array<Vec,4>> physical(star.size());
-    for (size_t k=0; k<star.size(); ++k) {
-        const int t=star[k];
-        if (t<0 || t>=static_cast<int>(Elems.size()) || isDelEle(t) ||
-            isvirtualtet(t) || ishulltet(t)) return 0;
-        tets[k].freeIndex=-1;
-        for (int j=0; j<4; ++j) {
-            const int n=Elems[t].form[j];
-            if (n<0 || n>=static_cast<int>(Nodes.size()) || isDelNod(n)) return 0;
-            physical[k][j]=Eigen::Map<Vec>(Nodes[n].pt);
-            scale=std::max(scale,(physical[k][j]-origin).norm());
-            if (n==iNod) tets[k].freeIndex=j;
-        }
-        if (tets[k].freeIndex<0) return 0;
-    }
-    if (!(scale>0) || !std::isfinite(scale)) return 0;
-    for (size_t k=0; k<tets.size(); ++k)
-        for (int j=0; j<4; ++j) tets[k].points[j]=(physical[k][j]-origin)/scale;
+int dt::DT::smooth_angle(int node, double minimumQualityFloor) {
+    (void)minimumQualityFloor;
+    return smoothWorstQualityPoints(std::vector<int>(1,node),2);
+}
 
-    // Trial evaluation uses physical coordinates and the existing CalDihedral
-    // convention. No mesh coordinate is written until the final acceptance.
-    std::vector<double> angles;
-    double initialSus=DBL_MAX, initialSusSum=0;
-    for (auto p:physical) {
-        const double q=quality_sus(p[0].data(),p[1].data(),p[2].data(),p[3].data());
-        if (!(q>0) || !std::isfinite(q)) return 0;
-        initialSus=std::min(initialSus,q); initialSusSum+=q;
-    }
-    const double floor=std::min(initialSus,minimumQualityFloor);
-    double initialAngleSum=-DBL_MAX, evaluatedAngleSum=0;
-    auto evaluate = [&](const Vec& position, double cutoff) {
-        double minimum=DBL_MAX, angleSum=0, susSum=0;
-        for (size_t k=0; k<tets.size(); ++k) {
-            auto p=physical[k]; p[tets[k].freeIndex]=position;
-            const double sus=quality_sus(p[0].data(),p[1].data(),p[2].data(),p[3].data());
-            if (!(sus>0) || !std::isfinite(sus) || sus<floor) return -DBL_MAX;
-            double lo,hi;
-            if (!CalDihedral(p[0].data(),p[1].data(),p[3].data(),p[2].data(),lo,hi,angles)
-                || !std::isfinite(lo) || lo<cutoff) return -DBL_MAX;
-            minimum=std::min(minimum,lo); angleSum+=lo; susSum+=sus;
-        }
-        // A max-min direction can damage many already-good cells. Retain the
-        // angle and SUS averages at entry while improving the worst angle.
-        if (angleSum<initialAngleSum || susSum<initialSusSum) return -DBL_MAX;
-        evaluatedAngleSum=angleSum;
-        return minimum;
+int dt::DT::smoothWorstQualityPoints(const std::vector<int>& nodes, int metric,
+    BoundarySmoothWorkspace* suppliedBoundary) {
+    if(nodes.empty() || (metric!=2 && metric!=6)) return 0;
+    std::map<int,size_t> member;
+    std::vector<Vec> origins;
+    std::vector<int> cells;
+    std::vector<std::array<int,3>> faces;
+    std::vector<Vec> normals;
+    auto addNormal=[&](Vec normal) {
+        for(const auto& n:normals) normal-=n*normal.dot(n);
+        const double length=normal.norm();
+        if(length>1e-10) normals.push_back(normal/length);
     };
-    double worst=evaluate(origin,0);
-    if (!(worst>0)) return 0;
-    const double initialAngle=worst;
-    initialAngleSum=evaluatedAngleSum;
-    Vec x=Vec::Zero();
-    double previousStep=1;
-    int smallProgress=0;
-    std::vector<std::array<double,6>> values(tets.size());
-    std::vector<std::array<Vec,6>> derivatives(tets.size());
-    std::vector<Vec> active;
-    active.reserve(tets.size()*6);
-    for (int iteration=0; iteration<12; ++iteration) {
-        double normalizedWorst=DBL_MAX;
-        bool valid=true;
-        for (size_t k=0; k<tets.size(); ++k) {
-            if (!dihedralGradients(tets[k],x,values[k],derivatives[k])) { valid=false; break; }
-            for (double q:values[k]) normalizedWorst=std::min(normalizedWorst,q);
-        }
-        if (!valid) break;
-        Vec direction=Vec::Zero();
-        for (double relativeBand : {1e-3,1e-5,0.0}) {
-            const double band=std::max(1e-12,relativeBand*std::max(1e-3,normalizedWorst));
-            active.clear(); double gradientScale=0;
-            for (size_t k=0; k<tets.size(); ++k) for (int e=0; e<6; ++e) {
-                if (values[k][e]>normalizedWorst+band) continue;
-                active.push_back(derivatives[k][e]);
-                gradientScale=std::max(gradientScale,active.back().norm());
+    BoundarySmoothWorkspace localBoundary;
+    for(int node:nodes) {
+        if(node<0 || node>=static_cast<int>(Nodes.size()) || node==ghost ||
+            isDelNod(node) || isCornerpnt(node) || lockV.count(node) ||
+            (nodes.size()==1 && periodic_P.count(node))) return 0;
+        if(!member.emplace(node,origins.size()).second) return 0;
+        origins.push_back(Vec(Nodes[node].pt));
+        std::vector<int> star;
+        if(isbndpnt(node)) {
+            auto& boundary=suppliedBoundary && nodes.size()==1 ? *suppliedBoundary : localBoundary;
+            if(!prepareBoundarySmoothPoint(node,boundary)) return 0;
+            star=boundary.star;
+            faces.insert(faces.end(),boundary.faces.begin(),boundary.faces.end());
+            if(isFacetpnt(node)) addNormal(Vec(boundary.normal.data())/boundary.normalLength);
+            else {
+                const Vec axis=(Vec(Nodes[boundary.neighbors[0]].pt)-Vec(Nodes[boundary.neighbors[1]].pt)).normalized();
+                const Vec normal=axis.unitOrthogonal();
+                addNormal(normal);addNormal(axis.cross(normal));
             }
-            direction=commonAscentDirection(active,gradientScale);
-            if (direction.squaredNorm()>0) break;
-        }
-        if (direction.squaredNorm()==0) break;
-        double step=std::min(1.0,2*previousStep), nextWorst=worst;
-        Vec next=x;
-        bool accepted=false;
-        for (int trial=0; trial<24; ++trial,step*=0.5) {
-            next=x+step*direction;
-            nextWorst=evaluate(origin+scale*next,worst+1e-12);
-            if (nextWorst>worst+1e-12) { accepted=true; break; }
-        }
-        if (!accepted) break;
-        smallProgress=nextWorst-worst<=1e-5?smallProgress+1:0;
-        x=next; worst=nextWorst; previousStep=step;
-        if (smallProgress>=2 || step*direction.norm()<1e-10) break;
-    }
-    const Vec result=origin+scale*x;
-    if (!result.allFinite() || !(evaluate(result,initialAngle+1e-12)>initialAngle+1e-12)) return 0;
-    for (int j=0; j<3; ++j) Nodes[iNod].pt[j]=result[j];
-    for (int t:star) updateQuality(t);
-    return 1;
-}
-
-namespace {
-struct JointTet {
-    double a=0,j=0,q=0;
-    Vec ga=Vec::Zero(),gj=Vec::Zero();
-    std::array<double,6> angles;
-    std::array<Vec,6> angleGradients;
-    std::array<double,4> corners;
-    std::array<Vec,4> cornerGradients;
-};
-bool jointMinimumAngleGradients(const SusTet& tet,const Vec& x,std::array<double,6>& angles,std::array<Vec,6>& gradients) {
-    auto p=tet.points;p[tet.freeIndex]=x;
-    const double det=sigma(p)/std::sqrt(2.0);
-    if(!(det>0))return false;
-    const Vec a=p[1]-p[0],b=p[2]-p[0],c=p[3]-p[0];
-    std::array<Vec,4> gd;gd[1]=b.cross(c);gd[2]=c.cross(a);gd[3]=a.cross(b);gd[0]=-gd[1]-gd[2]-gd[3];
-    const int faces[4][3]={{1,2,3},{0,3,2},{0,1,3},{0,2,1}};
-    std::array<Vec,4> normals;std::array<Mat,4> dn;bool ready[4]={false,false,false,false};
-    for(int f=0;f<4;++f)normals[f]=(p[faces[f][1]]-p[faces[f][0]]).cross(p[faces[f][2]]-p[faces[f][0]]);
-    int edge=0;double lo=DBL_MAX;
-    for(int i=0;i<3;++i)for(int j=i+1;j<4;++j,++edge) {
-        const int k=i>0?0:(j>1?1:2),l=6-i-j-k;
-        angles[edge]=std::atan2(det*(p[j]-p[i]).norm(),-normals[k].dot(normals[l]));
-        lo=std::min(lo,angles[edge]);gradients[edge].setZero();
-    }
-    auto derivative=[&](int f) {
-        if(ready[f])return;
-        const int i=faces[f][0],j=faces[f][1],k=faces[f][2];const Vec u=p[j]-p[i],v=p[k]-p[i];
-        for(int axis=0;axis<3;++axis) {
-            const Vec e=Vec::Unit(axis);
-            dn[f].col(axis)=((j==tet.freeIndex)-(i==tet.freeIndex))*e.cross(v)
-                +((k==tet.freeIndex)-(i==tet.freeIndex))*u.cross(e);
-        }
-        ready[f]=true;
-    };
-    edge=0;
-    for(int i=0;i<3;++i)for(int j=i+1;j<4;++j,++edge) {
-        if(angles[edge]>lo+1e-10)continue;
-        const int k=i>0?0:(j>1?1:2),l=6-i-j-k;derivative(k);derivative(l);
-        const Vec d=p[j]-p[i];const double length=d.norm();
-        const double y=det*length,z=-normals[k].dot(normals[l]);
-        const Vec gy=length*gd[tet.freeIndex]+det*((j==tet.freeIndex)-(i==tet.freeIndex))*d/length;
-        const Vec gz=-dn[k].transpose()*normals[l]-dn[l].transpose()*normals[k];
-        gradients[edge]=(z*gy-y*gz)/(y*y+z*z);
-        if(!gradients[edge].allFinite())return false;
-    }
-    return true;
-}
-bool jointTet(const SusTet& tet,const Vec& x,JointTet& out,bool gradients) {
-    auto p=tet.points;p[tet.freeIndex]=x;
-    const double det=sigma(p)/std::sqrt(2.0);
-    if (!(det>0) || !std::isfinite(det)) return false;
-    out.q=signedQuality(p);if (!(out.q>0))return false;
-    if (gradients) {
-        if (!jointMinimumAngleGradients(tet,x,out.angles,out.angleGradients))return false;
-    } else {
-        const int faces[4][3]={{1,2,3},{0,3,2},{0,1,3},{0,2,1}};
-        std::array<Vec,4> normal;
-        for(int k=0;k<4;++k)normal[k]=(p[faces[k][1]]-p[faces[k][0]]).cross(p[faces[k][2]]-p[faces[k][0]]);
-        int edge=0;
-        for(int i=0;i<3;++i)for(int j=i+1;j<4;++j,++edge) {
-            const int k=i>0?0:(j>1?1:2),l=6-i-j-k;
-            out.angles[edge]=std::atan2(det*(p[j]-p[i]).norm(),-normal[k].dot(normal[l]));
-        }
-    }
-    const double ideal=std::acos(1.0/3.0);
-    out.a=*std::min_element(out.angles.begin(),out.angles.end())/ideal;
-    if (gradients) {
-        int active=0;out.ga.setZero();
-        for(int k=0;k<6;++k)if(out.angles[k]<=out.a*ideal+1e-10) {
-            out.ga+=out.angleGradients[k]/ideal;++active;
-        }
-        out.ga/=std::max(1,active);
-    }
-    const Vec u=p[1]-p[0],v=p[2]-p[0],w=p[3]-p[0];
-    std::array<Vec,4> gd;gd[1]=v.cross(w);gd[2]=w.cross(u);gd[3]=u.cross(v);gd[0]=-gd[1]-gd[2]-gd[3];
-    for(int corner=0;corner<4;++corner) {
-        double product=1;Vec logDerivative=Vec::Zero();
-        for(int k=0;k<4;++k)if(k!=corner) {
-            const Vec edge=p[k]-p[corner];const double length2=edge.squaredNorm();
-            if (!(length2>0))return false;
-            product*=std::sqrt(length2);
-            if(gradients) {
-                if(tet.freeIndex==k)logDerivative+=edge/length2;
-                if(tet.freeIndex==corner)logDerivative-=edge/length2;
-            }
-        }
-        out.corners[corner]=std::sqrt(2.0)*det/product;
-        if(gradients)out.cornerGradients[corner]=out.corners[corner]*(gd[tet.freeIndex]/det-logDerivative);
-    }
-    out.j=*std::min_element(out.corners.begin(),out.corners.end());
-    if(gradients) {
-        out.gj.setZero();int active=0;
-        for(int k=0;k<4;++k)if(out.corners[k]<=out.j+1e-10) {out.gj+=out.cornerGradients[k];++active;}
-        out.gj/=std::max(1,active);
-    }
-    return std::isfinite(out.a)&&std::isfinite(out.j)&&out.a>0&&out.j>0;
-}
-struct JointEvaluation {
-    double objective=0;
-    Vec gradient=Vec::Zero();
-    dt::detail::JointSmoothingQuality quality;
-    bool valid=false;
-};
-JointEvaluation evaluateJoint(const std::vector<SusTet>& tets,const Vec& x,bool gradients) {
-    JointEvaluation out;
-    Vec angleGradient=Vec::Zero(),jacobianGradient=Vec::Zero();
-    for (const auto& tet:tets) {
-        JointTet q;if (!jointTet(tet,x,q,gradients))return out;
-        const double angle=q.a*std::acos(1.0/3.0)*180/std::acos(-1.0);
-        out.quality.angle+=angle;out.quality.jacobian+=q.j;
-        out.quality.minAngle=std::min(out.quality.minAngle,angle);
-        out.quality.minJacobian=std::min(out.quality.minJacobian,q.j);
-        out.quality.minSus=std::min(out.quality.minSus,q.q);
-        out.quality.badAngle+=angle<.1;out.quality.badJacobian+=q.j<1e-5;
-        ++out.quality.count;
-        out.objective+=.5*(q.a+q.j);
-        angleGradient+=q.ga;jacobianGradient+=q.gj;
-    }
-    out.quality.angle/=tets.size();out.quality.jacobian/=tets.size();
-    angleGradient/=tets.size();jacobianGradient/=tets.size();out.objective/=tets.size();
-    if (gradients) {
-        // A direction must ascend both normalized mean-quality gradients.
-        std::vector<Vec> active;
-        if (angleGradient.norm()>1e-14)active.push_back(angleGradient.normalized());
-        if (jacobianGradient.norm()>1e-14)active.push_back(jacobianGradient.normalized());
-        out.gradient=commonAscentDirection(active,1);
-    }
-    out.valid=out.quality.valid=true;
-    return out;
-}
-}
-
-int dt::DT::smoothAngleJacobian(int node,double floor) {
-    if (node<0 || node>=static_cast<int>(Nodes.size()) || node==ghost || isDelNod(node) ||
-        isCornerpnt(node) || lockV.count(node) || periodic_P.count(node) || isbndpnt(node))return 0;
-    std::vector<int> star;findSphere(node,star);
-    if (star.empty())return 0;
-    const auto before=detail::jointSmoothingQuality(*this,star,node);
-    if (!before.valid)return 0;
-    floor=std::min(before.minSus,floor);
-    const Vec origin(Nodes[node].pt);double scale=0;
-    for (int t:star)for (int n:Elems[t].form)scale=std::max(scale,(Vec(Nodes[n].pt)-origin).norm());
-    if (!(scale>0))return 0;
-    std::vector<SusTet> tets(star.size());
-    for (size_t i=0;i<star.size();++i)for (int k=0;k<4;++k) {
-        const int n=Elems[star[i]].form[k];tets[i].points[k]=(Vec(Nodes[n].pt)-origin)/scale;
-        if (n==node)tets[i].freeIndex=k;
-    }
-    Vec x=Vec::Zero();auto current=evaluateJoint(tets,x,true);
-    if (!current.valid)return 0;
-    double previousStep=.25;
-    for (int iteration=0;iteration<4;++iteration) {
-        Vec direction=current.gradient;
-        if (!direction.allFinite() || direction.norm()<1e-12)break;
-        direction*=.25/direction.norm();
-        double step=std::min(1.0,previousStep*2);bool accepted=false;JointEvaluation next;
-        for (int trial=0;trial<12;++trial,step*=.5) {
-            next=evaluateJoint(tets,x+step*direction,false);
-            if (next.valid && next.quality.minSus+1e-14>=floor &&
-                detail::jointSmoothingAccept(before,next.quality) &&
-                next.objective>current.objective+1e-12*std::max(1.0,std::abs(current.objective))) {
-                accepted=true;break;
-            }
-        }
-        if (!accepted)break;
-        const double gain=next.objective-current.objective;
-        x+=step*direction;previousStep=step;
-        if (step*direction.norm()<1e-8 || gain<1e-7*std::max(1.0,std::abs(current.objective)))break;
-        current=evaluateJoint(tets,x,true);if (!current.valid)break;
-    }
-    if (x.norm()<1e-12)return 0;
-    const Vec position=origin+scale*x;
-    const auto after=detail::jointSmoothingQuality(*this,star,node,position.data());
-    if (!after.valid || after.minSus+1e-14<floor || !detail::jointSmoothingAccept(before,after))return 0;
-    for (int k=0;k<3;++k)Nodes[node].pt[k]=position[k];
-    // Keep the caller's cached metric; topology and node selection are unchanged.
-    for (int t:star)updateQuality(t);
-    return 1;
-}
-
-namespace dt {
-namespace {
-using Vec = Eigen::Vector3d;
-detail::QualityTotals atPosition(DT& mesh, const std::vector<int>& star, int node,
-    const Vec& position, const detail::QualityBudget& budget, double volumeFloor = -DBL_MAX) {
-    detail::QualityTotals q;
-    for (int t : star) {
-        const double* p[4];
-        for (int k = 0; k < 4; ++k) {
-            const int n = mesh.Elems[t].form[k];
-            p[k] = n == node ? position.data() : mesh.Nodes[n].pt;
-        }
-        // A position below the unchanged local volume floor can never pass.
-        // Reject it before evaluating angles and Jacobians of the whole star.
-        if (volumeFloor != -DBL_MAX && !(GEOM_FUNC::orient3d(const_cast<double*>(p[0]),
-            const_cast<double*>(p[1]),const_cast<double*>(p[3]),const_cast<double*>(p[2])) > volumeFloor)) {
-            q.valid = false; break;
-        }
-        budget.add(mesh, q, p[0], p[1], p[2], p[3]);
-        if (!q.valid) break;
-    }
-    return q;
-}
-
-detail::QualityTotals tailCell(DT& mesh, int tet, const detail::QualityBudget& budget) {
-    detail::QualityTotals q;
-    const auto& p = mesh.Elems[tet].form;
-    double low = 0, high = 0;
-    std::vector<double> angles;
-    if (!mesh.CalDihedral(mesh.Nodes[p[0]].pt,mesh.Nodes[p[1]].pt,
-        mesh.Nodes[p[3]].pt,mesh.Nodes[p[2]].pt,low,high,angles,true) ||
-        !(RADIO2ANGLE(low) < budget.target())) return q;
-    // Retain the full finite/positive-shape check for all selected cells.
-    budget.add(mesh,q,mesh.Nodes[p[0]].pt,mesh.Nodes[p[1]].pt,
-        mesh.Nodes[p[2]].pt,mesh.Nodes[p[3]].pt);
-    return q;
-}
-
-} // namespace
-
-int DT::smoothTailPoint(int node, detail::QualityBudget& budget, BoundarySmoothWorkspace* boundary) {
-    DT& mesh = *this;
-    if (node < 0 || node >= static_cast<int>(mesh.Nodes.size()) || node == mesh.ghost ||
-        mesh.isDelNod(node) || (mesh.isbndpnt(node) && !boundary) || mesh.lockV.count(node) || mesh.periodic_P.count(node)) return 0;
-    if (boundary && !prepareBoundarySmoothPoint(node, *boundary)) return 0;
-    std::vector<int> star;
-    if (boundary) star = boundary->star;
-    else mesh.findSphere(node, star);
-    if (star.empty()) return 0;
-    std::vector<int> neighbors;
-    neighbors.reserve(star.size()*3);
-    for (int t : star) {
-        if (mesh.isDelEle(t) || mesh.ishulltet(t) || mesh.isvirtualtet(t)) return 0;
-        for (int n : mesh.Elems[t].form) if (n != node) neighbors.push_back(n);
-    }
-    std::sort(neighbors.begin(),neighbors.end());
-    neighbors.erase(std::unique(neighbors.begin(),neighbors.end()),neighbors.end());
-    const Vec origin(mesh.Nodes[node].pt);
-    const auto before = atPosition(mesh, star, node, origin, budget);
-    if (!before.valid || !(before.minAngle < budget.target())) return 0;
-    double scale = DBL_MAX;
-    Vec center = Vec::Zero();
-    for (int n : neighbors) {
-        const Vec offset = Vec(mesh.Nodes[n].pt) - origin;
-        scale = std::min(scale, offset.norm()); center += offset;
-    }
-    if (!(scale > 0) || !std::isfinite(scale) || neighbors.empty()) return 0;
-    center /= neighbors.size();
-    std::vector<Vec> directions;
-    directions.reserve(8);
-    if (boundary) {
-        Vec basis[2];
-        const int dimension = isFacetpnt(node) ? 2 : 1;
-        if (dimension == 2) {
-            const Vec normal = Vec(boundary->normal.data()) / boundary->normalLength;
-            basis[0] = normal.unitOrthogonal();
-            basis[1] = normal.cross(basis[0]);
         } else {
-            basis[0] = (Vec(Nodes[boundary->neighbors[0]].pt) -
-                        Vec(Nodes[boundary->neighbors[1]].pt)).normalized();
+            findSphere(node,star);
+            // Dynamic insertions can leave a stale interior classification.
+            // Never move a vertex through an actual live constraint face.
+            for(int t:star) for(int opposite=0;opposite<4;++opposite) {
+                if(Elems[t].form[opposite]==node) continue;
+                int face[3],k=0;
+                for(int j=0;j<4;++j)if(j!=opposite)face[k++]=Elems[t].form[j];
+                const int* entry=BndTri.find(face[0],face[1],face[2]);
+                if(entry && !isDelSurTri(*entry)) return 0;
+            }
         }
-        Vec gradient = Vec::Zero(), tangentCenter = Vec::Zero();
-        for (int k = 0; k < dimension; ++k) {
-            const Vec shift = scale * 1e-5 * basis[k];
-            const auto plus = atPosition(mesh, star, node, origin + shift, budget);
-            const auto minus = atPosition(mesh, star, node, origin - shift, budget);
-            if (plus.valid && minus.valid)
-                gradient += basis[k] * static_cast<double>(plus.focus - minus.focus);
-            tangentCenter += basis[k] * center.dot(basis[k]);
+        // Derive feature directions from live constrained edges as well as
+        // the cached vertex type. Coplanar geometry-ID seams are constraints.
+        std::set<int> neighbors;
+        for(int t:star)for(int other:Elems[t].form)if(other!=node)neighbors.insert(other);
+        for(int other:neighbors) {
+            const int* edge=BndEdg.find(node,other);
+            if(!edge || isDelSurEdg(*edge))continue;
+            const auto& e=SurEdgs[*edge];bool feature=e.constrain>0 || e.face.size()!=2;
+            if(e.face.size()==2)feature|=SurTris[e.face[0]].parent!=SurTris[e.face[1]].parent;
+            if(!feature)continue;
+            const Vec offset=Vec(Nodes[other].pt)-Vec(Nodes[node].pt);
+            if(!(offset.squaredNorm()>0))return 0;
+            const Vec axis=offset.normalized(),normal=axis.unitOrthogonal();
+            addNormal(normal);addNormal(axis.cross(normal));
         }
-        if (gradient.allFinite() && gradient.norm() > 0) directions.push_back(gradient.normalized());
-        if (tangentCenter.norm() > 0) directions.push_back(tangentCenter.normalized());
-        for (int k = 0; k < dimension; ++k) {
-            directions.push_back(basis[k]); directions.push_back(-basis[k]);
-        }
-    } else {
-        Vec gradient;
-        for (int k = 0; k < 3; ++k) {
-            Vec shift = Vec::Zero(); shift[k] = scale * 1e-5;
-            const auto plus = atPosition(mesh, star, node, origin + shift, budget);
-            const auto minus = atPosition(mesh, star, node, origin - shift, budget);
-            gradient[k] = plus.valid && minus.valid ? static_cast<double>(plus.focus - minus.focus) : 0;
-        }
-        if (gradient.allFinite() && gradient.norm() > 0) directions.push_back(gradient.normalized());
-        if (center.norm() > 0) directions.push_back(center.normalized());
-        for (int k = 0; k < 3; ++k) {
-            Vec axis = Vec::Zero(); axis[k] = 1; directions.push_back(axis); directions.push_back(-axis);
+        cells.insert(cells.end(),star.begin(),star.end());
+    }
+    if(normals.size()>=3) return 0;
+    std::sort(cells.begin(),cells.end());cells.erase(std::unique(cells.begin(),cells.end()),cells.end());
+    if(cells.empty()) return 0;
+    Mat projection=Mat::Identity();
+    for(const auto& normal:normals) projection-=normal*normal.transpose();
+    double scale=0;
+    for(int t:cells) {
+        if(t<0 || t>=static_cast<int>(Elems.size()) || isDelEle(t) || ishulltet(t) || isvirtualtet(t)) return 0;
+        for(int i=0;i<3;++i) for(int j=i+1;j<4;++j)
+            scale=std::max(scale,(Vec(Nodes[Elems[t].form[i]].pt)-Vec(Nodes[Elems[t].form[j]].pt)).norm());
+    }
+    if(!(scale>0) || !std::isfinite(scale)) return 0;
+    std::vector<detail::MinimaxCell> tets(cells.size());
+    for(size_t i=0;i<cells.size();++i) {
+        const auto& form=Elems[cells[i]].form;
+        Vec anchor(Nodes[form[0]].pt);
+        for(int k=0;k<4;++k) if(member.count(form[k])) {anchor=Vec(Nodes[form[k]].pt);break;}
+        for(int k=0;k<4;++k) {
+            tets[i].points[k]=(Vec(Nodes[form[k]].pt)-anchor)/scale;
+            tets[i].moving[k]=member.count(form[k])!=0;
         }
     }
-    Vec best = origin;
-    auto bestQuality = before;
-    double localVolumeFloor = DBL_MAX;
-    for (int t : star) localVolumeFloor = std::min(localVolumeFloor, mesh.calVolume(t));
-    localVolumeFloor *= .1;
-    struct Proposal {
-        Vec position;
-        detail::QualityTotals quality;
-        bool accepted = false;
+    auto point=[&](int node,const Vec& x)->Vec {
+        const auto found=member.find(node);
+        return found==member.end() ? Vec(Nodes[node].pt) : Vec(origins[found->second]+scale*x);
     };
-    std::array<Proposal,8> proposals;
-    const int directionCount = static_cast<int>(directions.size());
-    const int workers = std::max(1,std::min(4,std::min(mesh.num_threads,directionCount)));
-    // Proposals read one frozen star and ledger. Commit in the original order;
-    // no neighboring point can move until this vertex has finished.
-#pragma omp parallel for num_threads(workers) schedule(static) if(workers > 1)
-    for (int i = 0; i < directionCount; ++i) {
-        const auto& direction = directions[i];
-        double step = .25 * scale;
-        for (int iteration = 0; iteration < 16; ++iteration, step *= .5) {
-            const Vec candidate = origin + step * direction;
-            if (boundary) {
-                bool valid = true;
-                for (const auto& f : boundary->faces) {
-                    const Vec a(Nodes[f[0]].pt), b(Nodes[f[1]].pt), c(Nodes[f[2]].pt);
-                    if (!pointOnBoundaryPlane(a.data(), b.data(), c.data(), candidate.data())) {
-                        valid = false; break;
-                    }
-                    const Vec nextA = f[0] == node ? candidate : a;
-                    const Vec nextB = f[1] == node ? candidate : b;
-                    const Vec nextC = f[2] == node ? candidate : c;
-                    if (!((b-a).cross(c-a).dot((nextB-nextA).cross(nextC-nextA)) > 0)) {
-                        valid = false; break;
-                    }
-                }
-                if (!valid) continue;
+    auto boundaryValid=[&](const Vec& x) {
+        // A nearly stationary projected hull can amplify roundoff when its
+        // direction is normalized. Verify actual displacements independently.
+        for(size_t i=0;i<origins.size();++i) {
+            const Vec displacement=Vec(origins[i]+scale*x)-origins[i];
+            const double tolerance=32*std::numeric_limits<double>::epsilon()*origins[i].cwiseAbs().maxCoeff()+1e-12*scale;
+            for(const auto& normal:normals)
+                if(std::abs(normal.dot(displacement))>tolerance)return false;
+        }
+        for(const auto& face:faces) {
+            const Vec a(Nodes[face[0]].pt),b(Nodes[face[1]].pt),c(Nodes[face[2]].pt);
+            const Vec na=point(face[0],x),nb=point(face[1],x),nc=point(face[2],x);
+            if(!pointOnBoundaryPlane(a.data(),b.data(),c.data(),na.data()) ||
+                !pointOnBoundaryPlane(a.data(),b.data(),c.data(),nb.data()) ||
+                !pointOnBoundaryPlane(a.data(),b.data(),c.data(),nc.data()) ||
+                !((b-a).cross(c-a).dot((nb-na).cross(nc-na))>0)) return false;
+        }
+        return true;
+    };
+    auto evaluate=[&](const Vec& x,bool derivatives,std::vector<double>& values,std::vector<Vec>& gradients) {
+        values.clear();gradients.clear();double worst=DBL_MAX;
+        std::array<double,6> q;std::array<Vec,6> g;int count=0;
+        for(const auto& tet:tets) {
+            if(!detail::minimaxConstraints(tet,x,metric,derivatives,q,g,count)) return -DBL_MAX;
+            for(int k=0;k<count;++k) {
+                values.push_back(q[k]);worst=std::min(worst,q[k]);
+                if(derivatives) gradients.push_back(projection*g[k]);
             }
-            const auto q = atPosition(mesh, star, node, candidate, budget, localVolumeFloor);
-            if (!budget.accepts(before, q)) continue;
-            proposals[i].position = candidate;
-            proposals[i].quality = q;
-            proposals[i].accepted = true;
-            break;
         }
-    }
-    for (int i = 0; i < directionCount; ++i) {
-        const auto& p = proposals[i];
-        if (p.accepted && p.quality.focus > bestQuality.focus) {
-            best = p.position; bestQuality = p.quality;
+        return worst;
+    };
+    // Real-coordinate verification makes acceptance match the exported mesh,
+    // including after normalized displacements are rounded back to doubles.
+    auto actualMinimum=[&](const Vec& x) {
+        double worst=DBL_MAX;std::vector<double> angles;
+        for(int t:cells) {
+            const auto& form=Elems[t].form;
+            std::array<Vec,4> p={{point(form[0],x),point(form[1],x),point(form[2],x),point(form[3],x)}};
+            if(!(GEOM_FUNC::orient3d(p[0].data(),p[1].data(),p[3].data(),p[2].data())>0)) return -DBL_MAX;
+            double q=0;
+            if(metric==2) {
+                double high;
+                if(!CalDihedral(p[0].data(),p[1].data(),p[3].data(),p[2].data(),q,high,angles,true)) return -DBL_MAX;
+            } else q=ScaledJacobian(p[0].data(),p[1].data(),p[2].data(),p[3].data());
+            if(!(q>0) || !std::isfinite(q)) return -DBL_MAX;
+            worst=std::min(worst,q);
         }
+        return worst;
+    };
+    Vec x=Vec::Zero();
+    std::vector<double> values,candidateValues;
+    std::vector<Vec> gradients,unused,active;
+    values.reserve(tets.size()*6);gradients.reserve(tets.size()*6);candidateValues.reserve(tets.size()*6);
+    const double initial=actualMinimum(x);
+    if(!(initial>0)) return 0;
+    double worst=initial;int smallProgress=0;
+    // Klingner/Stellar-style nonsmooth max-min smoothing: active gradients,
+    // closest convex-hull point, inactive-function intersection, then line search.
+    // The 12 local iterations and 24 backtracks match the prior angle solver.
+    for(int iteration=0;iteration<12;++iteration) {
+        const double current=evaluate(x,true,values,gradients);
+        if(!(current>0)) break;
+        Vec direction=Vec::Zero();double rate=0,activeBand=0;
+        for(double relativeBand:{.03,1e-3,1e-5,0.0}) {
+            const double band=std::max(1e-12,relativeBand*current);
+            active.clear();double gradientScale=0;
+            for(size_t k=0;k<values.size();++k) if(values[k]<=current+band) {
+                active.push_back(gradients[k]);gradientScale=std::max(gradientScale,gradients[k].norm());
+            }
+            direction=projection*commonAscentDirection(active,gradientScale);
+            if(direction.norm()<=1e-12) {direction.setZero();continue;}
+            direction.normalize();rate=DBL_MAX;
+            for(size_t k=0;k<values.size();++k) if(values[k]<=current+band)
+                rate=std::min(rate,gradients[k].dot(direction));
+            if(rate>0) {activeBand=band;break;}
+            direction.setZero();
+        }
+        if(direction.squaredNorm()==0) break;
+        double step=.25;
+        for(size_t k=0;k<values.size();++k) if(values[k]>current+activeBand) {
+            const double slope=gradients[k].dot(direction);
+            if(slope<rate) {
+                const double intersection=(values[k]-current)/(rate-slope);
+                if(intersection>0 && std::isfinite(intersection)) step=std::min(step,intersection);
+            }
+        }
+        const double tolerance=std::max(1e-12,1e-10*std::abs(current));
+        bool accepted=false;Vec next=x;double nextWorst=current;
+        for(int trial=0;trial<24 && step>1e-14;++trial,step*=.5) {
+            next=projection*(x+step*direction);
+            if(!boundaryValid(next)) continue;
+            nextWorst=evaluate(next,false,candidateValues,unused);
+            if(nextWorst>current+tolerance && nextWorst-current>=.1*step*rate) {accepted=true;break;}
+        }
+        if(!accepted) break;
+        smallProgress=nextWorst-current<1e-5 ? smallProgress+1 : 0;
+        x=next;worst=nextWorst;
+        if(smallProgress>=2 || step<1e-10) break;
     }
-    if (!(bestQuality.focus > before.focus)) return 0;
-    for (int k = 0; k < 3; ++k) mesh.Nodes[node].pt[k] = best[k];
-    for (int t : star) mesh.updateQuality(t);
-    budget.commit(before, bestQuality);
+    const double tolerance=std::max(1e-12,1e-10*std::abs(initial));
+    if(!(worst>initial+tolerance) || !boundaryValid(x) || !(actualMinimum(x)>initial+tolerance)) return 0;
+    for(size_t i=0;i<nodes.size();++i) {
+        const Vec result=origins[i]+scale*x;
+        for(int axis=0;axis<3;++axis) Nodes[nodes[i]].pt[axis]=result[axis];
+    }
+    for(int t:cells) updateQuality(t);
     return 1;
-}
-
-int DT::repairQualityTailPass(double targetAngle, int rounds) {
-    if (omp_in_parallel())
-        throw std::logic_error("Quality tail repair must run outside a parallel region");
-    if (!improve_step || !AniSol.empty() || !topologyRepairEnabled || topologyRepairDeferred || rounds <= 0) return 0;
-    detail::QualityBudget budget(*this, targetAngle);
-    if (!budget.valid()) return 0;
-    size_t moves = 0, repairs = 0;
-    std::vector<unsigned char> boundaryTargets(modifyBnd ? Nodes.size() : 0, 0);
-    for (int round = 0; round < rounds; ++round) {
-        std::vector<unsigned char> targets(Nodes.size(), 0);
-        std::vector<std::pair<double, TopologyCandidate>> candidates;
-        for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
-            if (isDelEle(t) || ishulltet(t) || isvirtualtet(t)) continue;
-            const auto q = tailCell(*this,t,budget);
-            if (!q.valid || !(q.minAngle < targetAngle)) continue;
-            for (int n : Elems[t].form) {
-                targets[n] = 1;
-                if (modifyBnd && isbndpnt(n)) boundaryTargets[n] = 1;
-            }
-        }
-        size_t roundMoves = 0, roundRepairs = 0;
-        for (int n = 0; n < static_cast<int>(targets.size()); ++n)
-            if (targets[n]) roundMoves += smoothTailPoint(n, budget);
-        // Prioritize tiny Jacobians, then the low-angle tail. Frozen identities
-        // prevent later trials from accidentally operating on reused slots.
-        for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
-            if (isDelEle(t) || ishulltet(t) || isvirtualtet(t)) continue;
-            const auto q = tailCell(*this,t,budget);
-            if (!q.valid || !(q.minAngle < targetAngle)) continue;
-            candidates.push_back({q.minJacobian < 1e-4 ? q.minJacobian - 1 : q.minAngle, topologyCandidate(t)});
-        }
-        std::stable_sort(candidates.begin(), candidates.end(),
-            [](const std::pair<double,TopologyCandidate>& a, const std::pair<double,TopologyCandidate>& b) { return a.first < b.first; });
-        size_t roundAttempts = 0;
-        for (const auto& entry : candidates) {
-            if (roundAttempts >= 128) break;
-            if (!topologyCandidateCurrent(entry.second)) continue;
-            ++roundAttempts;
-            roundRepairs += tryTopologyRepair(entry.second, 0, &budget) == 1;
-        }
-        moves += roundMoves; repairs += roundRepairs;
-        if (!roundMoves && !roundRepairs) break;
-    }
-    // Finish boundary motion after the established interior/topology pass.
-    // A fresh ledger protects all quality measures of that completed result.
-    BoundarySmoothWorkspace boundary;
-    std::vector<int> boundaryNodes;
-    for (int n = 0; n < static_cast<int>(boundaryTargets.size()); ++n)
-        if (boundaryTargets[n] && !periodic_P.count(n) && prepareBoundarySmoothPoint(n, boundary))
-            boundaryNodes.push_back(n);
-    if (!boundaryNodes.empty()) {
-        detail::QualityBudget boundaryBudget(*this, targetAngle);
-        if (boundaryBudget.valid()) for (int n : boundaryNodes)
-            moves += smoothTailPoint(n, boundaryBudget, &boundary);
-    }
-    return static_cast<int>(moves + repairs);
-}
 }

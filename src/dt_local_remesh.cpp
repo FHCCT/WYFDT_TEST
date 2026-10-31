@@ -59,7 +59,7 @@ bool replacePatch(DT& host, const std::vector<int>& cells, Mesh& mesh,
         addOptimizationQuality(host,after,a,b,c,d);
         if (budget) budget->add(host,budgetAfter,a,b,c,d);
         Elem element(v[0],v[1],v[2],v[3]); element.geo = host.Elems[seed.tet].geo;
-        element.q = host.tetquality(a,b,c,d,nullptr,host.improve_Metric,false);
+        element.q = host.tetquality(a,b,c,d,nullptr,host.improve_Metric);
         if (!(element.q > 0) || !std::isfinite(element.q)) return false;
         const int local = static_cast<int>(replacement.size());
         for (int f = 0; f < 4; ++f) {

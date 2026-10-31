@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -37,7 +38,14 @@ struct BWRequest {
     std::array<int, 2> midpointEdge{{-1, -1}};
     // Matched rectangle/periodic points must retain their requested position.
     bool fixedEdgePoint = false;
+    // A point constructed inside a source face is exactly on that face,
+    // independent of cancellation in the orientation predicate.
+    std::array<int, 3> sourceFace{{-1, -1, -1}};
     bool midpointOnFace(int a, int b, int c) const {
+        if (sourceFace[0] >= 0 &&
+            std::find(sourceFace.begin(), sourceFace.end(), a) != sourceFace.end() &&
+            std::find(sourceFace.begin(), sourceFace.end(), b) != sourceFace.end() &&
+            std::find(sourceFace.begin(), sourceFace.end(), c) != sourceFace.end()) return true;
         if (midpointEdge[0] < 0 || midpointEdge[1] < 0 || midpointEdge[0] == midpointEdge[1]) return false;
         return (a == midpointEdge[0] || b == midpointEdge[0] || c == midpointEdge[0]) &&
             (a == midpointEdge[1] || b == midpointEdge[1] || c == midpointEdge[1]);

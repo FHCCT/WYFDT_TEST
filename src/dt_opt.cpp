@@ -1,13 +1,21 @@
 #include "dt.h"
-#include "dt_joint_smoothing.h"
 #include "dt_refinement_guard.h"
 #include "dt_geometry_guard.h"
 #include <exception>
+#include <limits>
+#include <stdexcept>
 #include "spdlog/sinks/null_sink.h"
 
 
 namespace {
+int optPlanarDegree = 8; // Internal tuning; <=0 disables the planar insertion sweep.
+constexpr double boundarySurfaceAngleAllowance = 0.1; // degrees, quality-driven mode only
 constexpr double topologyShortEdgeRatio = 1.0 / 200.0;
+// Candidate length relative to the poor seed cell's longest edge. The
+// collapse still validates actual cavity quality, sizes and geometry.
+constexpr double qualityCollapseShortEdgeRatio = 0.35;
+constexpr double qualityCollapseSeedAngle = 3.0;
+constexpr double qualityCollapseSeedJacobian = 0.01;
 constexpr double topologyInsertionRetryVolumeRatio = 0.5;
 // Retry only after the original insertion fails; callers preserve local bounds.
 int insertWithVolumeRetry(DT& mesh, int node, std::vector<int>& seeds,
@@ -93,6 +101,8 @@ int DT::MeshImprove(Args& args) {
 }
 
 int DT::improve_init(Args& args) {
+    if (!std::isfinite(args.optTh) || args.optTh < 0 || args.optTh > 1)
+        throw std::invalid_argument("optTh must be a finite quality fraction in [0, 1]");
 	//"Initialize Quality Field,3 times should be sufficient.
 	improve_step = 1;//tell dt it is improving now;
     size_t physicalCells = 0, livePoints = 0;
@@ -104,6 +114,8 @@ int DT::improve_init(Args& args) {
     // and are initialized once, never replenished at the start of a round.
     // Level-one boundary trial meshes must retain their original pure-flip path.
     // In particular they must not recursively enable a new repair algorithm.
+    boundaryFlipTrials.clear();
+    boundaryQualityTried.clear(); boundaryQualityMetric = -1;
     topologyRepairEnabled = args.optlevel > 1; topologyRepairDeferred = false;
     topologyRemeshTrialBudget = topologyRepairEnabled ? std::max<size_t>(8, livePoints / 1000) : 0;
     topologyInteriorPointBudget = livePoints / 400;
@@ -131,7 +143,7 @@ int DT::improve_init(Args& args) {
 		if (args.optlevel == 8) meshLogger->debug("Opt_level         : Coarsening");
 		else meshLogger->debug("Opt_level          : {}", args.optlevel);
 		meshLogger->debug("Opt_Loop_num       : {}", args.optloop);
-		meshLogger->debug("Opt_Threshold : {}", args.optTh);
+		meshLogger->debug("Opt_Quality_fraction : {}", args.optTh);
 		meshLogger->debug("Opt_Angle_strict: {}", args.optanglestrict);
 	}
 
@@ -142,10 +154,9 @@ int DT::TraditionalOptPass(Args& args) {
 	int nLoop = 3, nbad = 0;
 	double improve_goal = 1, minD = 0, minAvgD = 0, maxD = 0, maxAvgD = 0, minq;
 	nLoop = std::max(args.optloop, nLoop);
-	improve_goal = args.optTh;
 
 	improve_Metric = SUS_METRIC;
-	prepareQuality();
+	improve_goal = prepareQuality(args.optTh);
 	printQuality(improve_goal, nbad, minq, false);
 	minVolume_bw = 1e-16;
 
@@ -161,7 +172,7 @@ int DT::TraditionalOptPass(Args& args) {
 		}
         else if (infolevel > 0) meshLogger->info("Flip bndEdg: {}/{}", 0, 0);
 
-		prepareQuality();
+		improve_goal = prepareQuality(args.optTh);
 		TopologicalPass(improve_goal, args.optanglestrict, 1);
 		if (args.optlevel > 1) SmoothPass(1, improve_goal);
 		printQuality(improve_goal, nbad, minq, false);
@@ -237,12 +248,13 @@ int DT::OrthogonalityOptPass(Args& args) {
     int nbad=0;
     double minq;
 	improve_Metric = 8; //Orthogonality
-	prepareQuality();
+	double improve_goal = prepareQuality(args.optTh);
 	printQuality(0.01, nbad, minq, false);
 
 	for (int loop = 0; loop < nLoop; loop++) {
-		TopologicalPass(args.optTh, args.optanglestrict, 1);
-		SmoothPass(1, args.optTh);
+		improve_goal = prepareQuality(args.optTh);
+		TopologicalPass(improve_goal, args.optanglestrict, 1);
+		SmoothPass(1, improve_goal);
 		printQuality(0.01, nbad, minq, false);
 	}
     if (args.optanglestrict > 0) {
@@ -355,11 +367,8 @@ int DT::prepareBoundarySmoothPoint(int n, BoundarySmoothWorkspace& workspace) {
     return 1;
 }
 
-int DT::smoothPlanarBoundaryPoint(int n, double floor, BoundarySmoothWorkspace& workspace,
-    bool preserveAngleJacobian) {
+int DT::smoothPlanarBoundaryPoint(int n, double floor, BoundarySmoothWorkspace& workspace) {
     if (periodic_P.count(n) || !prepareBoundarySmoothPoint(n, workspace)) return 0;
-    const auto jointBefore = preserveAngleJacobian
-        ? detail::jointSmoothingQuality(*this,workspace.star,n) : detail::JointSmoothingQuality{};
     auto& star = workspace.star;
     auto& neighbors = workspace.neighbors;
     auto& faces = workspace.faces;
@@ -431,8 +440,6 @@ int DT::smoothPlanarBoundaryPoint(int n, double floor, BoundarySmoothWorkspace& 
             sum += q;
         }
         if (!valid || !(sum > oldSum + 1e-12 * count)) continue;
-        if (preserveAngleJacobian && !detail::jointSmoothingAccept(jointBefore,
-            detail::jointSmoothingQuality(*this,star,n,position))) continue;
         if (optimizationPolicy.enabled && !optimizationPointAccept(optimizationPolicy, originalQuality, candidateQuality)) continue;
         // Positive volume alone does not exclude a folded boundary triangle.
         for (auto f : faces) {
@@ -625,37 +632,30 @@ int DT::smoothPeriodicBoundaryGroup(const std::vector<int>& group, double floor)
 }
 
 int DT::QuicklyOptPass(Args& args) {
-	if (infolevel > 0)
-		 meshLogger->info("QuicklyOptPass");
-	// Keep at least one round per metric; integer remainder goes to SUS.
-	const int rounds = std::max(2, args.optloop);
-	const int angleRounds = std::max(1, rounds / 3);
-	const int polishStart = rounds - angleRounds;
-	optflipdeep = 0;
-	for (int loop = 0; loop < rounds; ++loop) {
-		updateminVolume();
-		improve_step = false;
-		flipEdgPass(1);
-		improve_step = true;
+    if (infolevel > 0) meshLogger->info("QuicklyOptPass");
+    const int rounds = std::max(2, args.optloop);
+    optflipdeep = 0;
+    if (optPlanarDegree > 0) {
+        updateminVolume();
+        refineHighDegreePlanarPoints(optPlanarDegree);
+    }
+    for (int loop = 0; loop < rounds; ++loop) {
+        updateminVolume();
+        improve_step = false;
+        flipEdgPass(1);
+        improve_step = true;
 
-		// Start with SUS shape quality, then polish the poor-angle tail.
-		// Both phases use the same fixed candidate ordering for all thread counts.
-		improve_Metric = loop < polishStart ? SUS_METRIC : 2;
-		prepareQuality();
-		TopologicalPass(args.optTh, args.optanglestrict, 1, true);
-		SmoothPass(1, args.optTh);
-		int nbad = 0;
-		double minq;
-		printQuality(args.optTh, nbad, minq, false);
-		// An insertion threshold is not a convergence test for mean/tail quality.
-		if (nbad == 0) {
-			if (loop >= polishStart) break;
-			// SUS convergence must not skip the mandatory angle phase.
-			loop = polishStart - 1;
-		}
-	}
-    repairQualityTailPass();
-	return 1;
+        // Shape smoothing comes first. SUS retains its regularized shape
+        // objective instead of trading average shape for a local angle gain.
+        improve_Metric = SUS_METRIC;
+        double improve_goal = prepareQuality(args.optTh);
+        TopologicalPass(improve_goal, args.optanglestrict, 1);
+		SmoothPass(1, improve_goal);
+        int nbad = 0;
+        double minq;
+        printQuality(improve_goal, nbad, minq, false);
+    }
+    return 1;
 }
 
 int DT::OptSizeControl_yunbo(double lamasize, 
@@ -676,7 +676,6 @@ int DT::OptSizeControl_yunbo(double lamasize,
     const int nLoop = std::max(args.optloop, 3);
     int nbad = 0;
     double minq;
-    const double improve_goal = args.optTh;
     struct splitSort {
         int EdgeID;
         int geoID;
@@ -903,7 +902,7 @@ int DT::OptSizeControl_yunbo(double lamasize,
         updateminVolume();
         flipEdgPass(1);
         improve_Metric = SUS_METRIC;
-        prepareQuality();
+        const double improve_goal = prepareQuality(args.optTh);
         TopologicalPass(improve_goal, args.optanglestrict, 1);
         SmoothPass(1, improve_goal);
         const int worstTet = printQuality(improve_goal, nbad, minq, false);
@@ -1036,7 +1035,9 @@ int DT::VolumeImprovePass(Args& args) {
 	return 0;
 }
 
-int DT::prepareQuality() {
+double DT::prepareQuality(double optTh) {
+    if (!std::isfinite(optTh) || optTh < 0 || optTh > 1)
+        throw std::invalid_argument("optTh must be a finite quality fraction in [0, 1]");
     MeshStageLog stageLog(*this, "Evaluate quality", 2);
     DTParallelScope parallelScope;
     const int workers = activeDTThreads(*this, 0, Elems.size());
@@ -1059,7 +1060,7 @@ int DT::prepareQuality() {
 			}
             // A rejection witness is not the actual objective stored in q.
             q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt,
-                AniMetric, improve_Metric, false);
+                AniMetric, improve_Metric);
 			if (q < 0) {
                 meshLogger->warn("Warning:Inverted tet: {} {}", i, calVolume(i));
 			}
@@ -1068,7 +1069,33 @@ int DT::prepareQuality() {
 
 		Elems[i].q = q;
 	}
-	return 1;
+    // Rank physical cells only, using the just-refreshed active metric.
+    // Non-finite values cannot participate in an ordered quality distribution.
+    std::vector<double> qualities;
+    qualities.reserve(Elems.size());
+    for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
+        if (isDelEle(t) || isvirtualtet(t) || ishulltet(t)) continue;
+        if (std::isfinite(Elems[t].q)) qualities.push_back(Elems[t].q);
+    }
+    double improve_goal = -std::numeric_limits<double>::infinity();
+    if (optTh > 0 && !qualities.empty()) {
+        // Nearest rank: ceil(optTh * N). Avoid rounding an integral product
+        // one ulp upwards into the next rank (for example, 0.07 * 100).
+        const double target = std::nextafter(optTh * qualities.size(),
+            -std::numeric_limits<double>::infinity());
+        const size_t count = std::min(qualities.size(), std::max(size_t(1),
+            static_cast<size_t>(std::ceil(target))));
+        const size_t rank = count - 1;
+        std::nth_element(qualities.begin(), qualities.begin() + rank, qualities.end());
+        // Topology uses <=, smoothing uses <. Include the selected rank and
+        // all ties in both without changing either optimizer's interface.
+        improve_goal = std::nextafter(qualities[rank],
+            std::numeric_limits<double>::infinity());
+    }
+    if (infolevel > 1) meshLogger->debug(
+        "Quality quantile: metric={} fraction={} goal={:.17g} cells={}",
+        improve_Metric, optTh, improve_goal, qualities.size());
+    return improve_goal;
 }
 
 int DT::printQuality(double  improve_goal, int& nbad, double& minq, bool outWorst) {
@@ -1115,11 +1142,11 @@ void DT::updateQuality(int i) {
 		if (improve_Metric == 5) {
 			getmm(a, b, c, d, AniMetric);
 		}
-		q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt, AniMetric, improve_Metric, false);
+		q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt, AniMetric, improve_Metric);
 		//if (q < 0) {
 		//	double ori = calVolume(i);
 		//	meshLogger->warn("Warning:Inverted tet: {} {}", i, ori);
-		//	q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt, AniMetric, improve_Metric, false);
+		//	q = tetquality(Nodes[a].pt, Nodes[b].pt, Nodes[c].pt, Nodes[d].pt, AniMetric, improve_Metric);
 		//}
 	}
     else {
@@ -1170,12 +1197,14 @@ int DT::SmoothPass(int nloop, double improve_goal) {
         // Accepted point moves are final. Only compute the floors needed by
         // their local guards; do not snapshot or re-evaluate the whole sweep.
         double minimumQualityFloor = 1e-12;
-        if (optimizationPolicy.enabled) {
+        const bool singleMetric=improve_Metric==2 || improve_Metric==6;
+        // Single-metric smoothing has no unrelated metric floors.
+        if (!singleMetric && optimizationPolicy.enabled) {
             const auto quality = measureOptimizationQuality(*this);
             if (!quality.valid) return 0;
             optimizationPolicy.angleFloor = quality.minAngle;
             optimizationPolicy.jacobianFloor = quality.minJacobian;
-        } else {
+        } else if (!singleMetric) {
             minimumQualityFloor = DBL_MAX;
             for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
                 if (isDelEle(t) || isvirtualtet(t) || ishulltet(t)) continue;
@@ -1203,18 +1232,18 @@ int DT::SmoothPass(int nloop, double improve_goal) {
                 for (int i = 0; i < static_cast<int>(group.size()); ++i) {
                     const int node = group[i];
                     ++attempts;
-                    const bool joint = improve_Metric == 2 && !optimizationPolicy.enabled;
-                    success += (improve_Metric == 8 ? smoothOrthogonalPoint(node, minimumQualityFloor, boundaryWorkspace) : isbndpnt(node)
-                        ? smoothPlanarBoundaryPoint(node, minimumQualityFloor, boundaryWorkspace, joint)
-                        : (joint ? smoothAngleJacobian(node, minimumQualityFloor)
-                                 : smoothInteriorPoint(node, minimumQualityFloor))) == 1;
+                    success += (singleMetric
+                        ? smoothWorstQualityPoints(std::vector<int>(1,node),improve_Metric,&boundaryWorkspace)
+                        : improve_Metric == 8 ? smoothOrthogonalPoint(node,minimumQualityFloor,boundaryWorkspace)
+                        : isbndpnt(node) ? smoothPlanarBoundaryPoint(node,minimumQualityFloor,boundaryWorkspace)
+                                        : smoothInteriorPoint(node,minimumQualityFloor)) == 1;
                 }
             }
         }
         // Serialize complete periodic orbits after ordinary workers finish:
         // paired stars may overlap each other or otherwise independent colors.
         if (!periodicGroups.empty() && modifyBnd &&
-            (improve_Metric == SUS_METRIC || improve_Metric == 2)) {
+            (improve_Metric == SUS_METRIC || improve_Metric == 2 || improve_Metric == 6)) {
             std::vector<unsigned char> candidate(Nodes.size(), 0);
             for (int t = 0; t < static_cast<int>(Elems.size()); ++t) {
                 if (isDelEle(t) || isvirtualtet(t) || ishulltet(t)) continue;
@@ -1227,7 +1256,8 @@ int DT::SmoothPass(int nloop, double improve_goal) {
                     if (n >= 0 && n < static_cast<int>(candidate.size()) && candidate[n]) selected = true;
                 if (!selected) continue;
                 ++periodicAttempts;
-                periodicSuccess += smoothPeriodicBoundaryGroup(group, minimumQualityFloor) == 1;
+                periodicSuccess += (singleMetric ? smoothWorstQualityPoints(group,improve_Metric)
+                    : smoothPeriodicBoundaryGroup(group,minimumQualityFloor)) == 1;
             }
         }
     }
@@ -1350,9 +1380,12 @@ DT::TopologyCandidate DT::topologyCandidate(int t) {
 
 bool DT::topologyCandidateCurrent(const TopologyCandidate& candidate) {
     const int t = candidate.tet;
-    return t >= 0 && t < static_cast<int>(Elems.size()) && !isDelEle(t) &&
-        !isvirtualtet(t) && !ishulltet(t) &&
-        std::equal(candidate.form.begin(), candidate.form.end(), Elems[t].form);
+    if (t < 0 || t >= static_cast<int>(Elems.size()) || isDelEle(t) ||
+        isvirtualtet(t) || ishulltet(t)) return false;
+    // Rolled-back flips can restore the same cell with a different vertex
+    // order. Keep that candidate, but reject reused slots with other vertices.
+    return std::equal(candidate.form.begin(), candidate.form.end(), Elems[t].form) ||
+        std::is_permutation(candidate.form.begin(), candidate.form.end(), Elems[t].form);
 }
 
 bool DT::needsTopologyRepair(int t, double angleDegrees, bool includeJacobian) {
@@ -1396,34 +1429,17 @@ int DT::tryTopologyRepair(const TopologyCandidate& candidate, double insertionAn
         if (!needsTopologyRepair(tet, insertionAngleDegrees)) return 0;
         return insertInteriorRepair(tet);
     }
-    // Tail proposals use a private constrained patch. No speculative deep
+    // Budget-checked proposals use a private constrained patch. No speculative deep
     // flip can mutate the host before its complete quality delta is accepted.
     if (budget) return remeshTopologyPatch(tet, budget);
     if (optflipdeep < 4) {
-        // Deep flips use the seed's geometric quality, never a mesh-wide
-        // minimum or mean. Their normal active-metric acceptance still applies.
-        OptimizationQuality quality;
-        const auto& p = candidate.form;
-        addOptimizationQuality(*this, quality, Nodes[p[0]].pt, Nodes[p[1]].pt,
-            Nodes[p[2]].pt, Nodes[p[3]].pt);
-        if (!quality.valid) return 0;
-        struct RestoreFlipState {
-            DT& mesh;
-            OptimizationPolicy policy;
-            int depth;
-            explicit RestoreFlipState(DT& value)
-                : mesh(value), policy(value.optimizationPolicy), depth(value.optflipdeep) {}
-            ~RestoreFlipState() {
-                mesh.optimizationPolicy = policy;
-                mesh.optflipdeep = depth;
-            }
+        struct RestoreFlipDepth {
+            DT& mesh; int depth;
+            explicit RestoreFlipDepth(DT& value) : mesh(value), depth(value.optflipdeep) {}
+            ~RestoreFlipDepth() { mesh.optflipdeep = depth; }
         } restore(*this);
-        optimizationPolicy.enabled = optimizationPolicy.inTopology = true;
-        optimizationPolicy.angleFloor = quality.minAngle;
-        optimizationPolicy.jacobianFloor = std::max(quality.minJacobian, 1e-4);
         optflipdeep = std::min(4, std::max(2, optflipdeep + 2));
-        const int result = removebadtet(tet, -1);
-        if (result == 1) {
+        if (removebadtet(tet, -1) == 1) {
             if (infolevel > 1) meshLogger->debug("Topology repair: deeper flips succeeded");
             return 1;
         }
@@ -1550,8 +1566,8 @@ int DT::TopologicalPass_serial(const std::vector<TopologyCandidate>& candidates,
         int t = candidate.tet;
         const int result = removebadtet(t, -1);
         if (result == 1) ++success;
-        // Only emergency repairs are dispatched during initial forming.
-        // Broad proposals follow once their complete-patch ledger is ready.
+        // A deferred caller may restrict repair to geometric emergencies.
+        // Normal quality passes reach the full existing-vertex repair chain.
         else if (improve_Metric != 8 && result == 0 && t >= 0 && !isDelEle(t) &&
             (!deferQualityRepairs || needsTopologyRepair(t, repair_angle_degrees)))
             success += tryTopologyRepair(topologyCandidate(t), repair_angle_degrees) == 1;
@@ -1587,15 +1603,20 @@ int DT::removebadtet(int& iElm, int thread_n) {
     } seedRelease{this, p, thread_n};
 
     // Reuse both ring buffers across this cell's edge attempts.
-    std::vector<int> wait_remove, shellPoints;
+    std::vector<int> wait_remove, shellPoints, boundaryCandidates;
 
 	for (int i = 0; i < 6; i++) {
 		//find a edge not try
 		int pa = Elems[iElm].form[Egid[i][0]];
 		int pb = Elems[iElm].form[Egid[i][1]];
-		if (isBndEdg(pa, pb)) {
-			continue;
-		}
+        if (isBndEdg(pa, pb)) {
+            if (improve_step && thread_n < 0 && !omp_in_parallel() && topologyRepairEnabled &&
+                !topologyRepairDeferred && modifyBnd && AniSol.empty() && improve_Metric != 8) {
+                const int* edge=BndEdg.find(pa,pb);
+                if(edge)boundaryCandidates.push_back(*edge);
+            }
+            continue;
+        }
 		wait_remove.assign(1, iElm);
 
 		int ret = removeInteriorEdge(wait_remove, Egid[i][0], Egid[i][1], deepth, thread_n, shellPoints);
@@ -1627,6 +1648,11 @@ int DT::removebadtet(int& iElm, int thread_n) {
 		}
 	}
 
+
+    // Try the inexpensive interior flips first. Boundary replacement needs a
+    // constrained local rebuild, and is reserved for the surviving poor seed.
+    for(int edge:boundaryCandidates)
+        if(tryBoundaryQualityFlip(edge))return 1;
 
 	return 0;
 }
@@ -2885,6 +2911,7 @@ int DT::contshortEdgPass(double lower) {
 }
 
 int DT::flipEdgPass(int nloop) {
+    boundaryFlipTrials.clear();
     MeshStageLog stageLog(*this, "Boundary flips", 2);
 	if (!modifyBnd) {
         if (infolevel > 0) meshLogger->info("Flip bndEdg: {}/{}", 0, 0);
@@ -4408,7 +4435,9 @@ int DT::collapseEdg(int index, int expectedDelete, int expectedKeep) {
 	return 1;
 }
 
-int DT::ifflipEdg(int index) {
+int DT::ifflipEdg(int index, bool qualityDriven) {
+    if (index < 0 || index >= static_cast<int>(SurEdgs.size()) || isDelSurEdg(index) ||
+        SurEdgs[index].info > 1 || SurEdgs[index].constrain > 0 || lockE.count(index)) return 0;
 	int mainfold = SurEdgs[index].face.size();
 	if (mainfold != 2)
 		return 0;
@@ -4417,6 +4446,9 @@ int DT::ifflipEdg(int index) {
 	int p2 = SurEdgs[index].iEnd;
 	int f1 = SurEdgs[index].face[0];
 	int f2 = SurEdgs[index].face[1];
+    if (isDelSurTri(f1) || isDelSurTri(f2) || lockF.count(f1) || lockF.count(f2) ||
+        SurTris[f1].parent != SurTris[f2].parent) return 0;
+    if (qualityDriven && (!periodic_P.empty() || !AniSol.empty())) return 0;
 	int p3 = -1, p4 = -1;
 
 	for (int i = 0; i < 3; i++) {
@@ -4449,12 +4481,13 @@ int DT::ifflipEdg(int index) {
 	double min3 = calculateTriangleAngles(Nodes[p1].pt, Nodes[p3].pt, Nodes[p4].pt, after1);
 	double min4 = calculateTriangleAngles(Nodes[p2].pt, Nodes[p3].pt, Nodes[p4].pt, after2);
 
-	if (init1[0] + init2[0] >= 170 || init1[1] + init2[1] >= 170) //179.5
+	if (!qualityDriven && (init1[0] + init2[0] >= 170 || init1[1] + init2[1] >= 170)) //179.5
 		return 0;
 
 	if (AniSol.size() == 0) {
-		if (std::min(min3, min4) <= std::min(min1, min2) + 0.1)
-			return 0;
+        if (qualityDriven) {
+            if (std::min(min3, min4) + boundarySurfaceAngleAllowance < std::min(min1, min2)) return 0;
+        } else if (std::min(min3, min4) <= std::min(min1, min2) + 0.1) return 0;
 	}
 	else {
 		double AniMetric[18] = { 0 };
@@ -4556,16 +4589,42 @@ int DT::checkFlipNormal(int p1, int p2, int p3, int p4) {
 }
 //waiting TODO:virtual tet seting
 int DT::flipEdg(int index, int deep) {
+    if (!ifflipEdg(index)) return 0;
     std::unique_ptr<DT> trial;
     return flipEdgWithTrial(index, deep, trial);
 }
 
 
-int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
+// Each physical boundary edge gets one expensive quality trial per active
+// metric and optimization call. New vertices/diagonals remain eligible.
+int DT::tryBoundaryQualityFlip(int edge) {
+    if(edge<0 || edge>=static_cast<int>(SurEdgs.size()) || isDelSurEdg(edge))return 0;
+    if(boundaryQualityMetric!=improve_Metric) {
+        boundaryQualityTried.clear();boundaryQualityMetric=improve_Metric;
+    }
+    const auto& e=SurEdgs[edge];
+    const auto ends=std::minmax(e.iStart,e.iEnd);
+    const uint64_t key=(uint64_t(static_cast<unsigned>(ends.first))<<32)|static_cast<unsigned>(ends.second);
+    if(boundaryQualityTried.count(key) || !ifflipEdg(edge,true))return 0;
+    return flipEdgWithTrial(edge,0,boundaryQualityTrial,true);
+}
+
+int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial, bool qualityDriven) {
+    // Callers have checked ifflipEdg (including the surface objective).
+    if (!modifyBnd || improve_Metric == 8) return 0;
 	if (deep > 1)
 		return 0;
 	int p1 = SurEdgs[index].iStart;
 	int p2 = SurEdgs[index].iEnd;
+    uint64_t qualityEdge=0;
+    if(qualityDriven) {
+        if(boundaryQualityMetric!=improve_Metric) {
+            boundaryQualityTried.clear();boundaryQualityMetric=improve_Metric;
+        }
+        const auto ends=std::minmax(p1,p2);
+        qualityEdge=(uint64_t(static_cast<unsigned>(ends.first))<<32)|static_cast<unsigned>(ends.second);
+        if(boundaryQualityTried.count(qualityEdge))return 0;
+    }
 	int f1 = SurEdgs[index].face[0];
 	int f2 = SurEdgs[index].face[1];
 	int p3 = -1, p4 = -1, p2_f1_idx = -1, p1_f2_idx = -1;
@@ -4611,10 +4670,46 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
 
 	findShell(tet, i1, i2, shell, shell_p);
 
-	std::map<int, int> oldgeoid;
+    // Cache the actual cavity, not only the boundary diagonal: an interior
+    // flip or a smoother can make a previously rejected proposal useful.
+    size_t stamp = static_cast<size_t>(improve_Metric) + 1;
+    const auto mix = [&](size_t x) { stamp ^= x + size_t(0x9e3779b9) + (stamp << 6) + (stamp >> 2); };
+    std::vector<std::array<int,5>> orderedShell;
+    orderedShell.reserve(shell.size());
+    for(int t:shell) {
+        std::array<int,5> key;
+        std::copy(Elems[t].form,Elems[t].form+4,key.begin());
+        std::sort(key.begin(),key.begin()+4);key[4]=Elems[t].geo;
+        orderedShell.push_back(key);
+    }
+    std::sort(orderedShell.begin(),orderedShell.end());
+    for(const auto& cell:orderedShell) {
+        mix(static_cast<size_t>(cell[4]));
+        for(int k=0;k<4;++k) {
+            const int n=cell[k];mix(static_cast<size_t>(n));
+            if(n!=ghost)for(double x:Nodes[n].pt)mix(std::hash<double>{}(x));
+        }
+    }
+    stamp |= 1;
+    auto& stamps = boundaryFlipTrials[index];
+    if (!topologyRepairDeferred && stamps[qualityDriven ? 1 : 0] == stamp) return 0;
+    stamps[qualityDriven ? 1 : 0] = stamp;
+    // Anything rejected by the nondegrading surface mode also fails the
+    // stricter body-quality mode on this identical cavity.
+    if (!qualityDriven) stamps[1] = stamp;
+    double oldWorst = std::numeric_limits<double>::infinity();
+    for (int t : shell) if (!ishulltet(t) && !isvirtualtet(t)) {
+        const auto& v = Elems[t].form;
+        double metric[6] = {};
+        if (improve_Metric == 5) getmm(v[0],v[1],v[2],v[3],metric);
+        const double q = tetquality(Nodes[v[0]].pt,Nodes[v[1]].pt,
+            Nodes[v[2]].pt,Nodes[v[3]].pt,metric,improve_Metric);
+        if (!std::isfinite(q)) return 0;
+        oldWorst = std::min(oldWorst,q);
+    }
+    if (!std::isfinite(oldWorst)) return 0;
 	double minVolume_flip = DBL_MAX;
 	for (int i = 0; i < shell.size(); i++) {
-		oldgeoid[Elems[shell[i]].geo] = 1;
 		if (!isvirtualtet(shell[i]) && !ishulltet(shell[i])) {
 			double tpvol = calVolume(shell[i]);
 			minVolume_flip = std::min(minVolume_flip, tpvol);
@@ -4783,6 +4878,9 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
 	tempargs.constrain = 1;
 	tempargs.outlogfile = 0;
 
+    std::map<std::array<double,3>, int> originalPoints;
+    for (size_t i=0;i<mesh.V.size();++i)
+        if (!originalPoints.emplace(mesh.V[i],mpn[i]).second) return 0;
     if (!trial) {
         trial.reset(new DT());
         // Rejected local trials must not emit errors through the host logger.
@@ -4790,6 +4888,7 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
             std::make_shared<spdlog::sinks::null_sink_mt>());
     }
     trial->parallelMinPointsPerThread = parallelMinPointsPerThread;
+    if(qualityDriven)boundaryQualityTried.insert(qualityEdge);
     try {
         if (!trial->tetrahedralize(mesh, tempargs)) {
             trial.reset();
@@ -4802,8 +4901,13 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
         return 0;
     }
 
-	if (mesh.V.size() > nodemp.size())
-		return 0;
+    if (mesh.V.size() > nodemp.size()) return 0;
+    mpn.clear();
+    for (const auto& point : mesh.V) {
+        const auto it = originalPoints.find(point);
+        if (it == originalPoints.end()) return 0;
+        mpn.push_back(it->second);
+    }
 
 	std::set<int> color;
 	for (int i = 0; i < mesh.T.size(); i++) {
@@ -4825,19 +4929,6 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
 	}
 
 
-    if (optimizationPolicy.enabled) {
-        const auto oldQuality = measureOptimizationQuality(*this, &shell);
-        OptimizationQuality newQuality;
-        for (const auto& cell : mesh.T) {
-            bool physical = true;
-            for (int j = 0; j < 4; ++j) physical = physical && mpn[cell[j]] != ghost;
-            if (!physical) continue;
-            double p[4][3];
-            for (int j = 0; j < 4; ++j) for (int k = 0; k < 3; ++k) p[j][k] = mesh.V[cell[j]][k];
-            addOptimizationQuality(*this, newQuality, p[0], p[1], p[2], p[3]);
-        }
-        if (!optimizationBoundaryAccept(optimizationPolicy, oldQuality, newQuality)) return 0;
-    }
 
 
 	struct Int3 {
@@ -4864,6 +4955,7 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
 	// --- 创建临时映射表 ---
 	std::unordered_map<Int3, int64_t, Int3Hasher> Tri;
 	std::unordered_map<Int3, int, Int3Hasher> checkTri;
+    std::unordered_map<Int3,int,Int3Hasher> outerRegions;
 
     Tri.reserve(shellBoundary.size() + mesh.T.size() * 2);
     checkTri.reserve(shellBoundary.size() + mesh.T.size() * 2);
@@ -4873,6 +4965,7 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
         const Int3 key(Elems[t].form[ib], Elems[t].form[ic], Elems[t].form[id]);
         Tri[key] = (static_cast<int64_t>(getNeig(t, j)) << 2) | getNeigOrd(t, j);
         checkTri.emplace(key, 1);
+        outerRegions.emplace(key,ishulltet(t)||isvirtualtet(t)?virtualID:Elems[t].geo);
     }
 
 	//check if dt is right
@@ -4891,6 +4984,53 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
 			return 0;
 	}
 
+    const Int3 newSurface1(p3,p4,p1), newSurface2(p3,p4,p2);
+    const int unknownRegion = std::numeric_limits<int>::min();
+    std::vector<int> regions(mesh.T.size(),unknownRegion);
+    std::vector<std::vector<int>> adjacent(mesh.T.size());
+    std::unordered_map<Int3,int,Int3Hasher> owners;
+    std::queue<int> pending;
+    const auto assign = [&](int cell,int region) {
+        if (regions[cell] != unknownRegion) return regions[cell] == region;
+        regions[cell]=region;pending.push(cell);return true;
+    };
+    for (int i=0;i<static_cast<int>(mesh.T.size());++i) {
+        for (int k=0;k<4;++k) if (mpn[mesh.T[i][k]]==ghost && !assign(i,virtualID)) return 0;
+        for (int f=0;f<4;++f) {
+            int v[3],n=0;
+            for(int k=0;k<4;++k)if(k!=f)v[n++]=mpn[mesh.T[i][k]];
+            const Int3 face(v[0],v[1],v[2]);
+            const auto outside=outerRegions.find(face);
+            if(outside!=outerRegions.end()) {
+                const int region=outside->second;
+                if(!assign(i,region))return 0;
+            } else if (!(face==newSurface1) && !(face==newSurface2)) {
+                const auto it=owners.emplace(face,i);
+                if(!it.second){adjacent[i].push_back(it.first->second);adjacent[it.first->second].push_back(i);}
+            }
+        }
+    }
+    while(!pending.empty()) {
+        const int i=pending.front();pending.pop();
+        for(int j:adjacent[i])if(!assign(j,regions[i]))return 0;
+    }
+    double newWorst=std::numeric_limits<double>::infinity();
+    std::vector<double> replacementQuality(mesh.T.size(),-1);
+    for(int i=0;i<static_cast<int>(mesh.T.size());++i) {
+        if(regions[i]==unknownRegion)return 0;
+        if(regions[i]==virtualID)continue;
+        int v[4];for(int k=0;k<4;++k)v[k]=mpn[mesh.T[i][k]];
+        double metric[6]={};if(improve_Metric==5)getmm(v[0],v[1],v[2],v[3],metric);
+        const double q=tetquality(Nodes[v[0]].pt,Nodes[v[1]].pt,Nodes[v[2]].pt,Nodes[v[3]].pt,metric,improve_Metric);
+        if(!std::isfinite(q)||!(q>0))return 0;
+        replacementQuality[i]=q;newWorst=std::min(newWorst,q);
+    }
+    const double tolerance=1e-10*std::max(1e-30,std::abs(oldWorst));
+    // Interleaved size refinement retains its surface trajectory. The final
+    // pure optimization applies the body-quality protection and repair mode.
+    if(!std::isfinite(newWorst) || (!topologyRepairDeferred &&
+        (qualityDriven ? !(newWorst>oldWorst+tolerance) : newWorst+tolerance<oldWorst)))return 0;
+
 	if (deep == 0 && periodic_P.size() != 0) {
 		if (periodic_P.find(p1) != periodic_P.end() && periodic_P.find(p2) != periodic_P.end()) {
 			for (auto it1 : periodic_P[p1]) {
@@ -4901,7 +5041,7 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
 						int eid = boundaryIndex;
 						if (eid == index)
 							continue;
-						if (flipEdgWithTrial(eid, 1, trial)) {
+						if (ifflipEdg(eid, qualityDriven) && flipEdgWithTrial(eid, 1, trial, qualityDriven)) {
 							break;
 						}
 						else {
@@ -4915,10 +5055,10 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
 
 	//if it will be correct
 	for (int i = 0; i < shell.size(); i++) {
+        if (QuantityControl && !ishulltet(shell[i]) && !isvirtualtet(shell[i])) --GeoNum[Elems[shell[i]].geo];
 		DelEle(shell[i]);
 	}
 
-	std::queue<int> newEvec;
 
 	for (int i = 0; i < mesh.T.size(); i++) {
 		int forghost = 0;
@@ -4930,7 +5070,9 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
 		DFC(forghost, ia, ib, ic, id);
 		int	newE = addElem(mpn[mesh.T[i][ib]], mpn[mesh.T[i][ic]], mpn[mesh.T[i][id]], mpn[mesh.T[i][ia]]);
 
-		newEvec.push(newE);
+        Elems[newE].geo=regions[i];
+        Elems[newE].q=replacementQuality[i];
+        if(QuantityControl && regions[i]!=virtualID)++GeoNum[regions[i]];
 		for (int j = 0; j < 4; j++) {
 			setP2T(Elems[newE].form[j], newE);
 			DNC(j, ia, ib, ic, id);
@@ -5028,61 +5170,6 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial) {
 		}
 	}
 
-	//for geoid
-	int pushfailtime = 0;
-	while (!newEvec.empty()) {
-		int ie = newEvec.front();
-		newEvec.pop();
-
-		if (ishulltet(ie)) {
-			setvirtualtet(ie);
-			continue;
-		}
-
-		int bndnum = 0;
-		for (int k = 0; k < 4; k++) {
-			DFC(k, ia, ib, ic, id);
-			int pb = Elems[ie].form[ib];
-			int pc = Elems[ie].form[ic];
-			int pd = Elems[ie].form[id];
-			if (isBndTri(pb, pc, pd)) {
-				bndnum++;
-				continue;
-			}
-			int neig = getNeig(ie, k);
-
-			if (Elems[neig].geo == -1) {
-				continue;
-			}
-			else {
-				Elems[ie].geo = Elems[neig].geo;
-				oldgeoid[Elems[ie].geo] = 0;
-			}
-		}
-		if (Elems[ie].geo == -1) {
-			if (pushfailtime++ > 1000) {
-				auto it1 = oldgeoid.begin();
-				auto it2 = std::next(it1);
-				if (it1->second == 0) Elems[ie].geo = it2->first;
-				if (it2->second == 0) Elems[ie].geo = it1->first;
-			}
-			else if (bndnum == 4) {
-				for (int k = 0; k < 4; k++) {
-					int neig = getNeig(ie, k);
-					if (Elems[neig].geo > 0) {
-						Elems[ie].geo = Elems[neig].geo;
-						break;
-					}
-				}
-			}
-			else newEvec.push(ie);
-
-		}
-        // The local rebuild initializes q to -1. During optimization, publish
-        // the actual host-metric quality before another repair or smoother
-        // reads the new cells; ordinary boundary passes refresh in prepareQuality.
-        if (improve_step && Elems[ie].geo != -1) updateQuality(ie);
-	}
 
 	return 1;
 }
@@ -6552,6 +6639,12 @@ bool DT::collapsePointOnFace(int face, const double* target) {
 
 int DT::collapsePoorTetShortEdge(int tet, double angleDegrees, detail::QualityBudget* budget) {
     if (isDelEle(tet) || ishulltet(tet) || isvirtualtet(tet)) return 0;
+    // Reserve contraction for geometrically poor seeds; other candidates
+    // continue through the existing flips, remeshing and insertion chain.
+    const auto& points = Elems[tet].form;
+    if (!needsTopologyRepair(tet, qualityCollapseSeedAngle) &&
+        !(ScaledJacobian(Nodes[points[0]].pt, Nodes[points[1]].pt,
+            Nodes[points[2]].pt, Nodes[points[3]].pt) < qualityCollapseSeedJacobian)) return 0;
     const std::array<int,4> seed = {{Elems[tet].form[0],Elems[tet].form[1],Elems[tet].form[2],Elems[tet].form[3]}};
     struct Edge { int a, b; double length; };
     std::vector<Edge> edges;
@@ -6563,7 +6656,7 @@ int DT::collapsePoorTetShortEdge(int tet, double angleDegrees, detail::QualityBu
     std::stable_sort(edges.begin(),edges.end(),[](const Edge& a,const Edge& b){return a.length < b.length;});
     for (const auto& edge : edges) {
         // A short edge is relative to this poor cell, not to a global minimum.
-        if (!(edge.length > 0 && edge.length < .2 * longest)) break;
+        if (!(edge.length > 0 && edge.length < qualityCollapseShortEdgeRatio * longest)) break;
         for (int direction = 0; direction < 2; ++direction) {
             const int ia = direction ? edge.b : edge.a, ib = direction ? edge.a : edge.b;
             const int remove = seed[ia], keep = seed[ib];

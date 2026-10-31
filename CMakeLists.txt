@@ -3,25 +3,25 @@ project(dt LANGUAGES C CXX)
 
 option(DT_BUILD_EXECUTABLE "Build the dt command-line program" ON)
 
+# Source discovery requires the build-system regeneration check.
+set(CMAKE_SUPPRESS_REGENERATION OFF)
+
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 
-add_library(dt STATIC
-    src/dt.cpp
-    src/dt_adp.cpp
-    src/dt_api.cpp
-    src/dt_bw.cpp
-    src/dt_bw_edge.cpp
-    src/dt_bw_parallel.cpp
-    src/dt_func.cpp
-    src/dt_local_remesh.cpp
-    src/dt_omp.cpp
-    src/dt_opt.cpp
-    src/dt_optimization_policy.cpp
-    src/dt_ort.cpp
-    src/dt_parallel.cpp
-    src/dt_surface.cpp
-    src/dt_sus.cpp
-    src/mesh_io.cpp
+file(GLOB_RECURSE DT_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cxx"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.hh"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.hxx"
+)
+list(REMOVE_ITEM DT_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/dt_main.cpp")
+source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" PREFIX src FILES ${DT_SOURCES})
+
+add_library(dt STATIC ${DT_SOURCES}
     extern/geom/intersection_func.cpp
     extern/geom/predicates.cpp
     extern/geom/ttotr.c

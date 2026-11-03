@@ -112,6 +112,10 @@ namespace dt {
         double rectangularInteriorSplitWidthRatio = 16.0;
         size_t rectangularPairedSplits = 0, rectangularPairFailures = 0, rectangularRedirectedSplits = 0;
         size_t qualityEdgeCollapses = 0, localStripPairedSplits = 0;
+        struct BoundaryRegionChecks {
+            size_t oldPair = 0, missingFace = 0, outerConflict = 0, propagation = 0;
+            size_t unseeded = 0, interfacePair = 0, volume = 0, overlapAccepted = 0;
+        } boundaryRegionChecks;
         void buildRectangularFaces();
 		std::vector<std::array<int, 3>> flipnmRecll;
         std::array<std::vector<std::array<int, 3>>, 128> parallelFlipHistory;
@@ -319,6 +323,16 @@ namespace dt {
         // Extra interior repairs share a fixed budget across all optimization rounds.
         size_t topologyInteriorPointBudget = 0, topologyInteriorCellBudget = 0;
         int insertInteriorRepair(int tet);
+        // Failed trials also consume these run-wide budgets.
+        size_t topologyInteriorSearchBudget = 0, topologyInteriorSmoothBudget = 0;
+        size_t topologyInteriorRescued = 0;
+        struct InteriorRepairAllowance { size_t plans = 0, smooth = 0, cells = 0; };
+        bool rescueInteriorPlan(BWPlan& plan, int seed, int& plansLeft, int& smoothLeft,
+            double longestEdge, InteriorRepairAllowance* allowance = nullptr,
+            unsigned* rejection = nullptr);
+        int repairFixedBoundaryTets(double strictAngle);
+        void reportBoundaryTetQuality(double strictAngle);
+        std::map<std::array<int,4>, unsigned> boundaryTetRepairRejections;
 		int findtet(int p[], std::vector<int> sph);
 		int matchtet(int p[], int t);
 
@@ -547,6 +561,15 @@ namespace dt {
         int flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial, bool qualityDriven = false);
         std::unique_ptr<DT> boundaryQualityTrial;
         std::unordered_map<int, std::array<size_t, 2>> boundaryFlipTrials;
+        double calculateTriangleAngles(const double* a, const double* b,
+            const double* c, double* angles);
+        struct BoundaryAngleReject {
+            std::array<int, 4> vertices;
+            std::array<std::array<double, 3>, 4> points;
+            bool valid = false;
+        };
+        // Bounded, per-instance cache of a coordinate-only surface veto.
+        std::vector<BoundaryAngleReject> boundaryAngleRejects;
         std::unordered_set<uint64_t> boundaryQualityTried;
         int boundaryQualityMetric = -1;
         int tryBoundaryQualityFlip(int edge);

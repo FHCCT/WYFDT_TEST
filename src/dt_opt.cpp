@@ -1,4 +1,5 @@
 #include "dt.h"
+#include "dt_flip_workspace.h"
 #include "dt_refinement_guard.h"
 #include "dt_geometry_guard.h"
 #include <exception>
@@ -115,10 +116,15 @@ int DT::improve_init(Args& args) {
     // Level-one boundary trial meshes must retain their original pure-flip path.
     // In particular they must not recursively enable a new repair algorithm.
     boundaryFlipTrials.clear();
+    boundaryAngleRejects.clear();
+    boundaryRegionChecks = BoundaryRegionChecks{};
     boundaryQualityTried.clear(); boundaryQualityMetric = -1;
     topologyRepairEnabled = args.optlevel > 1; topologyRepairDeferred = false;
     topologyRemeshTrialBudget = topologyRepairEnabled ? std::max<size_t>(8, livePoints / 1000) : 0;
     topologyInteriorPointBudget = livePoints / 400;
+    topologyInteriorSearchBudget = 6 * topologyInteriorPointBudget;
+    topologyInteriorSmoothBudget = 2 * topologyInteriorPointBudget;
+    topologyInteriorRescued = 0;
     topologyInteriorCellBudget = physicalCells / 200;
 
 
@@ -180,6 +186,9 @@ int DT::TraditionalOptPass(Args& args) {
 		if (nbad == 0) break;
 	}
 
+    if (args.optlevel > 1 && !modifyBnd && AniSol.empty() &&
+        repairFixedBoundaryTets(args.optanglestrict)>0)
+        printQuality(improve_goal,nbad,minq,false);
 	printfDihedral(minD, minAvgD, maxD, maxAvgD);
 	if (args.outworsttet)
 		printQuality(improve_goal, nbad, minq, true);
@@ -1552,6 +1561,11 @@ int DT::TopologicalPass(double improve_goal, double repair_angle_degrees, int nl
         if (success < 10) break;
     }
     if (infolevel > 0) meshLogger->info("Topology: {}/{}", totalSuccess, totalCandidates);
+    if (infolevel > 1) meshLogger->info("Interior rescue: accepted={} searchRemaining={} smoothRemaining={} pointRemaining={} cellRemaining={} remeshRemaining={}", topologyInteriorRescued, topologyInteriorSearchBudget, topologyInteriorSmoothBudget, topologyInteriorPointBudget, topologyInteriorCellBudget, topologyRemeshTrialBudget);
+    if (infolevel > 1) meshLogger->debug("Boundary region checks: old-pair={} missing-interface={} outer-conflict={} propagation-conflict={} unseeded={} interface-pair={} volume={} overlap-accepted={}",
+        boundaryRegionChecks.oldPair,boundaryRegionChecks.missingFace,boundaryRegionChecks.outerConflict,
+        boundaryRegionChecks.propagation,boundaryRegionChecks.unseeded,boundaryRegionChecks.interfacePair,
+        boundaryRegionChecks.volume,boundaryRegionChecks.overlapAccepted);
     return 1;
 }
 
@@ -1603,7 +1617,10 @@ int DT::removebadtet(int& iElm, int thread_n) {
     } seedRelease{this, p, thread_n};
 
     // Reuse both ring buffers across this cell's edge attempts.
-    std::vector<int> wait_remove, shellPoints, boundaryCandidates;
+    detail::FlipWorkspaceLease flipBuffers;
+    auto& wait_remove = flipBuffers.get().first;
+    auto& shellPoints = flipBuffers.get().second;
+    auto& boundaryCandidates = flipBuffers.get().third;
 
 	for (int i = 0; i < 6; i++) {
 		//find a edge not try
@@ -1918,6 +1935,7 @@ int DT::insertInteriorRepair(int tet) {
         return lengths[a] == lengths[b] ? a < b : lengths[a] > lengths[b];
     });
     BWPlan& plan = serialBW.plan;
+    int plansLeft=6, smoothLeft=2;
     for (int edge : order) {
         const int a = target.form[Egid[edge][0]], b = target.form[Egid[edge][1]];
         if (isBndEdg(a,b) || !(lengths[edge] > 0)) continue;
@@ -1931,7 +1949,8 @@ int DT::insertInteriorRepair(int tet) {
         request.space = (Nodes[a].space + Nodes[b].space) * 0.5;
         for (int k = 0; k < 3; ++k)
             request.point[k] = Nodes[a].pt[k] + (Nodes[b].pt[k] - Nodes[a].pt[k]) * 0.5;
-        if (planBWOnEdge(*this, request, plan) != BWStatus::Ready) continue;
+        if (planBWOnEdge(*this, request, plan) != BWStatus::Ready &&
+            !rescueInteriorPlan(plan,tet,plansLeft,smoothLeft,std::sqrt(lengths[order[0]]))) continue;
         if (std::find(plan.cavity.begin(), plan.cavity.end(), tet) == plan.cavity.end()) continue;
         // Reject cross-region cavities and enforce the remaining growth budget.
         const int region = Elems[tet].geo;
@@ -1960,7 +1979,11 @@ int DT::insertInteriorRepair(int tet) {
                 Nodes[face.vertices[1]].pt);
             if (!std::isfinite(volume) || !(volume > volumeFloor)) { valid = false; break; }
         }
-        if (!valid) continue;
+        if (!valid && !rescueInteriorPlan(plan,tet,plansLeft,smoothLeft,
+            std::sqrt(lengths[order[0]]))) continue;
+        // Rescue can replace the planned cavity; derive its growth again.
+        const size_t committedGrowth=plan.faces.size()>plan.cavity.size()
+            ? plan.faces.size()-plan.cavity.size():0;
         if (improve_Metric == 8) {
             std::vector<std::array<int,4>> replacement;
             const int proposedNode = static_cast<int>(Nodes.size());
@@ -1978,7 +2001,7 @@ int DT::insertInteriorRepair(int tet) {
             DelNod(node); throw;
         }
         commitBW(*this,plan,node,slots); finishBW(*this,plan);
-        --topologyInteriorPointBudget; topologyInteriorCellBudget -= growth;
+        --topologyInteriorPointBudget; topologyInteriorCellBudget -= committedGrowth;
         // Leave quality recovery to subsequent topology/smoothing passes.
         return 1;
     }
@@ -4466,6 +4489,21 @@ int DT::ifflipEdg(int index, bool qualityDriven) {
 
 	if (p3 < 0 || p4 < 0 || p3 == p4 || BndEdg.find(p3, p4)) return 0;
 
+    BoundaryAngleReject* angleReject = nullptr;
+    const std::array<int, 4> vertices = {{p1, p2, p3, p4}};
+    if (qualityDriven) {
+        constexpr size_t cacheSize = 4096;
+        if (boundaryAngleRejects.empty()) boundaryAngleRejects.resize(cacheSize);
+        angleReject = &boundaryAngleRejects[static_cast<size_t>(index) & (cacheSize - 1)];
+        if (angleReject->valid && angleReject->vertices == vertices) {
+            bool same = true;
+            for (int k = 0; k < 4; ++k)
+                same &= std::memcmp(angleReject->points[k].data(), Nodes[vertices[k]].pt,
+                    3 * sizeof(double)) == 0;
+            if (same) return 0;
+        }
+    }
+
 	if (!checkFlipNormal(p1, p2, p3, p4))
 		return 0;
 
@@ -4474,7 +4512,7 @@ int DT::ifflipEdg(int index, bool qualityDriven) {
 		return 0;
 	
 	// angle check
-	std::vector<double> init1, init2, after1, after2;
+    double init1[3], init2[3], after1[3], after2[3];
 	double min1 = calculateTriangleAngles(Nodes[p1].pt, Nodes[p2].pt, Nodes[p3].pt, init1);
 	double min2 = calculateTriangleAngles(Nodes[p1].pt, Nodes[p2].pt, Nodes[p4].pt, init2);
 
@@ -4486,7 +4524,13 @@ int DT::ifflipEdg(int index, bool qualityDriven) {
 
 	if (AniSol.size() == 0) {
         if (qualityDriven) {
-            if (std::min(min3, min4) + boundarySurfaceAngleAllowance < std::min(min1, min2)) return 0;
+            if (std::min(min3, min4) + boundarySurfaceAngleAllowance < std::min(min1, min2)) {
+                angleReject->vertices = vertices;
+                for (int k = 0; k < 4; ++k)
+                    std::copy(Nodes[vertices[k]].pt, Nodes[vertices[k]].pt + 3, angleReject->points[k].begin());
+                angleReject->valid = true;
+                return 0;
+            }
         } else if (std::min(min3, min4) <= std::min(min1, min2) + 0.1) return 0;
 	}
 	else {
@@ -4690,6 +4734,22 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial, bool q
             if(n!=ghost)for(double x:Nodes[n].pt)mix(std::hash<double>{}(x));
         }
     }
+    // A new interface may coincide with a shell boundary. Its validation
+    // depends on the outside region too, even if the old shell is unchanged.
+    std::vector<std::array<int,4>> outsideRegionStamp;
+    outsideRegionStamp.reserve(shell.size()*2);
+    for (int t:shell) for (int f=0;f<4;++f) {
+        const int outside=getNeig(t,f);
+        if (std::find(shell.begin(),shell.end(),outside)!=shell.end()) continue;
+        std::array<int,4> key; int n=0;
+        for (int k=0;k<4;++k) if(k!=f) key[n++]=Elems[t].form[k];
+        std::sort(key.begin(),key.begin()+3);
+        key[3]=outside<0?std::numeric_limits<int>::min():
+            (ishulltet(outside)||isvirtualtet(outside)?virtualID:Elems[outside].geo);
+        outsideRegionStamp.push_back(key);
+    }
+    std::sort(outsideRegionStamp.begin(),outsideRegionStamp.end());
+    for (const auto& face:outsideRegionStamp) for(int value:face)mix(static_cast<size_t>(value));
     stamp |= 1;
     auto& stamps = boundaryFlipTrials[index];
     if (!topologyRepairDeferred && stamps[qualityDriven ? 1 : 0] == stamp) return 0;
@@ -4985,6 +5045,34 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial, bool q
 	}
 
     const Int3 newSurface1(p3,p4,p1), newSurface2(p3,p4,p2);
+    // The face geometry ID does not determine either adjacent volume ID.
+    // Both old triangles must describe the same (possibly exterior) region pair.
+    const auto cellRegion = [&](int cell) {
+        return ishulltet(cell)||isvirtualtet(cell)?virtualID:Elems[cell].geo;
+    };
+    const auto orderedPair = [](int a,int b) {
+        return std::array<int,2>{{std::min(a,b),std::max(a,b)}};
+    };
+    std::array<int,2> interfaceRegions;
+    for (int oldFaceIndex=0;oldFaceIndex<2;++oldFaceIndex) {
+        const auto& face=SurTris[oldFaceIndex?f2:f1].form;
+        const Int3 oldFace(face[0],face[1],face[2]);
+        std::array<int,2> pair; int count=0;
+        for (int cell:shell) for (int side=0;side<4;++side) {
+            int v[3],n=0;
+            for (int k=0;k<4;++k) if (k!=side) v[n++]=Elems[cell].form[k];
+            if (Int3(v[0],v[1],v[2])==oldFace) {
+                if (count>=2) { if(infolevel>1)++boundaryRegionChecks.oldPair; return 0; }
+                pair[count++]=cellRegion(cell);
+            }
+        }
+        if (count!=2 || (oldFaceIndex && orderedPair(pair[0],pair[1])!=interfaceRegions)) {
+            if(infolevel>1)++boundaryRegionChecks.oldPair; return 0;
+        }
+        interfaceRegions=orderedPair(pair[0],pair[1]);
+    }
+    std::array<std::vector<int>,2> interfaceOwners;
+    bool overlappingInterface=false;
     const int unknownRegion = std::numeric_limits<int>::min();
     std::vector<int> regions(mesh.T.size(),unknownRegion);
     std::vector<std::vector<int>> adjacent(mesh.T.size());
@@ -4995,16 +5083,25 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial, bool q
         regions[cell]=region;pending.push(cell);return true;
     };
     for (int i=0;i<static_cast<int>(mesh.T.size());++i) {
-        for (int k=0;k<4;++k) if (mpn[mesh.T[i][k]]==ghost && !assign(i,virtualID)) return 0;
+        for (int k=0;k<4;++k) if (mpn[mesh.T[i][k]]==ghost && !assign(i,virtualID)) {
+            if(infolevel>1)++boundaryRegionChecks.outerConflict; return 0;
+        }
         for (int f=0;f<4;++f) {
             int v[3],n=0;
             for(int k=0;k<4;++k)if(k!=f)v[n++]=mpn[mesh.T[i][k]];
             const Int3 face(v[0],v[1],v[2]);
             const auto outside=outerRegions.find(face);
-            if(outside!=outerRegions.end()) {
+            const int interfaceIndex=face==newSurface1?0:face==newSurface2?1:-1;
+            if (interfaceIndex>=0) {
+                interfaceOwners[interfaceIndex].push_back(i);
+                // A disappearing sliver can turn an old shell boundary into
+                // the new interface. Its old INSIDE label is no longer valid.
+                // Do not seed or propagate across it; validate both sides below.
+                overlappingInterface|=outside!=outerRegions.end();
+            } else if(outside!=outerRegions.end()) {
                 const int region=outside->second;
-                if(!assign(i,region))return 0;
-            } else if (!(face==newSurface1) && !(face==newSurface2)) {
+                if(!assign(i,region)) { if(infolevel>1)++boundaryRegionChecks.outerConflict; return 0; }
+            } else {
                 const auto it=owners.emplace(face,i);
                 if(!it.second){adjacent[i].push_back(it.first->second);adjacent[it.first->second].push_back(i);}
             }
@@ -5012,7 +5109,58 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial, bool q
     }
     while(!pending.empty()) {
         const int i=pending.front();pending.pop();
-        for(int j:adjacent[i])if(!assign(j,regions[i]))return 0;
+        for(int j:adjacent[i])if(!assign(j,regions[i])) {
+            if(infolevel>1)++boundaryRegionChecks.propagation; return 0;
+        }
+    }
+    for (int region:regions) if (region==unknownRegion) {
+        if(infolevel>1)++boundaryRegionChecks.unseeded; return 0;
+    }
+    // Check the actual region on BOTH sides of each new triangle. When it
+    // coincides with the shell boundary, the opposite cell is outside the patch.
+    for (int faceIndex=0;faceIndex<2;++faceIndex) {
+        const auto& cells=interfaceOwners[faceIndex];
+        const Int3& key=faceIndex?newSurface2:newSurface1;
+        if (cells.empty() || cells.size()>2) { if(infolevel>1)++boundaryRegionChecks.missingFace; return 0; }
+        int opposite;
+        if (cells.size()==2) opposite=regions[cells[1]];
+        else {
+            const auto outside=Tri.find(key);
+            if (outside==Tri.end() || outside->second<0) { if(infolevel>1)++boundaryRegionChecks.missingFace; return 0; }
+            const int cell=static_cast<int>(outside->second>>2);
+            if (cell<0 || cell>=static_cast<int>(Elems.size()) || isDelEle(cell)) {
+                if(infolevel>1)++boundaryRegionChecks.missingFace; return 0;
+            }
+            opposite=cellRegion(cell);
+        }
+        if (orderedPair(regions[cells[0]],opposite)!=interfaceRegions) {
+            if(infolevel>1)++boundaryRegionChecks.interfacePair; return 0;
+        }
+    }
+    // Only the exceptional shell/interface overlap needs a volume audit.
+    // Permit coordinate roundoff of a flat sliver, not loss of a real region.
+    if (overlappingInterface) {
+        std::map<int,long double> oldVolume,newVolume;
+        for (int cell:shell) if (cellRegion(cell)!=virtualID) oldVolume[cellRegion(cell)]+=calVolume(cell);
+        double low[3]={DBL_MAX,DBL_MAX,DBL_MAX},high[3]={-DBL_MAX,-DBL_MAX,-DBL_MAX};
+        for (int v:mpn) if (v!=ghost) for (int k=0;k<3;++k) {
+            low[k]=std::min(low[k],Nodes[v].pt[k]); high[k]=std::max(high[k],Nodes[v].pt[k]);
+        }
+        long double diagonal2=0;
+        for (int k=0;k<3;++k) diagonal2+=static_cast<long double>(high[k]-low[k])*(high[k]-low[k]);
+        const long double roundoff=128*std::numeric_limits<double>::epsilon()*diagonal2*std::sqrt(diagonal2);
+        for (int i=0;i<static_cast<int>(mesh.T.size());++i) if (regions[i]!=virtualID) {
+            int v[4]; for(int k=0;k<4;++k)v[k]=mpn[mesh.T[i][k]];
+            newVolume[regions[i]]+=GEOM_FUNC::orient3d(Nodes[v[0]].pt,Nodes[v[1]].pt,Nodes[v[3]].pt,Nodes[v[2]].pt);
+        }
+        for (const auto& entry:newVolume) if (!oldVolume.count(entry.first)) oldVolume[entry.first]=0;
+        for (const auto& entry:oldVolume) {
+            const long double after=newVolume[entry.first];
+            const long double tolerance=roundoff+1e-10L*std::max(std::abs(entry.second),std::abs(after));
+            if (!std::isfinite(after) || std::abs(after-entry.second)>tolerance) {
+                if(infolevel>1)++boundaryRegionChecks.volume; return 0;
+            }
+        }
     }
     double newWorst=std::numeric_limits<double>::infinity();
     std::vector<double> replacementQuality(mesh.T.size(),-1);
@@ -5053,6 +5201,7 @@ int DT::flipEdgWithTrial(int index, int deep, std::unique_ptr<DT>& trial, bool q
 		}
 	}
 
+    if (overlappingInterface && infolevel>1) ++boundaryRegionChecks.overlapAccepted;
 	//if it will be correct
 	for (int i = 0; i < shell.size(); i++) {
         if (QuantityControl && !ishulltet(shell[i]) && !isvirtualtet(shell[i])) --GeoNum[Elems[shell[i]].geo];

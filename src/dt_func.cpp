@@ -2261,7 +2261,11 @@ void DT::vsub3( double a[3],  double b[3], double r[3]) {
 	return;
 }
 double DT::calculateTriangleAngles(const double* A, const double* B, const double* C, std::vector<double>& angles) {
-	angles.resize(3);
+    angles.resize(3);
+    return calculateTriangleAngles(A, B, C, angles.data());
+}
+
+double DT::calculateTriangleAngles(const double* A, const double* B, const double* C, double* angles) {
 	angles[0] = angles[1] = angles[2] = 181;
 
 	//Cal A

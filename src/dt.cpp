@@ -1,4 +1,5 @@
 #include "dt.h"
+#include "dt_flip_workspace.h"
 
 using namespace std;
 
@@ -55,12 +56,16 @@ void DT::resetMeshState() {
     qualityBoundarySplitInProgress = false;
     qualityEdgeCollapses = 0; localStripPairedSplits = 0; pendingBoundaryPairs.clear();
     boundaryQualityTrial.reset(); boundaryFlipTrials.clear();
+    boundaryAngleRejects.clear();
+    boundaryRegionChecks = BoundaryRegionChecks{};
     boundaryQualityTried.clear(); boundaryQualityMetric = -1;
     flipnmRecll.clear();
     for (auto& history : parallelFlipHistory) history.clear();
     parallelFlipCount.fill(0);
     susIdleStates.clear(); serialBW.slots.clear();
     topologyInteriorPointBudget = 0; topologyInteriorCellBudget = 0;
+    topologyInteriorSearchBudget = topologyInteriorSmoothBudget = topologyInteriorRescued = 0;
+    boundaryTetRepairRejections.clear();
     topologyRepairEnabled = false; topologyRepairDeferred = false;
     topologyRemeshTrialBudget = 0;
     ignoreIntersect = false; modifyBnd = false; addBoxFlag = false;
@@ -80,7 +85,7 @@ int DT::dt_init(Mesh& mesh, Args& args)
 	spdlogoutfile(args.outlogfile);
     meshLogger->set_level(infolevel == 0 ? spdlog::level::err :
         infolevel == 1 ? spdlog::level::info : spdlog::level::debug);
-	if (infolevel > 0) meshLogger->info("Version 2026.11.01");
+	if (infolevel > 0) meshLogger->info("Version 2026.11.03");
     MeshStageLog initLog(*this, "Initialize");
     if (infolevel > 0)
         meshLogger->info("Input mesh: points={} segments={} triangles={} tets={}",
@@ -267,14 +272,14 @@ void DT::AddBox(double scaled) {
 		Hx[i] = H[i] * scaled;                 // scaled half size
 	}
 
-	// ·Å´óºóµÄ min / max
+	// ï¿½Å´ï¿½ï¿½ï¿½ min / max
 	double minX[3], maxX[3];
 	for (int i = 0; i < 3; i++) {
 		minX[i] = C[i] - Hx[i];
 		maxX[i] = C[i] + Hx[i];
 	}
 
-	// 8 ¸ö½Çµã£¨AABB ±ê×¼Ë³Ðò£©
+	// 8 ï¿½ï¿½ï¿½Çµã£¨AABB ï¿½ï¿½×¼Ë³ï¿½ï¿½
 	double box[8][3] = {
 		{minX[0], minX[1], minX[2]},
 		{maxX[0], minX[1], minX[2]},
@@ -2762,12 +2767,12 @@ int DT::DealIntersect(int pa, int pb, int p1, int p2) {
 	);
 
 	if (isInt != 1) {
-		// 0: ²»Ïà½»
-		// 2: ¹²ÏßÖØµþ£¬²»ÊÇÎ¨Ò»½»µã£¬²»ÊÊºÏÖ±½Ó addNode
+		// 0: ï¿½ï¿½ï¿½à½»
+		// 2: ï¿½ï¿½ï¿½ï¿½ï¿½Øµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Î¨Ò»ï¿½ï¿½ï¿½ã£¬ï¿½ï¿½ï¿½Êºï¿½Ö±ï¿½ï¿½ addNode
 		return -1;
 	}
 
-	// Èç¹ûÖ»Ïë´¦ÀíÁ½Ìõ±ßÄÚ²¿Ïà½»£¬¶ø²»´¦Àí¶Ëµã½Ó´¥£¬¿ÉÒÔ¼ÓÕâ¸öÅÐ¶Ï
+	// ï¿½ï¿½ï¿½Ö»ï¿½ë´¦ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ú²ï¿½ï¿½à½»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ëµï¿½Ó´ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô¼ï¿½ï¿½ï¿½ï¿½ï¿½Ð¶ï¿½
 	if (intTyp[0] != dt::GEOM_FUNC::LTI_INTERSECT_EDG ||
 		intTyp[1] != dt::GEOM_FUNC::LTI_INTERSECT_EDG) {
 		return -1;
@@ -3676,7 +3681,7 @@ int DT::addinnerSteiner_Edge2(const int lostE, std::vector<int>& newN, int info)
 	//}
 	//printf("\n");
 
-	//¸ù¾Ý½»µã
+	//ï¿½ï¿½ï¿½Ý½ï¿½ï¿½ï¿½
 	//std::unordered_map<int, int> mp;
 	//for (auto it : Vid) {
 	//	std::vector<int>  tempvec, shellp;
@@ -4939,6 +4944,10 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 		}
 	}//oldtet.size() == 3
 	else {//oldtet.size() >3
+        // Only reuse a geometric veto while this exact ring is untouched.
+        const bool cacheAuxDirections = level < maxlevel && n <= 64;
+        uint64_t convexDirections = 0;
+        bool originalRing = true;
 		pa = Elems[oldtet[0]].form[ia];
 		pb = Elems[oldtet[0]].form[ib];
 		for (i = n - 1; i >= 0; i--) {
@@ -4972,6 +4981,7 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 				if (ori < 0) {
 					ori = dt::GEOM_FUNC::orient3d(Nodes[pc].pt, Nodes[pb].pt, Nodes[pd].pt, Nodes[pe].pt);//t[c,b,d,e]
 					if (ori < 0) {
+                        if (cacheAuxDirections) convexDirections |= uint64_t(1) << i;
 						ori = dt::GEOM_FUNC::orient3d(Nodes[pb].pt, Nodes[pa].pt, Nodes[pd].pt, Nodes[pe].pt);//t[b,a,d,e]
 						if (ori < 0) {
 							flipflag = 1;
@@ -5043,10 +5053,13 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 			if (flipflag) {
 				//could flip
 				nn = INT16_MAX;//reset nn
-				std::vector<int> flipvec(3);
+                detail::FlipWorkspaceLease flipBuffers;
+                auto& flipvec = flipBuffers.get().first;
+                flipvec.resize(3);
 				flipvec[0] = lefttet;//find letf tet
 				flipvec[1] = oldtet[i];
 
+                originalRing = false;
 				flip23(flipvec, e, thread_n);
 				flipCount++;
 
@@ -5089,7 +5102,7 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 				else if (ori == 0) {
 					//in mesh improvement,we will backtrack if the quality worse
 					int havpepd = -1;
-					std::vector<int> backtrack;
+                    auto& backtrack = flipBuffers.get().second;
 					//find a tet don't have pc
 					for (j = 0; j < 3; j++) {
 						if (j == tet_in_star)
@@ -5118,7 +5131,7 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 						}
 					}
 					//find a tet e pd and pe success,and find all backtrack
-					std::vector<int> shell_point;
+                    auto& shell_point = flipBuffers.get().third;
 					findShell(havpepd, d, e, backtrack, shell_point);
 					if (backtrack.size() != 3) {
 						meshLogger->error("Backtrack flipnm error!");
@@ -5152,7 +5165,8 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 					}
 				}
 				else if (improve_step) {
-					std::vector<int> shell, shellp;
+                    auto& shell = flipBuffers.get().second;
+                    auto& shellp = flipBuffers.get().third;
 					while (!flipHistory.empty())
 					{
 						auto it = flipHistory.back();
@@ -5208,6 +5222,8 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 			//remove ac/bc
 			if (level < maxlevel) {
 				for (i = 0; i < n; i++) {
+                    if (originalRing && cacheAuxDirections &&
+                        (convexDirections & (uint64_t(1) << i))) continue;
 					int falttet = oldtet[i];
 					a = b = -1;
 					for (j = 0; j < 4; j++) {
@@ -5256,8 +5272,9 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 					if (isBndEdg(pc, Elems[falttet].form[flatedge]))
 						continue;
 
-					std::vector<int> flatvec;
-					std::vector<int> shell_point;
+                    detail::FlipWorkspaceLease auxiliaryBuffers;
+                    auto& flatvec = auxiliaryBuffers.get().first;
+                    auto& shell_point = auxiliaryBuffers.get().second;
 					findShell(falttet, flatedge, c, flatvec, shell_point);
 					int overlaps = 0;
 					for (k = 0; k < flatvec.size(); k++)
@@ -5274,6 +5291,8 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 							tempminq = std::min(tempminq, Elems[flatvec[j]].q);
 						}
 					}
+                    // Even a failed auxiliary search may retain valid flips.
+                    originalRing = false;
 					nn = flipnm(flatvec, flatedge, c, level + 1, maxlevel, tempminq);
 					if (nn == 2) {
 						if (isMeshEdge(pa, pb, &newtet)) {//ab has exists
@@ -5282,7 +5301,7 @@ int DT::flipnm(std::vector<int>& oldtet, const int ia, const int ib, int level, 
 								if (Elems[newtet].form[k] == pa) a = k;
 								else if (Elems[newtet].form[k] == pb) b = k;
 							}
-							std::vector<int> shell_point;
+                            auto& shell_point = auxiliaryBuffers.get().third;
 							findShell(newtet, b, a, oldtet, shell_point);//find new shell ab
 							for (k = 0; k < oldtet.size(); k++) {
 								if (Elems[oldtet[k]].info == 0) {//set thit tet in star
@@ -5687,6 +5706,7 @@ bool DT::flipintersectcheck(int fliptype, int a, int b, int c, int d, int e) {
 
 /* Transport dt's Nodes and Elems to mesh*/
 int DT::outMesh(Mesh& mesh, Args& args) {
+    if (args.optlevel > 0 && infolevel > 0) reportBoundaryTetQuality(args.optanglestrict);
     MeshStageLog stageLog(*this, "Export mesh", 1);
 	int k = 0;
 
@@ -6252,7 +6272,7 @@ void DT::DelSingleEdge(int ie) {
 		for (auto it : SurEdgs[ie2].face) {
 			if (it == iFace) continue;
 
-			// ÆäÖÐ²»Îª px, p3 µÄµã½Ð py
+			// ï¿½ï¿½ï¿½Ð²ï¿½Îª px, p3 ï¿½Äµï¿½ï¿½ py
 			int py = -1;
 			for (int k = 0; k < 3; k++) {
 				int pp = SurTris[it].form[k];
@@ -6271,7 +6291,7 @@ void DT::DelSingleEdge(int ie) {
 			double ori = std::fabs(dt::GEOM_FUNC::orient3d(PY, P3, P1, P2));
 
 			bool cross = false;
-			// ½ü¹²ÃæÊ±£¬ÔÙ¼ì²éÏß¶ÎÊÇ·ñÏà½»/½üÏà½»
+			// ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½ï¿½Ù¼ï¿½ï¿½ï¿½ß¶ï¿½ï¿½Ç·ï¿½ï¿½à½»/ï¿½ï¿½ï¿½à½»
 
 			if (ori < COP_EPS) {
 				double dis = segmentSegmentDistance(PY, P3, P1, P2);

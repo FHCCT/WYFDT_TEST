@@ -1,0 +1,61 @@
+{
+  "primary_adptype2": {
+    "input": "test/20261028_dt/tmp_in_1793097600283661000.vtk",
+    "adpin": "test/20261028_dt/refine_id_1793097600283661000.txt",
+    "args": ["--adptype", "2", "--optloop", "10", "--nthread", "4"],
+    "expected_sha256": "609dbea493a67b9099ab30ab0a93f0660ee43c379e7b6f3332d0183977947285"
+  },
+  "hwusb_adptype2": {
+    "input": "test/20261026_dt/hwusb/tmp_in_1792997361698480700.vtk",
+    "adpin": "test/20261026_dt/hwusb/refine_id_1792997361698480700.txt",
+    "args": ["--adptype", "2", "--optloop", "10", "--nthread", "4"],
+    "expected_sha256": "ce09000f6f0fd242a1f7324419000d103dada54920d5642b0b2d7a90d95f4396"
+  },
+  "size_adptype6": {
+    "input": "test/20261019_dt/old20260929/SizeControlIn.vtk",
+    "sizecontrol_profile": "test/sizecontrol_profiles/size_20261019.profile",
+    "args": ["--adptype", "6", "--nthread", "4"],
+    "expected_sha256": "ab4193f2691b6e8ac0e75ca9f9bb01b2e81259739e9f39f51bc1fa4466ffbfb0"
+  },
+  "size_20261103_adptype6": {
+    "input": "test/20261103_SizeControl/SizeControlIn.vtk",
+    "sizecontrol_profile": "test/sizecontrol_profiles/size_20261103.profile",
+    "args": ["--adptype", "6", "--constrain", "0", "--nthread", "1", "--growsize", "1.01", "--optlevel", "3"],
+    "reference": "test/20261103_SizeControl/SizeControlIn_out.vtk",
+    "original_sha256": "e49ee0df46a96a60f8dee66d058edd26a510d832cf9f3add547968f340a06f7f",
+    "previous_sha256": "0bd8cd0eb0d97eee85f7931d7c2f9e83d75d03eb07cfc29b088bc77c38c688ec",
+    "expected_sha256": "365670b166917164cd255a3a458d37616489cc1f61376e8329ef403bcbae2c9d",
+    "watch_original_tetra_index": 252874,
+    "watch_original_interface_faces": [93044, 93045],
+    "watch_surface_geo": 117,
+    "note": "Replay log.txt: global size 14.9896, 112 volume sizes, optloop 10, optTh .4, strict angle .01, boundary angle 170. Region-correct boundary flips run by default during both size control and final optimization; watch indices refer to original_sha256."
+  },
+  "hfss_small": {
+    "input": "test/adp/HFSS_adp1.vtk",
+    "args": ["--adptype", "7", "--optlevel", "7", "--optloop", "10", "--optTh", "0.5", "--nthread", "4"],
+    "expected_sha256": "e55ee1d5514ea09cca8f141a23662d6ee064b7918a14d5eee03dfa9741bb1d1d"
+  },
+  "connector_small": {
+    "input": "test/adp/connector.vtk",
+    "args": ["--adptype", "7", "--optlevel", "7", "--optloop", "10", "--optTh", "0.5", "--nthread", "4"],
+    "expected_sha256": "1a97e6cd7817552f45ba440496f2ab2ff02652f618aab2ce0ef804d5f972fc39"
+  },
+  "adp_in1_small": {
+    "input": "test/adp/adp_in1.vtk",
+    "args": ["--adptype", "7", "--optlevel", "7", "--optloop", "10", "--optTh", "0.5", "--nthread", "4"],
+    "expected_sha256": "133d8f177856f6e10dea95d9a4437f70858ba0f938da927ae00143778c40023f"
+  },
+  "xieyang_generate": {
+    "input": "test/xieyang/in.vtk",
+    "args": ["--diglayer", "2", "3", "4", "5", "6", "7", "8", "9", "10", "--optTh", "1", "--optanglestrict", "10"],
+    "reference": "test/xieyang/in_out.vtk",
+    "original_sha256": "ff349d35107ba5bec091bbf9309318141f575e06ae761bdffaeebb86e7a17b75",
+    "previous_sha256": "bfdeb99f4b0045d54c375058808ab01e14b0151a60afb60a211c0c9abcd8be25",
+    "expected_sha256": "5b3b7f29649ed5646290bbfc6eaa2382e980de1654e255dc2a6f25775899b3ed",
+    "watch_tetra_index": 386728,
+    "watch_vertices": [10955, 10952, 10950, 10954],
+    "watch_boundary_tetra_index": 169435,
+    "watch_boundary_vertices": [105585, 97041, 95475, 97039],
+    "note": "Surface generation, default optlevel=3/constrain=1; bounded interior rescue and fixed-boundary tail enabled. watch_tetra_index refers to original_sha256; watch_boundary_tetra_index refers to previous_sha256. Locate by vertex sets after topology changes."
+  }
+}

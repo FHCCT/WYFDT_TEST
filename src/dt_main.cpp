@@ -1,6 +1,7 @@
 #include "dt.h"
 #include "mesh_io.h"
 #include <CLI11.hpp>
+#include "dt_sizecontrol_profile.h"
 using namespace std;
 //--input ../test\20260915_thread\adp/thread2_adpin.vtk --adpin ../test\20260915_thread\adp/thread2_refine_id.txt --adptype 2
 //--input ../test\20260916_dtAdp\pcb2\in.vtk --adpin ../test\20260916_dtAdp\pcb2\in.txt --adptype 2
@@ -10,6 +11,7 @@ int main(int argc, char* argv[]) {
 	std::string in_adp_filename;
 	std::string in_per_filename;
 	std::string out_filename;
+    std::string sizeControlProfile;
 	bool outwithsur = true;
 	int adptype =0;
 	dt::Args args;
@@ -18,6 +20,7 @@ int main(int argc, char* argv[]) {
 	app.add_option("--fine_mesh_file", args.fine_mesh_file, "Input dense/reference mesh for boundary point projection. (string, optional)");
 	app.add_option("--adpin", in_adp_filename, "Input Vertex. (string, required)");
 	app.add_option("--perin", in_per_filename, "Input Periodic Vertex. (string, required)");
+    app.add_option("--sizecontrol-profile", sizeControlProfile, "Replay size-control map and branch parameters (adptype 6)");
 	app.add_option("--adptype", adptype, "Adp type,1 P_error,2 Tid,3 Coares. (int, required)");
 	app.add_option("--output", out_filename, "Output tetmesh OUTPUT in .vtk format.  (string, required)");
 	app.add_option("--constrain", args.constrain, "Keep boundary constrain. (int, optional, int:1)");
@@ -120,7 +123,7 @@ int main(int argc, char* argv[]) {
 			else if (adptype == 6) {
 				std::unordered_map<int, double> facetSize;// = { {1, 6.66}, {2, 3.66}, {3, 1.66}, {4, 10.66}, {5, 16.66}, };
 				std::unordered_map<int, int> facetNum;// = { {1, 10000} };
-				std::unordered_map<int, double> elementSize = { {232112,33.3069},{224310,33.3069},{153827,14.2021},{161629,33.3069},{157728,33.3069},{193102,33.3069},{169431,33.3069},{212607,33.3069},{165530,33.3069},{173597,14.2021},{173332,33.3069},{177498,33.3069},{181399,33.3069},{185300,33.3069},{189201,33.3069},{197003,33.3069},{200904,33.3069},{204805,33.3069},{208706,33.3069},{216508,33.3069},{220409,33.3069},{228211,33.3069},{236013,33.3069},{239914,33.3069},{240183,14.2021},{326761,33.3069} };
+				std::unordered_map<int, double> elementSize = { {173124,4.99604},{295413,4.99604},{309565,4.99604},{170801,2.83756},{183943,4.99604},{191332,4.99604},{253008,4.99604},{173052,4.99604},{181614,2.83756},{249383,4.99604},{191222,4.99604},{215787,4.99604},{199468,4.99604},{188891,4.99604},{188169,4.99604},{196990,4.99604},{192747,4.99604},{250519,4.99604},{299078,4.99604},{194525,4.99604},{195264,4.99604},{198716,4.99604},{199578,4.99604},{265313,4.99604},{249540,4.99604},{213265,2.83756},{215043,4.99604},{243544,4.99604},{246618,4.99604},{272401,4.99604},{304643,4.99604},{246715,4.99604},{247480,4.99604},{249455,4.99604},{250604,4.99604},{251583,4.99604},{252234,4.99604},{310563,4.99604},{252344,4.99604},{256581,4.99604},{297904,4.99604},{257289,4.99604},{274551,4.99604},{257997,4.99604},{258692,4.99604},{259387,4.99604},{260750,2.83756},{310871,4.99604},{272304,4.99604},{261485,4.99604},{261557,4.99604},{262261,4.99604},{266214,4.99604},{264512,4.99604},{266129,4.99604},{265216,4.99604},{265385,4.99604},{295303,4.99604},{267193,4.99604},{269100,4.99604},{274648,4.99604},{269878,4.99604},{272207,4.99604},{272511,4.99604},{274344,4.99604},{274454,4.99604},{274720,2.83756},{293470,2.83756},{295498,4.99604},{296477,4.99604},{296562,4.99604},{297541,4.99604},{297638,4.99604},{297735,4.99604},{309434,4.99604},{297807,4.99604},{309768,4.99604},{298014,4.99604},{298099,4.99604},{299163,4.99604},{300142,4.99604},{300227,4.99604},{301206,4.99604},{308465,4.99604},{308850,4.99604},{308922,4.99604},{308994,4.99604},{309066,4.99604},{309138,4.99604},{309210,4.99604},{309282,4.99604},{309358,4.99604},{309506,4.99604},{309637,4.99604},{309696,4.99604},{309840,4.99604},{309916,4.99604},{309992,4.99604},{310068,4.99604},{310144,4.99604},{310216,4.99604},{310275,4.99604},{310347,4.99604},{310419,4.99604},{310491,4.99604},{310635,4.99604},{310694,4.99604},{310753,4.99604},{310812,4.99604},{310943,4.99604},{311002,4.99604},{311424,4.99604} };
 
 				std::unordered_map<int, int> elementNum;// = { {1641, 60} };
 				//args.periodic_P = { 1406,22,1534,1536,1534,1535,1536,1534,1536,1537,0,23,0,1408,1420,1418,1420,8,1412,1416,23,0,23,1417,1416,1412,1418,1420,1418,30,9,28,1546,1542,1546,1549,28,9,1535,1537,1535,1534,1537,1535,1537,1536,1408,1417,1408,0,30,8,30,1418,1417,1408,1417,23,8,30,8,1420,1419,1414,1419,13,1414,1419,1414,34,1545,1539,1545,1544,19,36,36,19,1265,6,13,34,13,1419,1413,1405,1413,37,34,13,34,1414,20,37,20,1405,1538,1544,1538,1539,1544,1538,1544,1545,1539,1545,1539,1538,1540,1548,1540,1541,1548,1540,1548,1547,1541,1547,1541,1540,1,1410,1547,1541,1547,1548,1542,1546,1542,1543,1410,1,37,20,37,1413,1543,1549,1543,1542,1549,1543,1549,1546,875,737,737,875,1405,1413,1405,20,6,1265,1266,15,15,1266,22,1406 };
@@ -132,11 +135,15 @@ int main(int argc, char* argv[]) {
 				//facetSize[114709] = portSize;
 
 				args.optloop = 10;
-				args.optTh = 0.3;
-				args.optanglestrict = 1;
+				args.optTh = 0.4;
+				args.optanglestrict = 0.01;
 				// Keep the user-provided minimum dihedral insertion angle.
 				args.adpangle = 170;
-				constexpr double lamasize = 33.3069;
+				double lamasize = 14.9896;
+                if (!sizeControlProfile.empty()) {
+                    try { dt::readSizeControlProfile(sizeControlProfile,args,lamasize,facetSize,facetNum,elementSize,elementNum); }
+                    catch (const std::exception& error) { d.meshLogger->error("{}",error.what()); return 1; }
+                }
 				ret = d.adaptation_by_YunBoSzieControl(mesh, args, lamasize, facetSize, facetNum, elementSize, elementNum);
 			}
 			else if (adptype == 7) {

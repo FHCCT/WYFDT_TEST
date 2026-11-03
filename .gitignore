@@ -45,3 +45,5 @@ copilot-instructions.md
 /extern/spdlog/*
 !/extern/spdlog/include/
 !/extern/spdlog/LICENSE
+/test
+/test

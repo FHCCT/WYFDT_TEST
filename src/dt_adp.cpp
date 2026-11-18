@@ -1089,11 +1089,18 @@ void DT::synchronizeRectangularSplit(int node, double sourceLength) {
         explicit Scope(bool& value) : active(value) { active = true; }
         ~Scope() { active = false; }
     } scope(rectangularPairingInProgress);
+    struct PairCandidate {
+        std::array<double, 3> coordinates;
+        Edge endpoints;
+        int geo, side;
+        double position;
+        RailLocation target;
+    };
+    std::vector<PairCandidate> candidates;
+    candidates.reserve(geometries.size());
     for (int geo : geometries) {
-        auto& face = rectangularFaces.at(geo);
-        // A large rectangle can already contain a fine local triangulation.
-        // Synchronize only an actual split that is long relative to its width;
-        // local diagonals and short rail segments must not refine remote sides.
+        const auto& face = rectangularFaces.at(geo);
+        // Synchronize only a split that is long relative to the rectangle width.
         if (!(sourceLength > rectangularSynchronizationWidthRatio * face.width + face.tolerance)) continue;
         const Vec origin = vector(face.origin), along = vector(face.along);
         const double position = (point(*this, node) - origin).dot(along);
@@ -1101,24 +1108,52 @@ void DT::synchronizeRectangularSplit(int node, double sourceLength) {
         for (int side = 0; side < 2; ++side) {
             const auto target = locateRail(*this, face, geo, side, position);
             if (target.node >= 0) continue;
-            if (target.edge < 0) {
-                ++rectangularPairFailures;
-                if (infolevel > 1) meshLogger->debug("Rectangle pair unavailable: geometry={} node={} side={}", geo, node, side);
-                continue;
+            // Keep an unavailable station in the queue: an earlier split can
+            // make it reachable. Use the rail station to order it in that case.
+            Vec coordinates = origin + position * along + (side * face.width) * vector(face.across);
+            Edge endpoints(-1, -1);
+            if (target.edge >= 0) {
+                const auto& edge = SurEdgs[target.edge];
+                coordinates = (1 - target.fraction) * point(*this, edge.iStart)
+                    + target.fraction * point(*this, edge.iEnd);
+                endpoints = std::minmax(edge.iStart, edge.iEnd);
             }
-            struct Acceptance {
-                BWAcceptance& value; BWAcceptance saved;
-                explicit Acceptance(BWAcceptance& v) : value(v), saved(v) { value = BWAcceptance::VolumeOnly; }
-                ~Acceptance() { value = saved; }
-            } acceptance(bwAcceptance);
-            const int paired = splitEdgImpl(target.edge, 0, false, target.fraction, true);
-            if (paired > 0) {
-                ++rectangularPairedSplits;
-                if (infolevel > 1) meshLogger->debug("Rectangle pair inserted: geometry={} node={} paired={} fraction={:.12g}", geo, node, paired, target.fraction);
-            } else {
-                ++rectangularPairFailures;
-                if (infolevel > 1) meshLogger->debug("Rectangle pair rejected by volume/insertion checks: geometry={} node={}", geo, node);
-            }
+            if (!coordinates.allFinite()) continue;
+            candidates.push_back(PairCandidate{array(coordinates), endpoints, geo, side, position, target});
+        }
+    }
+    // Geometry labels identify faces but must not determine new point IDs.
+    std::sort(candidates.begin(), candidates.end(), [](const PairCandidate& a, const PairCandidate& b) {
+        if (a.coordinates != b.coordinates) return a.coordinates < b.coordinates;
+        return a.endpoints < b.endpoints;
+    });
+    bool railChanged = false;
+    for (const auto& candidate : candidates) {
+        const auto& face = rectangularFaces.at(candidate.geo);
+        // A successful split can replace an edge or supply a station for a
+        // neighboring face. Resolve its target again before editing the mesh.
+        const auto target = railChanged
+            ? locateRail(*this, face, candidate.geo, candidate.side, candidate.position)
+            : candidate.target;
+        if (target.node >= 0) continue;
+        if (target.edge < 0) {
+            ++rectangularPairFailures;
+            if (infolevel > 1) meshLogger->debug("Rectangle pair unavailable: geometry={} node={} side={}", candidate.geo, node, candidate.side);
+            continue;
+        }
+        struct Acceptance {
+            BWAcceptance& value; BWAcceptance saved;
+            explicit Acceptance(BWAcceptance& v) : value(v), saved(v) { value = BWAcceptance::VolumeOnly; }
+            ~Acceptance() { value = saved; }
+        } acceptance(bwAcceptance);
+        const int paired = splitEdgImpl(target.edge, 0, false, target.fraction, true);
+        if (paired > 0) {
+            railChanged = true;
+            ++rectangularPairedSplits;
+            if (infolevel > 1) meshLogger->debug("Rectangle pair inserted: geometry={} node={} paired={} fraction={:.12g}", candidate.geo, node, paired, target.fraction);
+        } else {
+            ++rectangularPairFailures;
+            if (infolevel > 1) meshLogger->debug("Rectangle pair rejected by volume/insertion checks: geometry={} node={}", candidate.geo, node);
         }
     }
     // Paired points can border another, nonrectangular geometry. Process that
